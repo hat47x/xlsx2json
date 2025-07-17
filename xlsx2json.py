@@ -89,6 +89,50 @@ def get_named_range_values(wb, defined_name) -> Any:
     return values[0] if len(values) == 1 else values
 
 
+def is_empty_value(value: Any) -> bool:
+    """
+    値が空かどうかを判定する。
+    None、空文字列、空のリスト、空のdictを空値として扱う。
+    """
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    if isinstance(value, list) and len(value) == 0:
+        return True
+    if isinstance(value, dict) and len(value) == 0:
+        return True
+    return False
+
+
+def clean_empty_values(obj: Union[Dict[str, Any], List[Any], Any], suppress_empty: bool = True) -> Union[Dict[str, Any], List[Any], Any, None]:
+    """
+    空の値を再帰的に除去する。
+    suppress_empty が False の場合は何もしない。
+    """
+    if not suppress_empty:
+        return obj
+    
+    if isinstance(obj, dict):
+        cleaned = {}
+        for key, value in obj.items():
+            cleaned_value = clean_empty_values(value, suppress_empty)
+            if not is_empty_value(cleaned_value):
+                cleaned[key] = cleaned_value
+        return cleaned if cleaned else None
+    
+    elif isinstance(obj, list):
+        cleaned = []
+        for item in obj:
+            cleaned_item = clean_empty_values(item, suppress_empty)
+            if not is_empty_value(cleaned_item):
+                cleaned.append(cleaned_item)
+        return cleaned if cleaned else None
+    
+    else:
+        return obj if not is_empty_value(obj) else None
+
+
 def insert_json_path(root: Union[Dict[str, Any], List[Any]], keys: List[str], value: Any) -> None:
     """
     ドット区切りキーのリストから JSON 構造を構築し、値を挿入する。
@@ -161,6 +205,7 @@ def write_json(
     output_path: Path,
     schema: Optional[Dict[str, Any]] = None,
     validator: Optional[Draft7Validator] = None,
+    suppress_empty: bool = True,
 ) -> None:
     """
     JSON をファイルに書き出し。
@@ -168,6 +213,12 @@ def write_json(
     """
     base_name = output_path.stem
     output_dir = output_path.parent
+
+    # 空値の除去
+    if suppress_empty:
+        data = clean_empty_values(data, suppress_empty)
+        if data is None:
+            data = {}
 
     # バリデーション → エラーログ
     if validator:
@@ -201,6 +252,10 @@ def main() -> None:
         '--schema', '-s', type=Path,
         help='JSON Schema ファイル (バリデーションとソート用)'
     )
+    parser.add_argument(
+        '--keep-empty', action='store_true',
+        help='空のセル値も JSON に含める (デフォルトでは空値を除去)'
+    )
     args = parser.parse_args()
 
     xlsx_files = collect_xlsx_files(args.inputs)
@@ -210,6 +265,7 @@ def main() -> None:
 
     schema = load_schema(args.schema) if args.schema else None
     validator = Draft7Validator(schema) if schema else None
+    suppress_empty = not args.keep_empty
 
     for xlsx_path in xlsx_files:
         data = parse_named_ranges(xlsx_path)
@@ -217,7 +273,7 @@ def main() -> None:
         # 出力先設定
         out_dir = args.output_dir if args.output_dir else xlsx_path.parent / 'output-json'
         out_file = out_dir / f"{xlsx_path.stem}.json"
-        write_json(data, out_file, schema, validator)
+        write_json(data, out_file, schema, validator, suppress_empty)
 
 
 if __name__ == '__main__':
