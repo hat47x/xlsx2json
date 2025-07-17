@@ -2,11 +2,13 @@ import argparse
 import json
 import os
 import re
+import logging
+
+logger = logging.getLogger("xlsx2json")
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from openpyxl import load_workbook
-import jsonschema
 from jsonschema import Draft7Validator
 
 
@@ -42,7 +44,7 @@ def validate_and_log(
             path = '.'.join(str(p) for p in err.path)
             f.write(f"{path}: {err.message}\n")
 
-    print(f"Validation errors logged: {log_file}")
+    logger.info(f"Validation errors logged: {log_file}")
 
 
 def reorder_json(
@@ -233,14 +235,81 @@ def insert_json_path(root: Union[Dict[str, Any], List[Any]], keys: List[str], va
 def parse_named_ranges(xlsx_path: Path) -> Dict[str, Any]:
     """
     Excel 名前付き範囲(json.*) を解析してネスト dict/list を返す。
+    アンダーバーをワイルドカード（1文字）としてJSON Schemaの項目名と照合し、ユニークにマッチする場合はその項目名に置換する。
+    """
+    return parse_named_ranges_with_prefix(xlsx_path, prefix="json.")
+
+
+def parse_named_ranges_with_prefix(xlsx_path: Path, prefix: str = "json.") -> Dict[str, Any]:
+    """
+    Excel 名前付き範囲(prefix) を解析してネスト dict/list を返す。
+    prefixはデフォルトで"json."。
     """
     wb = load_workbook(xlsx_path, data_only=True)
     result: Dict[str, Any] = {}
 
+    # schemaファイルがあれば読み込む
+    global _global_schema
+    schema = None
+    try:
+        schema = _global_schema
+    except Exception:
+        schema = None
+
+    def match_schema_key(key: str, schema_props: dict) -> str:
+        if not schema_props:
+            return key
+        key = key.strip()
+        pattern = '^' + re.escape(key).replace('_', '.') + '$'
+        matches = [prop for prop in schema_props if re.fullmatch(pattern, prop, flags=re.UNICODE)]
+        logger.debug(f"key={key}, pattern={pattern}, matches={matches}")
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            logger.warning(f"ワイルドカード照合で複数マッチ: '{key}' → {matches}。ユニークでないため置換しません。")
+        return key
+
     for name, defined_name in wb.defined_names.items():
-        if not name.startswith("json."):
+        if not name.startswith(prefix):
             continue
-        path_keys = name.removeprefix("json.").split('.')
+        path_keys = name.removeprefix(prefix).split('.')
+
+        if schema is not None:
+            props = schema.get('properties', {})
+            items = schema.get('items', {})
+            new_keys = []
+            current_schema = schema
+            for k in path_keys:
+                if re.fullmatch(r"\d+", k):
+                    new_keys.append(k)
+                    if isinstance(current_schema, dict) and 'items' in current_schema:
+                        current_schema = current_schema['items']
+                        props = current_schema.get('properties', {}) if isinstance(current_schema, dict) else {}
+                        items = current_schema.get('items', {}) if isinstance(current_schema, dict) else {}
+                    else:
+                        props = {}
+                        items = {}
+                else:
+                    if not props or not isinstance(props, dict):
+                        logger.debug(f"props is empty or not dict at key={k}, break")
+                        break
+                    logger.debug(f"props.keys() at key={k}: {list(props.keys())}")
+                    new_k = match_schema_key(k, props)
+                    new_keys.append(new_k)
+                    next_schema = props.get(new_k, {}) if isinstance(props, dict) else {}
+                    if isinstance(next_schema, dict) and 'properties' in next_schema:
+                        current_schema = next_schema
+                        props = next_schema['properties']
+                        items = next_schema.get('items', {})
+                    elif isinstance(next_schema, dict) and 'items' in next_schema:
+                        current_schema = next_schema
+                        props = next_schema.get('properties', {})
+                        items = next_schema['items']
+                    else:
+                        props = {}
+                        items = {}
+            path_keys = new_keys
+
         value = get_named_range_values(wb, defined_name)
         insert_json_path(result, path_keys, value)
 
@@ -262,7 +331,7 @@ def collect_xlsx_files(paths: List[str]) -> List[Path]:
         elif p_path.is_file() and p_path.suffix.lower() == '.xlsx':
             files.append(p_path)
         else:
-            print(f"Warning: 未処理のパス: {p_path}")
+            logger.warning(f"未処理のパス: {p_path}")
     return files
 
 
@@ -299,7 +368,7 @@ def write_json(
     with output_path.open('w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    print(f"Written: {output_path}")
+    logger.info(f"ファイル出力成功: {output_path}")
 
 
 def main() -> None:
@@ -322,19 +391,35 @@ def main() -> None:
         '--keep-empty', action='store_true',
         help='空のセル値も JSON に含める (デフォルトでは空値を除去)'
     )
+    parser.add_argument(
+        '--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        help='ログレベルを指定 (デフォルト: INFO)'
+    )
+    parser.add_argument(
+        '--prefix', type=str, default='json.',
+        help='Excel 名前付き範囲のプレフィックス (デフォルト: json.)'
+    )
     args = parser.parse_args()
+
+    # ログ設定
+    logging.basicConfig(level=getattr(logging, args.log_level), format='[%(levelname)s] %(message)s')
+    logger.setLevel(getattr(logging, args.log_level))
 
     xlsx_files = collect_xlsx_files(args.inputs)
     if not xlsx_files:
-        print("Error: 対象の .xlsx が見つかりませんでした。")
+        logger.error("対象の .xlsx が見つかりませんでした。")
         return
 
     schema = load_schema(args.schema) if args.schema else None
     validator = Draft7Validator(schema) if schema else None
     suppress_empty = not args.keep_empty
 
+    # schemaをグローバル変数にセット（parse_named_rangesで参照）
+    global _global_schema
+    _global_schema = schema
+
     for xlsx_path in xlsx_files:
-        data = parse_named_ranges(xlsx_path)
+        data = parse_named_ranges_with_prefix(xlsx_path, prefix=args.prefix)
 
         # 出力先設定
         out_dir = args.output_dir if args.output_dir else xlsx_path.parent / 'output-json'

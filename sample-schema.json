@@ -29,8 +29,21 @@
       },
       "required": ["name", "address"],
       "additionalProperties": false
+    },
+    "日本語！": {
+      "type": "object",
+      "properties": {
+        "記号！": {
+          "type": "string",
+          "description": "Excelの「名前の定義」で使用できない記号をパスに含むケース"
+        },
+        "（記／号）～": {
+          "type": "string",
+          "description": "Excelの「名前の定義」で使用できない記号をパスに含むケース２"
+        }
+      }
     }
   },
-  "required": ["customer", "parent"],
+  "required": ["customer", "parent", "日本語！"],
   "additionalProperties": false
 }
