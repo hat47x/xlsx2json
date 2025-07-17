@@ -14,11 +14,23 @@
         }
       }
     },
-    "customer_name": {
-      "type": "string",
-      "description": "顧客の氏名"
+    "customer": {
+      "type": "object",
+      "description": "顧客",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "氏名"
+        },
+        "address": {
+          "type": "string",
+          "description": "住所"
+        }
+      },
+      "required": ["name", "address"],
+      "additionalProperties": false
     }
   },
-  "required": ["customer_name", "parent"],
+  "required": ["customer", "parent"],
   "additionalProperties": false
 }

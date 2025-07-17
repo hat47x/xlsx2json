@@ -105,10 +105,30 @@ def is_empty_value(value: Any) -> bool:
     return False
 
 
+def is_completely_empty(obj: Union[Dict[str, Any], List[Any], Any]) -> bool:
+    """
+    オブジェクトが完全に空かどうかを再帰的に判定する。
+    """
+    if obj is None:
+        return True
+    if isinstance(obj, str) and obj.strip() == "":
+        return True
+    if isinstance(obj, dict):
+        if not obj:
+            return True
+        return all(is_completely_empty(value) for value in obj.values())
+    if isinstance(obj, list):
+        if not obj:
+            return True
+        return all(is_completely_empty(item) for item in obj)
+    return False
+
+
 def clean_empty_values(obj: Union[Dict[str, Any], List[Any], Any], suppress_empty: bool = True) -> Union[Dict[str, Any], List[Any], Any, None]:
     """
     空の値を再帰的に除去する。
     suppress_empty が False の場合は何もしない。
+    配列の場合は、要素全体が完全に空の場合のみインデックスを詰める。
     """
     if not suppress_empty:
         return obj
@@ -122,11 +142,57 @@ def clean_empty_values(obj: Union[Dict[str, Any], List[Any], Any], suppress_empt
         return cleaned if cleaned else None
     
     elif isinstance(obj, list):
-        cleaned = []
+        # 配列の場合：まず全要素を再帰的に処理
+        processed_items = []
         for item in obj:
-            cleaned_item = clean_empty_values(item, suppress_empty)
-            if not is_empty_value(cleaned_item):
-                cleaned.append(cleaned_item)
+            processed_item = clean_empty_values(item, suppress_empty)
+            processed_items.append(processed_item)
+        
+        # 完全に空の要素のみを除去して詰める
+        # 部分的に空の要素（例：{"name": null, "address": "value"}）は保持
+        cleaned = []
+        for item in processed_items:
+            if not is_completely_empty(item):
+                cleaned.append(item)
+        
+        return cleaned if cleaned else None
+    
+    else:
+        return obj if not is_empty_value(obj) else None
+
+
+def clean_empty_arrays_contextually(obj: Union[Dict[str, Any], List[Any], Any], suppress_empty: bool = True) -> Union[Dict[str, Any], List[Any], Any, None]:
+    """
+    配列要素の整合性を保ちながら空値を除去する。
+    配列要素全体が空の場合のみインデックスを詰める。
+    """
+    if not suppress_empty:
+        return obj
+    
+    if isinstance(obj, dict):
+        cleaned = {}
+        for key, value in obj.items():
+            cleaned_value = clean_empty_arrays_contextually(value, suppress_empty)
+            if cleaned_value is not None:
+                cleaned[key] = cleaned_value
+        return cleaned if cleaned else None
+    
+    elif isinstance(obj, list):
+        # 配列の各要素を再帰的に処理
+        processed_items = []
+        for item in obj:
+            processed_item = clean_empty_arrays_contextually(item, suppress_empty)
+            processed_items.append(processed_item)
+        
+        # 配列要素の整合性チェック
+        # 全てがNoneの場合のみ、その要素を配列から除去
+        cleaned = []
+        for item in processed_items:
+            if item is not None:
+                cleaned.append(item)
+            # Noneでも、配列の整合性を保つため、一部の要素だけが空の場合は保持する必要がある
+            # この処理は、完全に空の要素のみを除去する
+        
         return cleaned if cleaned else None
     
     else:
