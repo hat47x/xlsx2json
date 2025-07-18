@@ -232,11 +232,14 @@ def insert_json_path(root: Union[Dict[str, Any], List[Any]], keys: List[str], va
             insert_json_path(root[key], keys[1:], value)
 
 
-def parse_array_split_rules(array_split_rules: List[str], prefix: str = "json.") -> Dict[str, str]:
+def parse_array_split_rules(array_split_rules: List[str], prefix: str = "json.") -> Dict[str, List[str]]:
     """
     配列化設定のパース。
-    形式: "json.parent.1=," または "json.parent.1=\\n"
+    形式: "json.parent.1=,|;" (複数の区切り文字を|で区切る)
+    パイプ文字自体を区切り文字にする場合は \\| でエスケープする。
     プレフィックスは自動的に削除される。
+    
+    戻り値: {path: [delimiter1, delimiter2, ...]}
     """
     rules = {}
     for rule in array_split_rules:
@@ -244,21 +247,33 @@ def parse_array_split_rules(array_split_rules: List[str], prefix: str = "json.")
             logger.warning(f"無効な配列化設定: {rule}")
             continue
         
-        path, delimiter = rule.split('=', 1)
+        path, delimiter_str = rule.split('=', 1)
         # プレフィックスを削除
         if path.startswith(prefix):
             path = path.removeprefix(prefix)
         
-        # エスケープ文字の処理
-        delimiter = delimiter.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
-        rules[path] = delimiter
+        # エスケープされたパイプ文字を一時的に置換
+        temp_placeholder = "___ESCAPED_PIPE___"
+        delimiter_str = delimiter_str.replace('\\|', temp_placeholder)
+        
+        # 複数の区切り文字を|で区切る
+        delimiter_parts = delimiter_str.split('|')
+        delimiters = []
+        for part in delimiter_parts:
+            # エスケープ文字の処理
+            processed_delimiter = part.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+            # エスケープされたパイプ文字を元に戻す
+            processed_delimiter = processed_delimiter.replace(temp_placeholder, '|')
+            delimiters.append(processed_delimiter)
+        
+        rules[path] = delimiters
     
     return rules
 
 
-def should_convert_to_array(path_keys: List[str], split_rules: Dict[str, str]) -> Optional[str]:
+def should_convert_to_array(path_keys: List[str], split_rules: Dict[str, List[str]]) -> Optional[List[str]]:
     """
-    指定されたパスが配列化対象かどうかを判定し、対応する区切り文字を返す。
+    指定されたパスが配列化対象かどうかを判定し、対応する区切り文字のリストを返す。
     """
     path_str = '.'.join(path_keys)
     
@@ -267,9 +282,9 @@ def should_convert_to_array(path_keys: List[str], split_rules: Dict[str, str]) -
         return split_rules[path_str]
     
     # 部分マッチング（前方一致）
-    for rule_path, delimiter in split_rules.items():
+    for rule_path, delimiters in split_rules.items():
         if path_str.startswith(rule_path + '.') or path_str == rule_path:
-            return delimiter
+            return delimiters
     
     return None
 
@@ -322,9 +337,58 @@ def check_schema_for_array_conversion(
     return is_string_array_schema(current_schema)
 
 
+def convert_string_to_multidimensional_array(value: Any, delimiters: List[str]) -> Any:
+    """
+    文字列を指定された区切り文字のリストで多次元配列に変換する。
+    
+    Args:
+        value: 変換対象の値
+        delimiters: 区切り文字のリスト（1次元目、2次元目、3次元目...の順）
+    
+    Returns:
+        多次元配列に変換された値
+    """
+    if not isinstance(value, str):
+        return value
+    
+    if not value.strip():
+        return []
+    
+    if not delimiters:
+        return value
+    
+    # 再帰的に次元を分割
+    def split_recursively(text: str, delimiter_list: List[str]) -> Any:
+        if not delimiter_list:
+            return text.strip()
+        
+        current_delimiter = delimiter_list[0]
+        remaining_delimiters = delimiter_list[1:]
+        
+        # 現在の区切り文字で分割
+        parts = text.split(current_delimiter)
+        
+        if not remaining_delimiters:
+            # 最後の次元：文字列のリストを返す
+            result = [part.strip() for part in parts if part.strip()]
+            return result if result else []
+        else:
+            # 中間次元：再帰的に処理
+            result = []
+            for part in parts:
+                part = part.strip()
+                if part:
+                    sub_result = split_recursively(part, remaining_delimiters)
+                    result.append(sub_result)
+            return result if result else []
+    
+    return split_recursively(value, delimiters)
+
+
 def convert_string_to_array(value: Any, delimiter: str) -> Any:
     """
     文字列を指定された区切り文字で配列に変換する。
+    （後方互換性のため残存）
     """
     if not isinstance(value, str):
         return value
@@ -351,12 +415,12 @@ def parse_named_ranges(xlsx_path: Path) -> Dict[str, Any]:
 def parse_named_ranges_with_prefix(
     xlsx_path: Path,
     prefix: str = "json.",
-    array_split_rules: Optional[Dict[str, str]] = None
+    array_split_rules: Optional[Dict[str, List[str]]] = None
 ) -> Dict[str, Any]:
     """
     Excel 名前付き範囲(prefix) を解析してネスト dict/list を返す。
     prefixはデフォルトで"json."。
-    array_split_rules: 配列化設定の辞書
+    array_split_rules: 配列化設定の辞書 {path: [delimiter1, delimiter2, ...]}
     """
     wb = load_workbook(xlsx_path, data_only=True)
     result: Dict[str, Any] = {}
@@ -431,24 +495,24 @@ def parse_named_ranges_with_prefix(
         value = get_named_range_values(wb, defined_name)
         
         # 配列化処理
-        # 1. 明示的なルールによる配列化
-        delimiter = should_convert_to_array(original_path_keys, array_split_rules)
-        logger.debug(f"original_path_keys={original_path_keys}, delimiter={delimiter}, value={value}")
+        # 1. 明示的なルールによる配列化（多次元対応）
+        delimiters = should_convert_to_array(original_path_keys, array_split_rules)
+        logger.debug(f"original_path_keys={original_path_keys}, delimiters={delimiters}, value={value}")
         
-        if delimiter is not None:
-            logger.debug(f"明示的ルールで配列化: {original_path_keys} -> delimiter='{delimiter}'")
+        if delimiters is not None:
+            logger.debug(f"明示的ルールで配列化: {original_path_keys} -> delimiters={delimiters}")
             if isinstance(value, list):
-                value = [convert_string_to_array(v, delimiter) for v in value]
+                value = [convert_string_to_multidimensional_array(v, delimiters) for v in value]
             else:
-                value = convert_string_to_array(value, delimiter)
+                value = convert_string_to_multidimensional_array(value, delimiters)
         # 2. スキーマによる配列化（デフォルト区切り文字: カンマ）
         elif check_schema_for_array_conversion(path_keys, schema):
-            default_delimiter = ','
-            logger.debug(f"スキーマベースで配列化: {path_keys} -> delimiter='{default_delimiter}'")
+            default_delimiters = [',']
+            logger.debug(f"スキーマベースで配列化: {path_keys} -> delimiters={default_delimiters}")
             if isinstance(value, list):
-                value = [convert_string_to_array(v, default_delimiter) for v in value]
+                value = [convert_string_to_multidimensional_array(v, default_delimiters) for v in value]
             else:
-                value = convert_string_to_array(value, default_delimiter)
+                value = convert_string_to_multidimensional_array(value, default_delimiters)
         
         logger.debug(f"配列化後の値: {value}")
         insert_json_path(result, path_keys, value)
@@ -513,7 +577,21 @@ def write_json(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Excel 名前付き範囲(json.*) -> JSON ファイル出力"
+        description="Excel 名前付き範囲(json.*) -> JSON ファイル出力",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+配列化設定の例:
+  1次元配列: --array-split "json.tags=,"
+  2次元配列: --array-split "json.matrix=;|,"
+  3次元配列: --array-split "json.cube=;|,|\t"
+  
+  区切り文字は|で区切って指定します。
+  例: "A,B;C,D" を ";" → "," で分割すると [["A","B"], ["C","D"]]
+  
+  パイプ文字自体を区切り文字にする場合は \\| でエスケープします:
+  --array-split "json.data=\\||,"  # パイプ文字 → カンマで分割
+  --array-split "json.mixed=;|\\|"  # セミコロン → パイプ文字で分割
+        """
     )
     parser.add_argument(
         'inputs', nargs='+',
@@ -541,7 +619,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--array-split', action='append', default=[],
-        help='配列化設定 (形式: "json.parent.1=," または "json.parent=\\n")'
+        help='配列化設定 (形式: "json.parent=,|;" 区切り文字を|で区切って多次元配列に対応。パイプ文字自体は\\|でエスケープ)'
     )
     args = parser.parse_args()
 

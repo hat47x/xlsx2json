@@ -5,16 +5,20 @@
   "properties": {
     "parent": {
       "type": "array",
-      "description": "親要素の3次元配列(縦×横×セル内カンマ区切り)",
+      "description": "4次元配列(縦×横×セル内縦×横)",
       "items": {
         "type": "array",
-        "description": "2次元配列(横方向セル範囲×セル内カンマ区切り)",
+        "description": "3次元配列(横×セル内縦×横)",
         "items": {
           "type": "array",
-          "description": "1次元配列(セル内カンマ区切り)",
+          "description": "2次元配列(セル内縦×横)",
           "items": {
-            "type": "string",
-            "description": "最小要素"
+            "type": "array",
+            "description": "1次元配列(セル内横)",
+            "items": {
+              "type": "string",
+              "description": "文字列"
+            }
           }
         }
       }
