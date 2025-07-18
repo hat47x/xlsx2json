@@ -1,16 +1,21 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "CustomerData",
+  "title": "Sample",
   "type": "object",
   "properties": {
     "parent": {
       "type": "array",
-      "description": "親要素の二次元配列",
+      "description": "親要素の3次元配列(縦×横×セル内カンマ区切り)",
       "items": {
         "type": "array",
+        "description": "2次元配列(横方向セル範囲×セル内カンマ区切り)",
         "items": {
-          "type": "string",
-          "description": "親要素の文字列"
+          "type": "array",
+          "description": "1次元配列(セル内カンマ区切り)",
+          "items": {
+            "type": "string",
+            "description": "最小要素"
+          }
         }
       }
     },

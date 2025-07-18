@@ -232,6 +232,114 @@ def insert_json_path(root: Union[Dict[str, Any], List[Any]], keys: List[str], va
             insert_json_path(root[key], keys[1:], value)
 
 
+def parse_array_split_rules(array_split_rules: List[str], prefix: str = "json.") -> Dict[str, str]:
+    """
+    配列化設定のパース。
+    形式: "json.parent.1=," または "json.parent.1=\\n"
+    プレフィックスは自動的に削除される。
+    """
+    rules = {}
+    for rule in array_split_rules:
+        if '=' not in rule:
+            logger.warning(f"無効な配列化設定: {rule}")
+            continue
+        
+        path, delimiter = rule.split('=', 1)
+        # プレフィックスを削除
+        if path.startswith(prefix):
+            path = path.removeprefix(prefix)
+        
+        # エスケープ文字の処理
+        delimiter = delimiter.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+        rules[path] = delimiter
+    
+    return rules
+
+
+def should_convert_to_array(path_keys: List[str], split_rules: Dict[str, str]) -> Optional[str]:
+    """
+    指定されたパスが配列化対象かどうかを判定し、対応する区切り文字を返す。
+    """
+    path_str = '.'.join(path_keys)
+    
+    # 完全一致
+    if path_str in split_rules:
+        return split_rules[path_str]
+    
+    # 部分マッチング（前方一致）
+    for rule_path, delimiter in split_rules.items():
+        if path_str.startswith(rule_path + '.') or path_str == rule_path:
+            return delimiter
+    
+    return None
+
+
+def is_string_array_schema(schema: Dict[str, Any]) -> bool:
+    """
+    スキーマが文字列配列かどうかを判定する。
+    """
+    if not isinstance(schema, dict):
+        return False
+    
+    # type: "array" かつ items.type: "string" の場合
+    if schema.get('type') == 'array':
+        items = schema.get('items', {})
+        if isinstance(items, dict) and items.get('type') == 'string':
+            return True
+    
+    return False
+
+
+def check_schema_for_array_conversion(
+    path_keys: List[str],
+    schema: Optional[Dict[str, Any]]
+) -> bool:
+    """
+    スキーマを参照して、指定されたパスが文字列配列として定義されているかを判定する。
+    """
+    if not schema:
+        return False
+    
+    current_schema = schema
+    for key in path_keys:
+        if re.fullmatch(r"\d+", key):
+            # 数字キーの場合は items を参照
+            if isinstance(current_schema, dict) and 'items' in current_schema:
+                current_schema = current_schema['items']
+            else:
+                return False
+        else:
+            # 文字列キーの場合は properties を参照
+            if isinstance(current_schema, dict) and 'properties' in current_schema:
+                props = current_schema['properties']
+                if key in props:
+                    current_schema = props[key]
+                else:
+                    return False
+            else:
+                return False
+    
+    return is_string_array_schema(current_schema)
+
+
+def convert_string_to_array(value: Any, delimiter: str) -> Any:
+    """
+    文字列を指定された区切り文字で配列に変換する。
+    """
+    if not isinstance(value, str):
+        return value
+    
+    if not value.strip():
+        return []
+    
+    # 区切り文字で分割
+    parts = value.split(delimiter)
+    # 前後の空白を削除
+    result = [part.strip() for part in parts if part.strip()]
+    
+    return result if result else []
+
+
 def parse_named_ranges(xlsx_path: Path) -> Dict[str, Any]:
     """
     Excel 名前付き範囲(json.*) を解析してネスト dict/list を返す。
@@ -240,10 +348,15 @@ def parse_named_ranges(xlsx_path: Path) -> Dict[str, Any]:
     return parse_named_ranges_with_prefix(xlsx_path, prefix="json.")
 
 
-def parse_named_ranges_with_prefix(xlsx_path: Path, prefix: str = "json.") -> Dict[str, Any]:
+def parse_named_ranges_with_prefix(
+    xlsx_path: Path,
+    prefix: str = "json.",
+    array_split_rules: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
     """
     Excel 名前付き範囲(prefix) を解析してネスト dict/list を返す。
     prefixはデフォルトで"json."。
+    array_split_rules: 配列化設定の辞書
     """
     wb = load_workbook(xlsx_path, data_only=True)
     result: Dict[str, Any] = {}
@@ -255,6 +368,9 @@ def parse_named_ranges_with_prefix(xlsx_path: Path, prefix: str = "json.") -> Di
         schema = _global_schema
     except Exception:
         schema = None
+
+    if array_split_rules is None:
+        array_split_rules = {}
 
     def match_schema_key(key: str, schema_props: dict) -> str:
         if not schema_props:
@@ -272,7 +388,8 @@ def parse_named_ranges_with_prefix(xlsx_path: Path, prefix: str = "json.") -> Di
     for name, defined_name in wb.defined_names.items():
         if not name.startswith(prefix):
             continue
-        path_keys = name.removeprefix(prefix).split('.')
+        original_path_keys = name.removeprefix(prefix).split('.')
+        path_keys = original_path_keys.copy()
 
         if schema is not None:
             props = schema.get('properties', {})
@@ -310,7 +427,30 @@ def parse_named_ranges_with_prefix(xlsx_path: Path, prefix: str = "json.") -> Di
                         items = {}
             path_keys = new_keys
 
+        # 値を取得
         value = get_named_range_values(wb, defined_name)
+        
+        # 配列化処理
+        # 1. 明示的なルールによる配列化
+        delimiter = should_convert_to_array(original_path_keys, array_split_rules)
+        logger.debug(f"original_path_keys={original_path_keys}, delimiter={delimiter}, value={value}")
+        
+        if delimiter is not None:
+            logger.debug(f"明示的ルールで配列化: {original_path_keys} -> delimiter='{delimiter}'")
+            if isinstance(value, list):
+                value = [convert_string_to_array(v, delimiter) for v in value]
+            else:
+                value = convert_string_to_array(value, delimiter)
+        # 2. スキーマによる配列化（デフォルト区切り文字: カンマ）
+        elif check_schema_for_array_conversion(path_keys, schema):
+            default_delimiter = ','
+            logger.debug(f"スキーマベースで配列化: {path_keys} -> delimiter='{default_delimiter}'")
+            if isinstance(value, list):
+                value = [convert_string_to_array(v, default_delimiter) for v in value]
+            else:
+                value = convert_string_to_array(value, default_delimiter)
+        
+        logger.debug(f"配列化後の値: {value}")
         insert_json_path(result, path_keys, value)
 
     return result
@@ -399,6 +539,10 @@ def main() -> None:
         '--prefix', type=str, default='json.',
         help='Excel 名前付き範囲のプレフィックス (デフォルト: json.)'
     )
+    parser.add_argument(
+        '--array-split', action='append', default=[],
+        help='配列化設定 (形式: "json.parent.1=," または "json.parent=\\n")'
+    )
     args = parser.parse_args()
 
     # ログ設定
@@ -414,12 +558,15 @@ def main() -> None:
     validator = Draft7Validator(schema) if schema else None
     suppress_empty = not args.keep_empty
 
+    # 配列化設定のパース
+    array_split_rules = parse_array_split_rules(args.array_split, args.prefix)
+
     # schemaをグローバル変数にセット（parse_named_rangesで参照）
     global _global_schema
     _global_schema = schema
 
     for xlsx_path in xlsx_files:
-        data = parse_named_ranges_with_prefix(xlsx_path, prefix=args.prefix)
+        data = parse_named_ranges_with_prefix(xlsx_path, prefix=args.prefix, array_split_rules=array_split_rules)
 
         # 出力先設定
         out_dir = args.output_dir if args.output_dir else xlsx_path.parent / 'output-json'
