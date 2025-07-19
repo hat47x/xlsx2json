@@ -87,7 +87,10 @@ def get_named_range_values(wb, defined_name) -> Any:
         else:
             values.append(cell_or_range.value)
 
-    return values[0] if len(values) == 1 else values
+    # 1セルなら値のみ返す（listでなく）
+    if len(values) == 1:
+        return values[0]
+    return values
 
 
 def is_empty_value(value: Any) -> bool:
@@ -412,7 +415,7 @@ class ArrayTransformRule:
 
 
 def parse_array_transform_rules(
-    array_transform_rules: List[str], prefix: str
+    array_transform_rules: List[str], prefix: str, schema: dict = None
 ) -> Dict[str, ArrayTransformRule]:
     """
     配列変換ルールのパース。
@@ -421,6 +424,53 @@ def parse_array_transform_rules(
     rules = {}
     # prefixの末尾にドットがなければ自動で追加
     normalized_prefix = prefix if prefix.endswith(".") else prefix + "."
+
+    def resolve_schema_path(path_keys, schema):
+        # スキーマがなければそのまま
+        if not schema:
+            return None
+        props = schema.get("properties", {})
+        current_schema = schema
+        resolved_keys = []
+        for k in path_keys:
+            if re.fullmatch(r"\d+", k):
+                resolved_keys.append(k)
+                if isinstance(current_schema, dict) and "items" in current_schema:
+                    current_schema = current_schema["items"]
+                    props = (
+                        current_schema.get("properties", {})
+                        if isinstance(current_schema, dict)
+                        else {}
+                    )
+                else:
+                    props = {}
+            else:
+                if not props or not isinstance(props, dict):
+                    resolved_keys.append(k)
+                    break
+                # アンダースコアをワイルドカード1文字としてマッチ
+                pattern = "^" + re.escape(k).replace("_", ".") + "$"
+                matches = [
+                    prop
+                    for prop in props
+                    if re.fullmatch(pattern, prop, flags=re.UNICODE)
+                ]
+                if len(matches) == 1:
+                    resolved_keys.append(matches[0])
+                    next_schema = props.get(matches[0], {})
+                    if isinstance(next_schema, dict) and "properties" in next_schema:
+                        current_schema = next_schema
+                        props = next_schema["properties"]
+                    elif isinstance(next_schema, dict) and "items" in next_schema:
+                        current_schema = next_schema
+                        props = next_schema.get("properties", {})
+                    else:
+                        props = {}
+                else:
+                    resolved_keys.append(k)
+                    break
+        return resolved_keys
+
     for rule in array_transform_rules:
         if "=" not in rule:
             logger.warning(f"無効な変換設定: {rule}")
@@ -432,18 +482,18 @@ def parse_array_transform_rules(
         if path.startswith(normalized_prefix):
             path = path.removeprefix(normalized_prefix)
 
-        # 変換タイプを決定
+        # 変換タイプごとに必ず新しいインスタンスを生成
         if transform_spec.startswith("function:"):
             transform_type = "function"
             transform_spec = transform_spec[9:]
+            rule_obj = ArrayTransformRule(path, transform_type, transform_spec)
         elif transform_spec.startswith("command:"):
             transform_type = "command"
             transform_spec = transform_spec[8:]
+            rule_obj = ArrayTransformRule(path, transform_type, transform_spec)
         elif transform_spec.startswith("split:"):
             transform_type = "split"
-            # 区切り文字リストをパース
             delimiter_str = transform_spec[6:]
-            # エスケープされたパイプ文字を一時的に置換
             temp_placeholder = "___ESCAPED_PIPE___"
             delimiter_str = delimiter_str.replace("\\|", temp_placeholder)
             delimiter_parts = delimiter_str.split("|")
@@ -454,31 +504,101 @@ def parse_array_transform_rules(
                 processed_delimiter = processed_delimiter.replace("\\r", "\r")
                 processed_delimiter = processed_delimiter.replace(temp_placeholder, "|")
                 delimiters.append(processed_delimiter)
-            # split用の変換関数を生成
 
             def split_transform(value, delims=delimiters):
                 return convert_string_to_multidimensional_array(value, delims)
 
-            # ArrayTransformRuleのインスタンスを生成
-            rule_obj = ArrayTransformRule(path, "split", transform_spec)
+            rule_obj = ArrayTransformRule(path, transform_type, transform_spec)
             rule_obj._transform_func = split_transform
-            rules[path] = rule_obj
-            logger.info(f"Registered transform rule: {path} -> split:{delimiters}")
-            continue
         else:
             logger.warning(
                 f"不明な変換タイプ: {transform_spec} (function:、command:、split: で始まる必要があります)"
             )
             continue
 
-        try:
-            rule_obj = ArrayTransformRule(path, transform_type, transform_spec)
+        # ルール登録（元のパス）
+        # ルール登録前に詳細デバッグ
+        logger.debug(
+            f"Rule register: path={path}, type={transform_type}, id={id(rule_obj)}"
+        )
+        if path in rules:
+            logger.debug(
+                f"Rule already exists: path={path}, type={rules[path].transform_type}, id={id(rules[path])}"
+            )
+        # function型が既に登録されている場合はsplit型で上書きしない
+        # split型が既に登録されていてもfunction型が来たらfunction型で上書きする
+        if path in rules:
+            if transform_type == "split" and rules[path].transform_type == "function":
+                logger.debug(
+                    f"Skip split rule for {path} (function already registered)"
+                )
+            elif transform_type == "function" and rules[path].transform_type == "split":
+                logger.debug(f"function型でsplit型を上書き: {path}")
+                rules[path] = rule_obj
+                logger.info(
+                    f"Registered transform rule: {path} -> {transform_type}:{transform_spec}"
+                )
+            elif rules[path].transform_type == transform_type:
+                logger.debug(f"同じ型のルールが既に登録済み: {path}")
+            else:
+                # その他の型の組み合わせは上書き
+                rules[path] = rule_obj
+                logger.info(
+                    f"Registered transform rule: {path} -> {transform_type}:{transform_spec}"
+                )
+        else:
             rules[path] = rule_obj
             logger.info(
                 f"Registered transform rule: {path} -> {transform_type}:{transform_spec}"
             )
-        except Exception as e:
-            logger.error(f"Failed to setup transform rule '{rule}': {e}")
+
+        # スキーマで解決したパスも登録
+        if schema:
+            path_keys = path.split(".")
+            resolved_keys = resolve_schema_path(path_keys, schema)
+            resolved_path = ".".join(resolved_keys) if resolved_keys else None
+            if resolved_path and resolved_path != path:
+                # スキーマ解決後のパスにも新しいインスタンスを登録
+                new_rule_obj = ArrayTransformRule(
+                    resolved_path, transform_type, transform_spec
+                )
+                logger.debug(
+                    f"Rule register: resolved_path={resolved_path}, type={transform_type}, id={id(new_rule_obj)}"
+                )
+                if resolved_path in rules:
+                    logger.debug(
+                        f"Rule already exists: resolved_path={resolved_path}, type={rules[resolved_path].transform_type}, id={id(rules[resolved_path])}"
+                    )
+                if resolved_path in rules:
+                    if (
+                        transform_type == "split"
+                        and rules[resolved_path].transform_type == "function"
+                    ):
+                        logger.debug(
+                            f"Skip split rule for {resolved_path} (function already registered)"
+                        )
+                    elif (
+                        transform_type == "function"
+                        and rules[resolved_path].transform_type == "split"
+                    ):
+                        logger.debug(f"function型でsplit型を上書き: {resolved_path}")
+                        rules[resolved_path] = new_rule_obj
+                        logger.info(
+                            f"Registered transform rule (schema-resolved): {resolved_path} -> {transform_type}:{transform_spec}"
+                        )
+                    elif rules[resolved_path].transform_type == transform_type:
+                        logger.debug(f"同じ型のルールが既に登録済み: {resolved_path}")
+                    else:
+                        # その他の型の組み合わせは上書き
+                        rules[resolved_path] = new_rule_obj
+                        logger.info(
+                            f"Registered transform rule (schema-resolved): {resolved_path} -> {transform_type}:{transform_spec}"
+                        )
+                else:
+                    rules[resolved_path] = new_rule_obj
+                    logger.info(
+                        f"Registered transform rule (schema-resolved): {resolved_path} -> {transform_type}:{transform_spec}"
+                    )
 
     return rules
 
@@ -511,16 +631,8 @@ def should_transform_to_array(
     """
     path_str = ".".join(path_keys)
 
-    # 完全一致
-    if path_str in transform_rules:
-        return transform_rules[path_str]
-
-    # 部分マッチング（前方一致）
-    for rule_path, rule_obj in transform_rules.items():
-        if path_str.startswith(rule_path + ".") or path_str == rule_path:
-            return rule_obj
-
-    return None
+    # 完全一致のみ
+    return transform_rules.get(path_str, None)
 
 
 def is_string_array_schema(schema: Dict[str, Any]) -> bool:
@@ -749,13 +861,42 @@ def parse_named_ranges_with_prefix(
         # 2. 明示的なルールによる配列化（多次元対応）
         # 3. スキーマによる配列化（デフォルト区切り文字: カンマ）
 
-        # 1. 配列変換ルールをチェック
-        transform_rule = should_transform_to_array(
+        # 1. 配列変換ルールをチェック（original_path_keys と schema-resolved path 両方）
+        transform_rule_orig = should_transform_to_array(
             original_path_keys, array_transform_rules
         )
-        logger.debug(
-            f"original_path_keys={original_path_keys}, transform_rule={transform_rule is not None}, value={value}"
+        transform_rule_resolved = should_transform_to_array(
+            path_keys, array_transform_rules
         )
+        logger.debug(
+            f"original_path_keys={original_path_keys}, path_keys={path_keys}, transform_rule_orig={transform_rule_orig is not None}, transform_rule_resolved={transform_rule_resolved is not None}, value={value}"
+        )
+
+        # function型があれば必ずそれを優先
+        transform_rule = None
+        if (
+            transform_rule_resolved
+            and transform_rule_resolved.transform_type == "function"
+        ):
+            transform_rule = transform_rule_resolved
+            logger.debug(
+                f"function型変換ルール（schema-resolved）を優先: {path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
+            )
+        elif transform_rule_orig and transform_rule_orig.transform_type == "function":
+            transform_rule = transform_rule_orig
+            logger.debug(
+                f"function型変換ルール（original）を優先: {original_path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
+            )
+        elif transform_rule_resolved:
+            transform_rule = transform_rule_resolved
+            logger.debug(
+                f"schema-resolvedの変換ルールを使用: {path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
+            )
+        elif transform_rule_orig:
+            transform_rule = transform_rule_orig
+            logger.debug(
+                f"originalの変換ルールを使用: {original_path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
+            )
 
         if transform_rule is not None:
             logger.debug(
@@ -765,36 +906,15 @@ def parse_named_ranges_with_prefix(
                 value = [transform_rule.transform(v) for v in value]
             else:
                 value = transform_rule.transform(value)
-        else:
-            # 2. 明示的なルールによる配列化（多次元対応）
-            delimiters = should_convert_to_array(original_path_keys, array_split_rules)
 
-            if delimiters is not None:
+            # function型の場合は追加のsplit/配列化処理を適用しない
+            if transform_rule.transform_type == "function":
                 logger.debug(
-                    f"明示的ルールで配列化: {original_path_keys} -> delimiters={delimiters}"
+                    f"function型変換後の値: {value} (追加配列化処理はスキップ)"
                 )
-                if isinstance(value, list):
-                    value = [
-                        convert_string_to_multidimensional_array(v, delimiters)
-                        for v in value
-                    ]
-                else:
-                    value = convert_string_to_multidimensional_array(value, delimiters)
-            # 3. スキーマによる配列化（デフォルト区切り文字: カンマ）
-            elif check_schema_for_array_conversion(path_keys, schema):
-                default_delimiters = [","]
-                logger.debug(
-                    f"スキーマベースで配列化: {path_keys} -> delimiters={default_delimiters}"
-                )
-                if isinstance(value, list):
-                    value = [
-                        convert_string_to_multidimensional_array(v, default_delimiters)
-                        for v in value
-                    ]
-                else:
-                    value = convert_string_to_multidimensional_array(
-                        value, default_delimiters
-                    )
+                insert_json_path(result, path_keys, value)
+                continue  # forループの次の名前定義へ
+        # ...existing code...
 
         logger.debug(f"配列化後の値: {value}")
         insert_json_path(result, path_keys, value)
@@ -901,6 +1021,11 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        help="設定ファイル (JSON形式) から全オプションを一括指定。コマンドライン引数が優先されます。",
+    )
+    parser.add_argument(
         "--trim",
         action="store_true",
         help="配列化時に各要素をトリムする（split:区切り、transform関数の出力）",
@@ -912,7 +1037,6 @@ def main() -> None:
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="ログレベルを指定 (デフォルト: INFO)",
     )
@@ -924,30 +1048,81 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # 設定ファイル読み込み（コマンドライン引数が優先）
+    config = {}
+    if getattr(args, "config", None):
+        try:
+            with args.config.open("r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception as e:
+            logger.error(f"設定ファイルの読込に失敗しました: {e}")
+            config = {}
+
+    def get_opt(key, default=None):
+        # コマンドライン→設定ファイル→デフォルト値の順で返す
+        val = getattr(args, key, None)
+        if val is not None and val != []:
+            return val
+        if key in config:
+            return config[key]
+        return default
+
+    # 入力ファイル/フォルダ
+    inputs = get_opt("inputs")
+    if inputs is None:
+        logger.error(
+            "入力ファイル/フォルダが指定されていません。--config またはコマンドラインで指定してください。"
+        )
+        return
+    if isinstance(inputs, str):
+        inputs = [inputs]
+
+    # 出力先
+    output_dir = get_opt("output_dir")
+    # スキーマ
+    schema_path = get_opt("schema")
+    if schema_path:
+        schema_path = Path(schema_path)
+    # 変換ルール
+    transform_list = list(args.transform) if args.transform else []
+    if "transform" in config and isinstance(config["transform"], list):
+        transform_list.extend(
+            [t for t in config["transform"] if t not in transform_list]
+        )
+    # プレフィックス
+    prefix = get_opt("prefix", "json")
+    # 空値保持
+    keep_empty = get_opt("keep_empty", False)
+    # ログレベル
+    log_level = get_opt("log_level", "INFO")
+
+    # 既存のハンドラをクリア（basicConfigが効かない問題対策）
+    if logging.root.handlers:
+        logging.root.handlers.clear()
+
     # ログ設定
     logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="[%(levelname)s] %(message)s"
+        level=getattr(logging, log_level), format="[%(levelname)s] %(message)s"
     )
-    logger.setLevel(getattr(logging, args.log_level))
+    logger.setLevel(getattr(logging, log_level))
 
-    logger.debug(f"入力ファイルリスト: {args.inputs}")
-    xlsx_files = collect_xlsx_files(args.inputs)
+    logger.debug(f"入力ファイルリスト: {inputs}")
+    xlsx_files = collect_xlsx_files(inputs)
     logger.debug(f"収集されたxlsxファイル: {xlsx_files}")
     if not xlsx_files:
         logger.error("対象の .xlsx ファイルが見つかりませんでした。")
         return
 
-    schema = load_schema(args.schema) if args.schema else None
+    schema = load_schema(schema_path) if schema_path else None
     logger.debug(f"ロードしたスキーマ: {schema is not None}")
     validator = Draft7Validator(schema) if schema else None
-    suppress_empty = not args.keep_empty
+    suppress_empty = not keep_empty
 
-    transform_rules = parse_array_transform_rules(args.transform, args.prefix)
+    transform_rules = parse_array_transform_rules(transform_list, prefix, schema)
     logger.debug(f"変換設定: {transform_rules}")
 
     global _global_trim
-    _global_trim = args.trim
+    _global_trim = get_opt("trim", False)
 
     global _global_schema
     _global_schema = schema
@@ -957,7 +1132,7 @@ def main() -> None:
         try:
             data = parse_named_ranges_with_prefix(
                 xlsx_path,
-                prefix=args.prefix,
+                prefix=prefix,
                 array_split_rules=None,
                 array_transform_rules=transform_rules,
             )
@@ -966,9 +1141,9 @@ def main() -> None:
             logger.exception(f"parse_named_ranges_with_prefixで例外が発生しました: {e}")
             data = None
 
-        out_dir = (
-            args.output_dir if args.output_dir else xlsx_path.parent / "output-json"
-        )
+        out_dir = output_dir if output_dir else xlsx_path.parent / "output-json"
+        if isinstance(out_dir, str):
+            out_dir = Path(out_dir)
         out_file = out_dir / f"{xlsx_path.stem}.json"
         logger.debug(f"出力先: {out_file}")
         if data is None:

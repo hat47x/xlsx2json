@@ -53,6 +53,6 @@
       }
     }
   },
-  "required": ["customer", "parent", "日本語！"],
-  "additionalProperties": false
+  "required": ["customer", "parent"],
+  "additionalProperties": true
 }

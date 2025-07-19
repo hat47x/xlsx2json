@@ -55,9 +55,39 @@ python xlsx2json.py [INPUT1 ...] [OPTIONS]
 | `-o, --output-dir` | 一括出力先フォルダを指定。省略時は各入力ファイルと同じディレクトリの `output-json/` に出力されます。 |
 | `-s, --schema` | JSON Schema ファイルを指定。バリデーションとキー順序の整理に使用されます。 |
 | `--transform RULE` | 変換設定。指定した名前付き範囲の値に対し、split（区切り文字による配列化）、function（Python関数）、command（外部コマンド）による変換を適用（複数指定可）。 |
+| `--config FILE` | 設定ファイル（JSON形式）から全オプションを一括指定。コマンドライン引数が優先されます。 |
 | `--keep-empty` | 空のセル値も JSON に含めます（デフォルトでは空値を除去）。 |
 | `--prefix PREFIX` | Excel 名前付き範囲のプレフィックスを指定（デフォルト: `json`）。 |
 | `--log-level LEVEL` | ログレベルを指定（`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`、デフォルト: `INFO`）。 |
+
+---
+
+## 設定ファイルによる一括指定
+
+`--config` オプションで、変換ルール以外も含めた全オプションをJSON形式で一括指定できます。
+
+### 設定ファイル例（config.json）
+```json
+{
+  "inputs": ["sample.xlsx"],
+  "output_dir": "output-json",
+  "schema": "sample-schema.json",
+  "transform": [
+    "json.tags=split:,",
+    "json.matrix=split:,|\n"
+  ],
+  "prefix": "json",
+  "keep_empty": false,
+  "log_level": "INFO"
+}
+```
+
+### 実行例
+```bash
+python xlsx2json.py --config config.json
+```
+
+コマンドライン引数で指定した値は、設定ファイルより優先されます。
 
 ---
 
