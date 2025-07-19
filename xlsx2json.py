@@ -802,44 +802,36 @@ def parse_named_ranges_with_prefix(
     for name, defined_name in wb.defined_names.items():
         if not name.startswith(normalized_prefix):
             continue
-        original_path_keys = name.removeprefix(normalized_prefix).split(".")
-        # 空文字列キーが出現しないように除去
-        original_path_keys = [k for k in original_path_keys if k != ""]
+        # セル範囲名からjson.を除去し、'.'で分割して空文字列を除去
+        original_path_keys = [k for k in name.removeprefix(normalized_prefix).split(".") if k]
         path_keys = original_path_keys.copy()
 
+        # スキーマ解決
+        schema_path_keys = []
+        schema_broken = False
         if schema is not None:
             props = schema.get("properties", {})
             items = schema.get("items", {})
-            new_keys = []
             current_schema = schema
             for k in path_keys:
                 if re.fullmatch(r"\d+", k):
-                    new_keys.append(k)
+                    schema_path_keys.append(k)
                     if isinstance(current_schema, dict) and "items" in current_schema:
                         current_schema = current_schema["items"]
-                        props = (
-                            current_schema.get("properties", {})
-                            if isinstance(current_schema, dict)
-                            else {}
-                        )
-                        items = (
-                            current_schema.get("items", {})
-                            if isinstance(current_schema, dict)
-                            else {}
-                        )
+                        props = current_schema.get("properties", {}) if isinstance(current_schema, dict) else {}
+                        items = current_schema.get("items", {}) if isinstance(current_schema, dict) else {}
                     else:
                         props = {}
                         items = {}
                 else:
                     if not props or not isinstance(props, dict):
                         logger.debug(f"props is empty or not dict at key={k}, break")
+                        schema_broken = True
                         break
                     logger.debug(f"props.keys() at key={k}: {list(props.keys())}")
                     new_k = match_schema_key(k, props)
-                    new_keys.append(new_k)
-                    next_schema = (
-                        props.get(new_k, {}) if isinstance(props, dict) else {}
-                    )
+                    schema_path_keys.append(new_k)
+                    next_schema = props.get(new_k, {}) if isinstance(props, dict) else {}
                     if isinstance(next_schema, dict) and "properties" in next_schema:
                         current_schema = next_schema
                         props = next_schema["properties"]
@@ -851,7 +843,9 @@ def parse_named_ranges_with_prefix(
                     else:
                         props = {}
                         items = {}
-            path_keys = new_keys
+            # スキーマで途中までしか解決できなかった場合は original_path_keys を使う
+            if not schema_broken:
+                path_keys = schema_path_keys
 
         # 値を取得
         value = get_named_range_values(wb, defined_name)
@@ -862,59 +856,46 @@ def parse_named_ranges_with_prefix(
         # 3. スキーマによる配列化（デフォルト区切り文字: カンマ）
 
         # 1. 配列変換ルールをチェック（original_path_keys と schema-resolved path 両方）
-        transform_rule_orig = should_transform_to_array(
-            original_path_keys, array_transform_rules
-        )
-        transform_rule_resolved = should_transform_to_array(
-            path_keys, array_transform_rules
-        )
-        logger.debug(
-            f"original_path_keys={original_path_keys}, path_keys={path_keys}, transform_rule_orig={transform_rule_orig is not None}, transform_rule_resolved={transform_rule_resolved is not None}, value={value}"
-        )
+        # 変換ルールの判定は path_keys/original_path_keys 両方で探す
+        def get_transform_rule(array_transform_rules, path_keys, original_path_keys):
+            key_path = ".".join(path_keys)
+            orig_key_path = ".".join(original_path_keys)
+            # 完全一致優先
+            if key_path in array_transform_rules:
+                return array_transform_rules[key_path]
+            elif orig_key_path in array_transform_rules:
+                return array_transform_rules[orig_key_path]
+            # 配列要素の場合は親キーでも判定
+            if len(path_keys) > 1 and ".".join(path_keys[:-1]) in array_transform_rules:
+                return array_transform_rules[".".join(path_keys[:-1])]
+            if len(original_path_keys) > 1 and ".".join(original_path_keys[:-1]) in array_transform_rules:
+                return array_transform_rules[".".join(original_path_keys[:-1])]
+            return None
 
-        # function型があれば必ずそれを優先
-        transform_rule = None
-        if (
-            transform_rule_resolved
-            and transform_rule_resolved.transform_type == "function"
-        ):
-            transform_rule = transform_rule_resolved
-            logger.debug(
-                f"function型変換ルール（schema-resolved）を優先: {path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
-            )
-        elif transform_rule_orig and transform_rule_orig.transform_type == "function":
-            transform_rule = transform_rule_orig
-            logger.debug(
-                f"function型変換ルール（original）を優先: {original_path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
-            )
-        elif transform_rule_resolved:
-            transform_rule = transform_rule_resolved
-            logger.debug(
-                f"schema-resolvedの変換ルールを使用: {path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
-            )
-        elif transform_rule_orig:
-            transform_rule = transform_rule_orig
-            logger.debug(
-                f"originalの変換ルールを使用: {original_path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
-            )
+        transform_rule = get_transform_rule(array_transform_rules, path_keys, original_path_keys)
+        logger.debug(
+            f"original_path_keys={original_path_keys}, path_keys={path_keys}, transform_rule={transform_rule is not None}, value={value}"
+        )
 
         if transform_rule is not None:
+            insert_keys = path_keys if ".".join(path_keys) in array_transform_rules else original_path_keys
             logger.debug(
-                f"配列変換ルールで変換: {original_path_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
+                f"変換ルールで変換: {insert_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
             )
             if isinstance(value, list):
                 value = [transform_rule.transform(v) for v in value]
             else:
                 value = transform_rule.transform(value)
 
-            # function型の場合は追加のsplit/配列化処理を適用しない
+            # function型の場合は追加のsplit/配列化処理はスキップ
             if transform_rule.transform_type == "function":
                 logger.debug(
                     f"function型変換後の値: {value} (追加配列化処理はスキップ)"
                 )
-                insert_json_path(result, path_keys, value)
-                continue  # forループの次の名前定義へ
-        # ...existing code...
+            # どちらのキーで挿入するか判定
+            insert_keys = path_keys if ".".join(path_keys) in array_transform_rules else original_path_keys
+            insert_json_path(result, insert_keys, value)
+            continue
 
         logger.debug(f"配列化後の値: {value}")
         insert_json_path(result, path_keys, value)
@@ -969,10 +950,19 @@ def write_json(
     if schema:
         data = reorder_json(data, schema)
 
+    # datetime型を文字列に変換する関数
+    def json_default(obj):
+        import datetime
+        if isinstance(obj, datetime.datetime):
+            return obj.isoformat()
+        if isinstance(obj, datetime.date):
+            return obj.isoformat()
+        return str(obj)
+
     # ファイル書き出し
     output_dir.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2, default=json_default)
 
     logger.info(f"ファイルの出力に成功しました: {output_path}")
 
