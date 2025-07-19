@@ -208,7 +208,10 @@ def clean_empty_arrays_contextually(
 
 
 def insert_json_path(
-    root: Union[Dict[str, Any], List[Any]], keys: List[str], value: Any
+    root: Union[Dict[str, Any], List[Any]],
+    keys: List[str],
+    value: Any,
+    full_path: str = "",
 ) -> None:
     """
     ドット区切りキーのリストから JSON 構造を構築し、値を挿入する。
@@ -216,6 +219,7 @@ def insert_json_path(
     """
     key = keys[0]
     is_last = len(keys) == 1
+    current_path = f"{full_path}.{key}" if full_path else key
 
     if re.fullmatch(r"\d+", key):
         idx = int(key) - 1
@@ -228,16 +232,25 @@ def insert_json_path(
         else:
             if root[idx] is None:
                 root[idx] = [] if re.fullmatch(r"\d+", keys[1]) else {}
-            insert_json_path(root[idx], keys[1:], value)
+            insert_json_path(root[idx], keys[1:], value, current_path)
     else:
+        # dict型でない場合は、呼び出し元の親dictの該当キーをdictに置き換える
         if not isinstance(root, dict):
-            raise TypeError(f"Expected dict at {keys}, got {type(root)}")
+            raise TypeError(f"insert_json_path: root must be dict, got {type(root)}")
         if is_last:
             root[key] = value
         else:
+            # 既存値がstr型などの場合はdictに置き換え、元の値を'__value__'キーに退避
+            if key in root and not isinstance(root[key], (dict, list)):
+                prev_value = root[key]
+                logger.warning(
+                    f"パス重複が検出されました: '{current_path}' - "
+                    f"既存値を '__value__' キーに退避します (値: {prev_value})"
+                )
+                root[key] = {"__value__": prev_value}
             if key not in root:
                 root[key] = [] if re.fullmatch(r"\d+", keys[1]) else {}
-            insert_json_path(root[key], keys[1:], value)
+            insert_json_path(root[key], keys[1:], value, current_path)
 
 
 def parse_array_split_rules(
@@ -803,7 +816,9 @@ def parse_named_ranges_with_prefix(
         if not name.startswith(normalized_prefix):
             continue
         # セル範囲名からjson.を除去し、'.'で分割して空文字列を除去
-        original_path_keys = [k for k in name.removeprefix(normalized_prefix).split(".") if k]
+        original_path_keys = [
+            k for k in name.removeprefix(normalized_prefix).split(".") if k
+        ]
         path_keys = original_path_keys.copy()
 
         # スキーマ解決
@@ -818,8 +833,16 @@ def parse_named_ranges_with_prefix(
                     schema_path_keys.append(k)
                     if isinstance(current_schema, dict) and "items" in current_schema:
                         current_schema = current_schema["items"]
-                        props = current_schema.get("properties", {}) if isinstance(current_schema, dict) else {}
-                        items = current_schema.get("items", {}) if isinstance(current_schema, dict) else {}
+                        props = (
+                            current_schema.get("properties", {})
+                            if isinstance(current_schema, dict)
+                            else {}
+                        )
+                        items = (
+                            current_schema.get("items", {})
+                            if isinstance(current_schema, dict)
+                            else {}
+                        )
                     else:
                         props = {}
                         items = {}
@@ -831,7 +854,9 @@ def parse_named_ranges_with_prefix(
                     logger.debug(f"props.keys() at key={k}: {list(props.keys())}")
                     new_k = match_schema_key(k, props)
                     schema_path_keys.append(new_k)
-                    next_schema = props.get(new_k, {}) if isinstance(props, dict) else {}
+                    next_schema = (
+                        props.get(new_k, {}) if isinstance(props, dict) else {}
+                    )
                     if isinstance(next_schema, dict) and "properties" in next_schema:
                         current_schema = next_schema
                         props = next_schema["properties"]
@@ -868,17 +893,26 @@ def parse_named_ranges_with_prefix(
             # 配列要素の場合は親キーでも判定
             if len(path_keys) > 1 and ".".join(path_keys[:-1]) in array_transform_rules:
                 return array_transform_rules[".".join(path_keys[:-1])]
-            if len(original_path_keys) > 1 and ".".join(original_path_keys[:-1]) in array_transform_rules:
+            if (
+                len(original_path_keys) > 1
+                and ".".join(original_path_keys[:-1]) in array_transform_rules
+            ):
                 return array_transform_rules[".".join(original_path_keys[:-1])]
             return None
 
-        transform_rule = get_transform_rule(array_transform_rules, path_keys, original_path_keys)
+        transform_rule = get_transform_rule(
+            array_transform_rules, path_keys, original_path_keys
+        )
         logger.debug(
             f"original_path_keys={original_path_keys}, path_keys={path_keys}, transform_rule={transform_rule is not None}, value={value}"
         )
 
         if transform_rule is not None:
-            insert_keys = path_keys if ".".join(path_keys) in array_transform_rules else original_path_keys
+            insert_keys = (
+                path_keys
+                if ".".join(path_keys) in array_transform_rules
+                else original_path_keys
+            )
             logger.debug(
                 f"変換ルールで変換: {insert_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
             )
@@ -893,12 +927,16 @@ def parse_named_ranges_with_prefix(
                     f"function型変換後の値: {value} (追加配列化処理はスキップ)"
                 )
             # どちらのキーで挿入するか判定
-            insert_keys = path_keys if ".".join(path_keys) in array_transform_rules else original_path_keys
-            insert_json_path(result, insert_keys, value)
+            insert_keys = (
+                path_keys
+                if ".".join(path_keys) in array_transform_rules
+                else original_path_keys
+            )
+            insert_json_path(result, insert_keys, value, ".".join(insert_keys))
             continue
 
         logger.debug(f"配列化後の値: {value}")
-        insert_json_path(result, path_keys, value)
+        insert_json_path(result, path_keys, value, ".".join(path_keys))
 
     return result
 
@@ -953,6 +991,7 @@ def write_json(
     # datetime型を文字列に変換する関数
     def json_default(obj):
         import datetime
+
         if isinstance(obj, datetime.datetime):
             return obj.isoformat()
         if isinstance(obj, datetime.date):
