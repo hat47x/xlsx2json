@@ -54,10 +54,10 @@ python xlsx2json.py [INPUT1 ...] [OPTIONS]
 | `INPUT1 ...` | 変換対象のファイルまたはフォルダ（.xlsx）。フォルダ指定時は直下の `.xlsx` ファイルを対象とします。 |
 | `-o, --output-dir` | 一括出力先フォルダを指定。省略時は各入力ファイルと同じディレクトリの `output-json/` に出力されます。 |
 | `-s, --schema` | JSON Schema ファイルを指定。バリデーションとキー順序の整理に使用されます。 |
+| `--transform RULE` | 変換設定。指定した名前付き範囲の値に対し、split（区切り文字による配列化）、function（Python関数）、command（外部コマンド）による変換を適用（複数指定可）。 |
 | `--keep-empty` | 空のセル値も JSON に含めます（デフォルトでは空値を除去）。 |
-| `--prefix PREFIX` | Excel 名前付き範囲のプレフィックスを指定（デフォルト: `json.`）。 |
+| `--prefix PREFIX` | Excel 名前付き範囲のプレフィックスを指定（デフォルト: `json`）。 |
 | `--log-level LEVEL` | ログレベルを指定（`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`、デフォルト: `INFO`）。 |
-| `--array-split RULE` | 配列化設定。指定した名前付き範囲の値を区切り文字で分割して配列化（複数指定可）。 |
 
 ---
 
@@ -65,10 +65,11 @@ python xlsx2json.py [INPUT1 ...] [OPTIONS]
 
 1. **ファイル収集**: 入力パスから `.xlsx` ファイルを収集
 2. **データ読み込み**: 名前付き範囲（`json.*`）を読み込み、ネスト構造の辞書・リストを生成
-3. **空値処理**: （デフォルト）空の値を除去（`--keep-empty` オプションで保持可能）
-4. **バリデーション**: （オプション）Schema バリデーションとエラーログ出力
-5. **キー整理**: （オプション）Schema の `properties` 順にキーを整理
-6. **ファイル出力**: JSON ファイルとして書き出し
+3. **変換処理**: `--transform` オプションで指定したルールに従い、値の配列化・関数変換・コマンド変換等を適用
+4. **空値処理**: （デフォルト）空の値を除去（`--keep-empty` オプションで保持可能）
+5. **バリデーション**: （オプション）Schema バリデーションとエラーログ出力
+6. **キー整理**: （オプション）Schema の `properties` 順にキーを整理
+7. **ファイル出力**: JSON ファイルとして書き出し
 
 ---
 
@@ -126,96 +127,57 @@ json.orders.1.items.3.name → { "orders": [{ "items": [null, null, { "name": ..
 
 ---
 
-## 配列化オプション（--array-split）
 
-### 基本的な使用方法
+## 変換ルール指定（--transform）
 
-`--array-split` オプションは、Excelの名前付き範囲の値を区切り文字で分割し、JSON配列として出力します。
+Excelの名前付き範囲から抽出した値に対して、柔軟な変換ルールを指定できます。
 
-#### 構文
-```bash
---array-split "json.パス=区切り文字"
-```
+### 配列化（split）
 
-#### 基本例
+区切り文字で値を配列化したい場合は、`split:` 変換タイプを使います。
+
+#### 実行例
+
 ```bash
 # カンマ区切りで配列化
-python xlsx2json.py sample.xlsx --array-split "json.tags=,"
+python xlsx2json.py sample.xlsx --transform "json.tags=split:,"
+# → ["apple", "banana", "orange"]
 
 # 改行区切りで配列化
-python xlsx2json.py sample.xlsx --array-split "json.parent.1=\n"
+python xlsx2json.py sample.xlsx --transform "json.parent.1=split:\n"
+# → ["A", "B", "C"]
 
-# 複数指定
-python xlsx2json.py sample.xlsx --array-split "json.tags=," --array-split "json.parent.1=\n"
+# 多次元配列（セミコロン→カンマ）
+python xlsx2json.py sample.xlsx --transform "json.matrix=split:;|,"
+# → [["A", "B"], ["C", "D"]]
+
+# パイプ文字を区切り文字として使用
+python xlsx2json.py sample.xlsx --transform "json.data=split:\|"
+# → ["A", "B", "C"]
+
+# 3次元配列（セミコロン→パイプ→カンマ）
+python xlsx2json.py sample.xlsx --transform "json.cube=split:;|\||,"
+# → [[["A", "B"], ["C", "D"]], [["E", "F"], ["G", "H"]]]
 ```
 
-### 多次元配列の対応
+区切り文字は `|` で区切って多次元配列に対応します。
+パイプ文字自体を区切り文字にする場合は `\|` でエスケープします。
+改行（`\n`）、タブ（`\t`）、復帰（`\r`）も利用可能です。
 
-#### 区切り文字の指定方法
-パイプ文字（`|`）で区切って、1次元目、2次元目、3次元目...の区切り文字を指定できます。
+### Python関数による変換
 
 ```bash
-# 1次元配列: カンマ区切り
---array-split "json.data=,"
-# "A,B,C" → ["A", "B", "C"]
-
-# 2次元配列: セミコロンで1次元目、カンマで2次元目を区切り
---array-split "json.matrix=;|,"
-# "A,B;C,D" → [["A", "B"], ["C", "D"]]
-
-# 3次元配列: セミコロン、パイプ、カンマで各次元を区切り
---array-split "json.cube=;|\||,"
-# "A,B|C,D;E,F|G,H" → [[["A", "B"], ["C", "D"]], [["E", "F"], ["G", "H"]]]
+python xlsx2json.py sample.xlsx --transform "json.tags=function:mymodule:split_func"
+python xlsx2json.py sample.xlsx --transform "json.tags=function:/path/to/script.py:split_func"
+# → Python関数で値を変換
 ```
 
-### エスケープ処理
-
-#### パイプ文字を区切り文字として使用
-パイプ文字（`|`）を実際の区切り文字として使用したい場合は、`\|` でエスケープします。
+### 外部コマンドによる変換
 
 ```bash
-# パイプ文字を1次元目の区切り文字として使用
---array-split "json.data=\\|"
-# "A|B|C" → ["A", "B", "C"]
-
-# パイプ文字を1次元目、カンマを2次元目の区切り文字として使用
---array-split "json.matrix=\\||,"
-# "A,B|C,D" → [["A", "B"], ["C", "D"]]
-
-# セミコロンを1次元目、パイプ文字を2次元目の区切り文字として使用
---array-split "json.mixed=;|\\|"
-# "A|B;C|D" → [["A", "B"], ["C", "D"]]
-
-# 複雑な例：3次元配列でパイプ文字を含む
---array-split "json.complex=;|\\||,"
-# "A,B|C,D;E,F|G,H" → [[["A", "B"], ["C", "D"]], [["E", "F"], ["G", "H"]]]
+python xlsx2json.py sample.xlsx --transform "json.lines=command:sort -u"
+# → sortコマンドで値を変換
 ```
-
-#### 標準的なエスケープシーケンス
-```bash
-# 改行、タブ、復帰文字
---array-split "json.data=\n"  # 改行区切り
---array-split "json.data=\t"  # タブ区切り
---array-split "json.data=\r"  # 復帰文字区切り
-```
-
-### 実際の使用例
-
-| Excelの名前定義 | セル値 | オプション例 | 出力例 |
-|---|---|---|---|
-| `json.tags` | `apple,banana,orange` | `--array-split "json.tags=,"` | `["apple", "banana", "orange"]` |
-| `json.parent.1` | `A\nB\nC` | `--array-split "json.parent.1=\n"` | `["A", "B", "C"]` |
-| `json.matrix` | `A,B;C,D` | `--array-split "json.matrix=;|,"` | `[["A", "B"], ["C", "D"]]` |
-| `json.data` | `A\|B\|C` | `--array-split "json.data=\\|"` | `["A", "B", "C"]` |
-
-### 注意点
-
-- プレフィックス（`json.`など）は自動的に除去されます
-- 区切り文字が含まれない場合は1要素の配列となります
-- 複数の `--array-split` を指定すると、それぞれのパスに個別に適用されます
-- 配列化対象のパスは、Excelの名前付き範囲の階層表現で指定します
-
----
 
 ## 記号ワイルドカード対応
 
@@ -277,66 +239,94 @@ python xlsx2json.py sample.xlsx --schema sample-schema.json --log-level DEBUG
 ```json
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Sample",
   "type": "object",
   "properties": {
-    "customer_name": {"type": "string"},
     "parent": {
       "type": "array",
+      "description": "4次元配列(縦×横×セル内縦×横)",
       "items": {
         "type": "array",
-        "items": {"type": "string"}
+        "description": "3次元配列(横×セル内縦×横)",
+        "items": {
+          "type": "array",
+          "description": "2次元配列(セル内縦×横)",
+          "items": {
+            "type": "array",
+            "description": "1次元配列(セル内横)",
+            "items": {
+              "type": "string",
+              "description": "文字列"
+            }
+          }
+        }
+      }
+    },
+    "customer": {
+      "type": "object",
+      "description": "顧客",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "氏名"
+        },
+        "address": {
+          "type": "string",
+          "description": "住所"
+        }
+      },
+      "required": ["name", "address"],
+      "additionalProperties": false
+    },
+    "日本語！": {
+      "type": "object",
+      "properties": {
+        "記号！": {
+          "type": "string",
+          "description": "Excelの「名前の定義」で使用できない記号をパスに含むケース"
+        },
+        "（記／号）～": {
+          "type": "string",
+          "description": "Excelの「名前の定義」で使用できない記号をパスに含むケース２"
+        }
       }
     }
   },
-  "required": ["customer_name", "parent"],
+  "required": ["customer", "parent", "日本語！"],
   "additionalProperties": false
 }
 ```
 
----
+## 変換ルール指定（--transform）
 
-## 実用的な使用例
+Excelの名前付き範囲から抽出した値に対して、柔軟な変換ルールを指定できます。
 
-### 基本的な使用
+### 配列化（split）
 
-```bash
-# 単一ファイルの変換
-python xlsx2json.py data.xlsx
+区切り文字で値を配列化したい場合は、`split:` 変換タイプを使います。
 
-# 複数ファイルの変換
-python xlsx2json.py file1.xlsx file2.xlsx
+例：
 
-# フォルダ内のすべての .xlsx ファイルを変換
-python xlsx2json.py ./data_folder/
+```
+--transform "json.tags=split:,"
+--transform "json.matrix=split:;|,"
+--transform "json.data=split:\||,"
 ```
 
-### 高度な使用例
+区切り文字は `|` で区切って多次元配列に対応します。
+パイプ文字自体を区切り文字にする場合は `\|` でエスケープします。
 
-```bash
-# 出力先を指定
-python xlsx2json.py data.xlsx --output-dir ./json_output/
+### Python関数による変換
 
-# JSON Schema を使用してバリデーション
-python xlsx2json.py data.xlsx --schema schema.json
+```
+--transform "json.tags=function:mymodule:split_func"
+--transform "json.tags=function:/path/to/script.py:split_func"
+```
 
-# 空のセル値も含めて出力
-python xlsx2json.py data.xlsx --keep-empty
+### 外部コマンドによる変換
 
-# 名前付き範囲のプレフィックスを変更
-python xlsx2json.py data.xlsx --prefix myprefix.
-
-# ログレベルをDEBUGにして詳細な処理ログを出力
-python xlsx2json.py data.xlsx --log-level DEBUG
-
-# 複数のオプションを組み合わせ
-python xlsx2json.py ./data/ \
-  --output-dir ./output/ \
-  --schema schema.json \
-  --keep-empty \
-  --prefix myprefix. \
-  --log-level DEBUG \
-  --array-split "json.tags=," \
-  --array-split "json.matrix=;|,"
+```
+--transform "json.lines=command:sort -u"
 ```
 
 ### 実際のワークフロー例
@@ -349,11 +339,9 @@ python xlsx2json.py sample.xlsx --schema validation.json --log-level DEBUG
 python xlsx2json.py ./production_data/ \
   --output-dir ./json_output/ \
   --schema production_schema.json \
-  --array-split "json.categories=," \
-  --array-split "json.nested_data=;|,"
+  --transform "json.categories=split:," \
+  --transform "json.nested_data=split:;|,"
 ```
-
----
 
 ## ライセンス
 
