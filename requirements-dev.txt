@@ -1,0 +1,10 @@
+# Development dependencies
+# Include base requirements
+-r requirements.txt
+
+# Testing
+pytest>=8.4.1
+pytest-cov>=4.0.0
+
+# Development tools
+tox>=4.0.0

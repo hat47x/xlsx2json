@@ -1,3 +1,7 @@
+"""
+xlsx2json - Excel の名前付き範囲を JSON に変換するツール
+"""
+
 import argparse
 import json
 import re
@@ -11,6 +15,10 @@ from typing import Any, Dict, List, Optional, Union, Callable
 from openpyxl import load_workbook
 from jsonschema import Draft7Validator
 
+
+# グローバル変数
+_global_trim = False
+_global_schema = None
 
 logger = logging.getLogger("xlsx2json")
 
@@ -1011,7 +1019,7 @@ def main() -> None:
         description="Excel 名前付き範囲(json.*) -> JSON ファイル出力",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-変換設定の例:
+変換ルールの例:
   配列化:
     1次元配列化: --transform "json.tags=split:,"  (カンマで分割)
     2次元配列化: --transform "json.matrix=split:,|\n"  (カンマ→改行で分割)
@@ -1025,7 +1033,7 @@ def main() -> None:
         """,
     )
     parser.add_argument(
-        "inputs", nargs="+", help="変換対象のファイルまたはフォルダ (.xlsx)"
+        "inputs", nargs="*", help="変換対象のファイルまたはフォルダ (.xlsx)"
     )
     parser.add_argument(
         "--output-dir",
@@ -1043,21 +1051,17 @@ def main() -> None:
         "--transform",
         action="append",
         default=[],
-        help=(
-            '変換設定 (形式: "json.path=function:module:func" または\n'
-            '"json.path=command:cmd args" または \n'
-            '"json.path=split:delim1 | delim2 | ..." )'
-        ),
+        help="変換ルール",
     )
     parser.add_argument(
         "--config",
         type=Path,
-        help="設定ファイル (JSON形式) から全オプションを一括指定。コマンドライン引数が優先されます。",
+        help="設定ファイル",
     )
     parser.add_argument(
         "--trim",
         action="store_true",
-        help="配列化時に各要素をトリムする（split:区切り、transform関数の出力）",
+        help="配列化時に各要素をトリムする",
     )
     parser.add_argument(
         "--keep-empty",
@@ -1073,7 +1077,7 @@ def main() -> None:
         "--prefix",
         type=str,
         default="json",
-        help="Excel 名前付き範囲のプレフィックス (デフォルト: json)",
+        help="Excelセル名のプレフィックス",
     )
     args = parser.parse_args()
 
@@ -1090,17 +1094,22 @@ def main() -> None:
     def get_opt(key, default=None):
         # コマンドライン→設定ファイル→デフォルト値の順で返す
         val = getattr(args, key, None)
-        if val is not None and val != []:
-            return val
+        # inputsの場合は空のリストでも設定ファイルを確認
+        if key == "inputs":
+            if val:  # 空でないリストの場合
+                return val
+        else:
+            if val is not None and val != []:
+                return val
         if key in config:
             return config[key]
         return default
 
     # 入力ファイル/フォルダ
     inputs = get_opt("inputs")
-    if inputs is None:
+    if not inputs:
         logger.error(
-            "入力ファイル/フォルダが指定されていません。--config またはコマンドラインで指定してください。"
+            "入力ファイル/フォルダが指定されていません。コマンドライン引数または --config で指定してください。"
         )
         return
     if isinstance(inputs, str):
@@ -1167,7 +1176,7 @@ def main() -> None:
             )
             logger.debug(f"parse_named_ranges_with_prefix結果: {data}")
         except Exception as e:
-            logger.exception(f"parse_named_ranges_with_prefixで例外が発生しました: {e}")
+            logger.exception(f"例外が発生しました: {e}")
             data = None
 
         out_dir = output_dir if output_dir else xlsx_path.parent / "output-json"
