@@ -23,6 +23,11 @@ _global_schema = None
 logger = logging.getLogger("xlsx2json")
 
 
+# =============================================================================
+# Core Utilities
+# =============================================================================
+
+
 def load_schema(schema_path: Optional[Path]) -> Optional[Dict[str, Any]]:
     """
     指定されたパスから JSON スキーマを読み込む。
@@ -31,8 +36,26 @@ def load_schema(schema_path: Optional[Path]) -> Optional[Dict[str, Any]]:
     if not schema_path:
         return None
 
-    with schema_path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    if not schema_path.exists():
+        raise FileNotFoundError(f"スキーマファイルが見つかりません: {schema_path}")
+
+    if not schema_path.is_file():
+        raise ValueError(f"指定されたパスはファイルではありません: {schema_path}")
+
+    try:
+        with schema_path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        # 詳細なエラー情報をログに出力し、元の例外を再発生
+        logger.error(f"無効なJSONフォーマットです: {schema_path} - {e}")
+        raise  # 元のJSONDecodeErrorを再発生
+    except Exception as e:
+        raise IOError(f"スキーマファイルの読み込みに失敗しました: {schema_path} - {e}")
+
+
+# =============================================================================
+# Schema Operations
+# =============================================================================
 
 
 def validate_and_log(
@@ -52,7 +75,12 @@ def validate_and_log(
             path = ".".join(str(p) for p in err.path)
             f.write(f"{path}: {err.message}\n")
 
-    logger.info(f"Validation errors logged: {log_file}")
+    logger.debug(f"Validation errors written to: {log_file}")
+
+
+# =============================================================================
+# Data Validation and Cleaning
+# =============================================================================
 
 
 def reorder_json(
@@ -215,6 +243,11 @@ def clean_empty_arrays_contextually(
         return obj if not is_empty_value(obj) else None
 
 
+# =============================================================================
+# JSON Path Operations
+# =============================================================================
+
+
 def insert_json_path(
     root: Union[Dict[str, Any], List[Any]],
     keys: List[str],
@@ -225,6 +258,12 @@ def insert_json_path(
     ドット区切りキーのリストから JSON 構造を構築し、値を挿入する。
     数字キーは list、文字列キーは dict として扱う。
     """
+    # 空のパスの場合のエラーハンドリング
+    if not keys:
+        raise ValueError(
+            "JSONパスが空です。値を挿入するには少なくとも1つのキーが必要です。"
+        )
+
     key = keys[0]
     is_last = len(keys) == 1
     current_path = f"{full_path}.{key}" if full_path else key
@@ -272,8 +311,15 @@ def parse_array_split_rules(
 
     戻り値: {path: [delimiter1, delimiter2, ...]}
     """
+    if not prefix or not isinstance(prefix, str):
+        raise ValueError("prefixは空ではない文字列である必要があります。")
+
     rules = {}
     for rule in array_split_rules:
+        if not rule or not isinstance(rule, str):
+            logger.warning(f"無効なルール形式をスキップします: {rule}")
+            continue
+
         if "=" not in rule:
             logger.warning(f"無効な配列化設定: {rule}")
             continue
@@ -304,10 +350,23 @@ def parse_array_split_rules(
     return rules
 
 
+# =============================================================================
+# Array Transform Rules
+# =============================================================================
+
+
 class ArrayTransformRule:
     """配列変換ルールを表すクラス"""
 
     def __init__(self, path: str, transform_type: str, transform_spec: str):
+        # パラメータの基本検証
+        if not path or not isinstance(path, str):
+            raise ValueError("pathは空ではない文字列である必要があります。")
+        if not transform_type or not isinstance(transform_type, str):
+            raise ValueError("transform_typeは空ではない文字列である必要があります。")
+        if not transform_spec or not isinstance(transform_spec, str):
+            raise ValueError("transform_specは空ではない文字列である必要があります。")
+
         self.path = path
         self.transform_type = transform_type  # 'function', 'command', 'split'
         self.transform_spec = transform_spec
@@ -442,6 +501,9 @@ def parse_array_transform_rules(
     配列変換ルールのパース。
     形式: "json.path=function:module:func_name" または "json.path=command:cat"
     """
+    if not prefix or not isinstance(prefix, str):
+        raise ValueError("prefixは空ではない文字列である必要があります。")
+
     rules = {}
     # prefixの末尾にドットがなければ自動で追加
     normalized_prefix = prefix if prefix.endswith(".") else prefix + "."
@@ -624,6 +686,11 @@ def parse_array_transform_rules(
     return rules
 
 
+# =============================================================================
+# Array Processing
+# =============================================================================
+
+
 def should_convert_to_array(
     path_keys: List[str], split_rules: Dict[str, List[str]]
 ) -> Optional[List[str]]:
@@ -770,6 +837,11 @@ def convert_string_to_array(value: Any, delimiter: str) -> Any:
     return result if result else []
 
 
+# =============================================================================
+# Named Range Parsing
+# =============================================================================
+
+
 def parse_named_ranges_with_prefix(
     xlsx_path: Path,
     prefix: str,
@@ -782,7 +854,29 @@ def parse_named_ranges_with_prefix(
     array_split_rules: 配列化設定の辞書 {path: [delimiter1, delimiter2, ...]}
     array_transform_rules: 配列変換設定の辞書 {path: ArrayTransformRule}
     """
-    wb = load_workbook(xlsx_path, data_only=True)
+    # 文字列パスをPathオブジェクトに変換（互換性のため）
+    if isinstance(xlsx_path, str):
+        xlsx_path = Path(xlsx_path)
+
+    if not xlsx_path or not isinstance(xlsx_path, Path):
+        raise ValueError(
+            "xlsx_pathは有効なPathオブジェクトまたは文字列パスである必要があります。"
+        )
+
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"Excelファイルが見つかりません: {xlsx_path}")
+
+    if not xlsx_path.is_file():
+        raise ValueError(f"指定されたパスはファイルではありません: {xlsx_path}")
+
+    if not prefix or not isinstance(prefix, str):
+        raise ValueError("prefixは空ではない文字列である必要があります。")
+
+    try:
+        wb = load_workbook(xlsx_path, data_only=True)
+    except Exception as e:
+        raise ValueError(f"Excelファイルの読み込みに失敗しました: {xlsx_path} - {e}")
+
     result: Dict[str, Any] = {}
 
     # schemaファイルがあれば読み込む
@@ -949,22 +1043,37 @@ def parse_named_ranges_with_prefix(
     return result
 
 
+# =============================================================================
+# File Operations
+# =============================================================================
+
+
 def collect_xlsx_files(paths: List[str]) -> List[Path]:
     """
     ファイルまたはディレクトリのリストから、対象となる .xlsx ファイル一覧を取得。
     ディレクトリ指定時は直下のみ。
     """
+    if not paths:
+        raise ValueError("入力パスのリストが空です。少なくとも1つのパスが必要です。")
+
     files: List[Path] = []
     for p in paths:
+        if not p or not isinstance(p, str):
+            logger.warning(f"無効なパス形式をスキップします: {p}")
+            continue
+
         p_path = Path(p)
-        if p_path.is_dir():
-            for entry in p_path.iterdir():
-                if entry.suffix.lower() == ".xlsx":
-                    files.append(entry)
-        elif p_path.is_file() and p_path.suffix.lower() == ".xlsx":
-            files.append(p_path)
-        else:
-            logger.warning(f"未処理のパス: {p_path}")
+        try:
+            if p_path.is_dir():
+                for entry in p_path.iterdir():
+                    if entry.suffix.lower() == ".xlsx":
+                        files.append(entry)
+            elif p_path.is_file() and p_path.suffix.lower() == ".xlsx":
+                files.append(p_path)
+            else:
+                logger.warning(f"未処理のパス: {p_path}")
+        except (OSError, PermissionError) as e:
+            logger.warning(f"パスへのアクセスに失敗しました: {p_path} - {e}")
     return files
 
 
@@ -1014,6 +1123,11 @@ def write_json(
     logger.info(f"ファイルの出力に成功しました: {output_path}")
 
 
+# =============================================================================
+# Main Program
+# =============================================================================
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Excel 名前付き範囲(json.*) -> JSON ファイル出力",
@@ -1027,7 +1141,7 @@ def main() -> None:
   Python関数:
     モジュール: --transform "json.tags=function:mymodule:split_func"
     ファイル: --transform "json.tags=function:/path/to/script.py:split_func"
-  外部コマンド: --transform "json.lines=command:sort -u"
+    外部コマンド: --transform "json.lines=command:sort -u"
 
   外部コマンドは標準入力から値を受け取り、標準出力に結果を返します。
         """,
