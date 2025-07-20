@@ -1,0 +1,13 @@
+{
+  "inputs": ["samples/sample.xlsx"],
+  "output_dir": "samples/output-json",
+  "schema": "samples/schema.json",
+  "transform": [
+    "json.parent=split:,|\n",
+    "json.日本語！.（記／号）～=function:samples/transform.py:string_transform",
+    "json.command_test=command:sort -u"
+  ],
+  "prefix": "json",
+  "keep_empty": true,
+  "log_level": "INFO"
+}

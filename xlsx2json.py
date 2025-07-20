@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+"""
+xlsx2json - Excel の名前付き範囲を JSON に変換するツール
+
+単一ファイルで実行可能なスタンドアロンツール
+"""
+
 import argparse
 import json
 import re
@@ -11,6 +18,10 @@ from typing import Any, Dict, List, Optional, Union, Callable
 from openpyxl import load_workbook
 from jsonschema import Draft7Validator
 
+
+# グローバル変数
+_global_trim = False
+_global_schema = None
 
 logger = logging.getLogger("xlsx2json")
 
@@ -208,10 +219,7 @@ def clean_empty_arrays_contextually(
 
 
 def insert_json_path(
-    root: Union[Dict[str, Any], List[Any]],
-    keys: List[str],
-    value: Any,
-    full_path: str = "",
+    root: Union[Dict[str, Any], List[Any]], keys: List[str], value: Any, full_path: str = ""
 ) -> None:
     """
     ドット区切りキーのリストから JSON 構造を構築し、値を挿入する。
@@ -1025,7 +1033,7 @@ def main() -> None:
         """,
     )
     parser.add_argument(
-        "inputs", nargs="+", help="変換対象のファイルまたはフォルダ (.xlsx)"
+        "inputs", nargs="*", help="変換対象のファイルまたはフォルダ (.xlsx)"
     )
     parser.add_argument(
         "--output-dir",
@@ -1090,17 +1098,22 @@ def main() -> None:
     def get_opt(key, default=None):
         # コマンドライン→設定ファイル→デフォルト値の順で返す
         val = getattr(args, key, None)
-        if val is not None and val != []:
-            return val
+        # inputsの場合は空のリストでも設定ファイルを確認
+        if key == "inputs":
+            if val:  # 空でないリストの場合
+                return val
+        else:
+            if val is not None and val != []:
+                return val
         if key in config:
             return config[key]
         return default
 
     # 入力ファイル/フォルダ
     inputs = get_opt("inputs")
-    if inputs is None:
+    if not inputs:
         logger.error(
-            "入力ファイル/フォルダが指定されていません。--config またはコマンドラインで指定してください。"
+            "入力ファイル/フォルダが指定されていません。コマンドライン引数または --config で指定してください。"
         )
         return
     if isinstance(inputs, str):
