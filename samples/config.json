@@ -9,5 +9,35 @@
   ],
   "prefix": "json",
   "keep_empty": true,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "containers": {
+    "json.表1": {
+      "range": "表1.range",
+      "direction": "row",
+      "items": ["列A", "列B", "列C"],
+      "labels": ["列A", "列B", "列C"]
+    },
+    "json.リスト1": {
+      "range": "リスト1.range",
+      "direction": "row", 
+      "items": ["aaa名称", "aaaコード", "bbb名称", "bbbコード"],
+      "labels": ["aaa名称", "aaaコード", "bbb名称", "bbbコード"]
+    },
+    "json.ツリー1": {
+      "range": "ツリー1.range",
+      "direction": "row",
+      "items": ["seq", "A"],
+      "labels": ["seq", "A"]
+    },
+    "json.ツリー1.lv1.1.lv2": {
+      "offset": 1,
+      "items": ["seq", "B"],
+      "labels": ["seq", "B"]
+    },
+    "json.ツリー1.lv1.1.lv2.1.lv3": {
+      "offset": 1,
+      "items": ["seq", "C"],
+      "labels": ["seq", "C"]
+    }
+  }
 }

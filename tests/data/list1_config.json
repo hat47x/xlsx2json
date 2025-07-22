@@ -1,0 +1,15 @@
+{
+  "inputs": ["tests/data/table1.xlsx"],
+  "output_dir": "tests/data/output-json",
+  "prefix": "json",
+  "keep_empty": true,
+  "log_level": "INFO",
+  "containers": {
+    "json.リスト1": {
+      "range": "リスト1.range",
+      "direction": "row", 
+      "items": ["aaa名称", "aaaコード", "bbb名称", "bbbコード"],
+      "labels": ["aaa名称", "aaaコード", "bbb名称", "bbbコード"]
+    }
+  }
+}

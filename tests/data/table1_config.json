@@ -1,0 +1,15 @@
+{
+  "inputs": ["tests/data/table1.xlsx"],
+  "output_dir": "tests/data/output-json",
+  "prefix": "json",
+  "keep_empty": true,
+  "log_level": "INFO",
+  "containers": {
+    "json.表1": {
+      "range": "表1.range",
+      "direction": "row",
+      "items": ["列A", "列B", "列C"],
+      "labels": ["列A", "列B", "列C"]
+    }
+  }
+}

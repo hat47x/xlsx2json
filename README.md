@@ -15,6 +15,9 @@ Excelの「名前付き範囲」（以降「セル名」）を用いて事前に
 セル名にドット `.` 区切りのキー階層を記載することで、自動的にネストした JSON 構造に変換します。複雑な階層データも直感的に定義可能です。
 セル名の先頭には `json.` を付加してください。本ツールではこのプレフィックスがついたセル名をJSON出力に用います。
 
+### 🔄 繰り返し構造の自動処理
+コンテナ機能により、Excel の繰り返し構造（テーブル、カード型レイアウト、階層構造）を自動検出・処理できます。罫線解析による構造判定で、手動でのセル名設定作業を大幅に軽減します。
+
 ### 📋 JSON Schema サポート
 `--schema` オプションで JSON Schema を指定することで、データのバリデーションおよびキー順序の指定が可能です。バリデーションエラーは `<basename>.error.log` に出力されます。
 
@@ -59,8 +62,18 @@ python xlsx2json.py samples/sample.xlsx --schema samples/schema.json
 ```bash
 # カンマ区切りデータを配列に変換
 python xlsx2json.py samples/sample.xlsx --transform "json.parent=split:,"
+```
 
-# 設定ファイルを用いることで大量の変換ルールにも対応
+### 4. コンテナによる繰り返し構造の自動処理
+```bash
+# テーブル形式の繰り返しデータを自動検出・変換
+python xlsx2json.py samples/sample.xlsx \
+  --container '{"json.orders":{"range":"A1:C10","direction":"row","items":["date","customer","amount"]}}'
+```
+
+### 5. 設定ファイルの利用
+```bash
+# 設定ファイルで大規模な変換ルールや複雑な階層構造を定義
 python xlsx2json.py samples/sample.xlsx --config samples/config.json
 ```
 
@@ -97,6 +110,7 @@ python xlsx2json.py [INPUT1 ...] [OPTIONS]
 | `-o, --output-dir` | 一括出力先フォルダを指定。省略時は各入力ファイルと同じディレクトリの `output-json/` に出力されます。 |
 | `-s, --schema` | JSON Schema ファイルを指定。バリデーションやキー順序の整理などに使用されます。 |
 | `--transform RULE` | 変換ルールを指定。指定したセル名の値に対し、split（区切り文字による配列化）、function（Python関数）、command（外部コマンド）による変換を適用（複数指定可）。 |
+| `--container DEFINITION` | コンテナ定義を指定。Excel の繰り返し構造（テーブル、カード、階層構造）を自動検出・処理（複数指定可）。JSON形式で定義します。 |
 | `--keep-empty` | 空のセル値も JSON に含めます（デフォルト: true）。 |
 | `--prefix PREFIX` | Excel セル名のプレフィックスを指定（デフォルト: `json`）。 |
 | `--log-level LEVEL` | ログレベルを指定（`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`、デフォルト: `INFO`）。 |
@@ -118,6 +132,20 @@ python xlsx2json.py [INPUT1 ...] [OPTIONS]
     "json.tags=split:,",
     "json.matrix=split:,|\n"
   ],
+  "containers": {
+    "json.orders": {
+      "range": "orders_range",
+      "direction": "row",
+      "increment": 1,
+      "items": ["date", "customer_id", "amount"],
+      "labels": ["注文日", "顧客ID", "金額"]
+    },
+    "json.orders.1.items": {
+      "offset": 3,
+      "items": ["product_code", "quantity", "unit_price"],
+      "labels": ["商品コード", "数量", "単価"]
+    }
+  },
   "prefix": "json",
   "keep_empty": false,
   "log_level": "INFO"
@@ -131,6 +159,10 @@ python xlsx2json.py --config config.json
 
 # 設定ファイル + コマンドライン引数の組み合わせ（コマンドライン引数が優先）
 python xlsx2json.py --config config.json --log-level DEBUG
+
+# 設定ファイル + 追加のコンテナ定義
+python xlsx2json.py --config config.json \
+  --container '{"json.additional":{"range":"E1:G10","direction":"row","items":["extra1","extra2"]}}'
 ```
 
 コマンドライン引数で指定した値は、設定ファイルより優先されます。
@@ -245,6 +277,72 @@ python xlsx2json.py samples/sample.xlsx --transform "json.tags=function:/path/to
 # sortコマンドを指定
 python xlsx2json.py samples/sample.xlsx --transform "json.lines=command:sort -u"
 ```
+
+---
+
+## コンテナ指定（--container）
+
+Excelの繰り返し構造（テーブル、カード型レイアウト、階層構造）を自動検出・処理するためのコンテナ定義をコマンドラインで指定できます。
+
+### 基本書式
+
+```bash
+--container '{"セル名": JSON定義}'
+```
+
+JSON定義は、設定ファイルの `containers` セクションと同じ形式を使用します。
+
+#### 使用例
+
+##### 基本的なテーブル定義
+```bash
+# シンプルなテーブル
+python xlsx2json.py sample.xlsx \
+  --container '{"json.orders":{"range":"A1:C10","direction":"row","items":["date","customer","amount"]}}'
+
+# ラベル検証付き
+python xlsx2json.py sample.xlsx \
+  --container '{"json.orders":{"range":"orders_range","direction":"row","items":["date","customer","amount"],"labels":["注文日","顧客名","金額"]}}'
+```
+
+##### 親子関係（ネスト構造）
+```bash
+# 親コンテナ
+python xlsx2json.py sample.xlsx \
+  --container '{"json.orders":{"range":"orders_range","direction":"row","items":["date","customer","items"]}}' \
+  --container '{"json.orders.1.items":{"offset":3,"items":["product","quantity","price"]}}'
+```
+
+##### カード型レイアウト
+```bash
+# 多段組みカード
+python xlsx2json.py sample.xlsx \
+  --container '{"json.customers":{"range":"A1:C20","direction":"column","increment":5,"items":["name","phone","address"]}}'
+```
+
+##### 階層構造（ツリー）
+```bash
+# 3階層のツリー構造
+python xlsx2json.py sample.xlsx \
+  --container '{"json.tree_data":{"range":"tree_range","direction":"row","items":["name","value","seq"]}}' \
+  --container '{"json.tree_data.lv1.1.lv2":{"offset":1,"items":["name","value","seq"]}}' \
+  --container '{"json.tree_data.lv1.1.lv2.1.lv3":{"offset":1,"items":["name","value","seq"]}}'
+```
+
+### 設定ファイルとの組み合わせ
+
+```bash
+# 設定ファイル + 追加のコンテナ定義
+python xlsx2json.py --config config.json \
+  --container '{"json.additional":{"range":"Z1:Z10","direction":"row","items":["extra_field"]}}'
+```
+
+### 注意点
+
+- JSON文字列はシェルでのエスケープに注意（シングルクォートを推奨）
+- 複数のコンテナは `--container` を複数回指定
+- コマンドライン指定は設定ファイルの `containers` より優先されます
+- 同じセル名の定義が重複した場合、後から指定したものが優先されます
 
 ## 記号ワイルドカード対応
 
