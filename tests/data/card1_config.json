@@ -1,0 +1,16 @@
+{
+  "inputs": ["tests/data/table1.xlsx"],
+  "output_dir": "tests/data/output-json",
+  "prefix": "json",
+  "keep_empty": true,
+  "log_level": "INFO",
+  "containers": {
+    "json.card": {
+      "range": "card.range",
+      "direction": "row", 
+      "increment": 5,
+      "items": ["customer_name", "address", "tel"],
+      "labels": ["顧客名", "住所", "電話番号"]
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "inputs": ["tests/data/table1.xlsx"],
+  "output_dir": "tests/data/output-json",
+  "prefix": "json",
+  "keep_empty": true,
+  "log_level": "INFO",
+  "containers": {
+    "json.ツリー1": {
+      "range": "ツリー1.range",
+      "direction": "row",
+      "items": ["seq", "A"],
+      "labels": ["seq", "A"]
+    },
+    "json.ツリー1.lv1.1.lv2": {
+      "offset": 1,
+      "items": ["seq", "B"],
+      "labels": ["seq", "B"]
+    },
+    "json.ツリー1.lv1.1.lv2.1.lv3": {
+      "offset": 1,
+      "items": ["seq", "C"],
+      "labels": ["seq", "C"]
+    }
+  }
+}
