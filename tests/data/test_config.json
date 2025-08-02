@@ -1,6 +1,7 @@
 {
-  "input-files": ["tests/data/table1.xlsx"],
-  "output-dir": "tests/data/output",
+  "input-files": ["tests/data/sample.xlsx"],
+  "output-dir": "tests/data/output", "inputs": ["tests/data/table1.xlsx"],
+  "output_dir": "tests/data/output",
   "prefix": "json",
   "keep-empty": true,
   "log-level": "INFO",
@@ -11,5 +12,4 @@
       "items": ["列A", "列B", "列C"],
       "labels": ["列A", "列B", "列C"]
     }
-  }
 }

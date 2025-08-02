@@ -1,15 +1,15 @@
 {
-  "inputs": ["samples/sample.xlsx"],
-  "output_dir": "samples/output-json",
+  "input-files": ["samples/sample.xlsx"],
+  "output-dir": "samples/output",
   "schema": "samples/schema.json",
   "transform": [
     "json.parent=split:,|\n",
-    "json.日本語！.（記／号）～=function:samples/transform.py:string_transform",
-    "json.command_test=command:sort -u"
+    "json.日本語！.（記／号）～=function:samples/transform.py:normalize",
+    "json.command_test=command:sort -u",
+    "json.matrix_example=range:A1:C3:function:samples/transform.py:total"
   ],
   "prefix": "json",
-  "keep_empty": true,
-  "log_level": "INFO",
+  "keep-empty": true,
   "containers": {
     "json.表1": {
       "range": "表1.range",
@@ -39,5 +39,6 @@
       "items": ["seq", "C"],
       "labels": ["seq", "C"]
     }
-  }
+  },
+  "log-level": "INFO"
 }

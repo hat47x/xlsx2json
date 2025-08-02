@@ -1,0 +1,68 @@
+# xlsx2json YAML設定ファイル例
+# JSON形式も引き続き使用可能（JSONはYAMLのサブセット）
+
+# 入力ファイル指定
+input-files:
+  - samples/sample.xlsx
+
+# 出力設定
+output-dir: output
+output-format: yaml  # json または yaml
+
+# JSON Schema指定（バリデーション用）
+schema: samples/schema.json
+
+# 変換ルール
+transform:
+  - "json.tags=split:,"                    # カンマ区切りで配列化
+  - "json.matrix=split:,|\n"               # 2次元配列（カンマ→改行）
+  - "json.name=function:samples/transform.py:normalize"  # 文字列正規化
+  - "json.orders.*.date=function:date:parse_japanese_date"     # 日付変換
+  - "json.orders.*.amount=function:math:parse_currency"        # 金額変換
+
+# コンテナ定義（繰り返し構造の自動処理）
+containers:
+  # 注文テーブル
+  json.orders:
+    range: orders_range    # セル名で範囲指定
+    direction: row         # 行方向の繰り返し
+    increment: 1           # 行間隔
+    items:                 # 各行の項目
+      - date
+      - customer_id
+      - amount
+    labels:                # ヘッダー行での検証用ラベル
+      - 注文日
+      - 顧客ID
+      - 金額
+  
+  # 注文明細（ネスト構造）
+  json.orders.1.items:
+    offset: 3              # 親コンテナからのオフセット列
+    items:
+      - product_code
+      - quantity
+      - unit_price
+    labels:
+      - 商品コード
+      - 数量
+      - 単価
+
+  # カード型レイアウト例
+  json.customers:
+    range: A20:C50
+    direction: column      # 列方向の繰り返し
+    increment: 5           # 5行おきにカード
+    items:
+      - name
+      - phone
+      - address
+    labels:
+      - 顧客名
+      - 電話番号
+      - 住所
+
+# その他のオプション
+prefix: json           # セル名のプレフィックス
+keep-empty: false      # 空の値を除外
+log-level: INFO        # ログレベル（DEBUG/INFO/WARNING/ERROR/CRITICAL）

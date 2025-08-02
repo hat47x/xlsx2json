@@ -1,9 +1,10 @@
 {
-  "inputs": ["tests/data/table1.xlsx"],
-  "output_dir": "tests/data/output-json",
+  "input-files": ["tests/data/card1.xlsx"],
+  "output-dir": "tests/data/output", "inputs": ["tests/data/table1.xlsx"],
+  "output_dir": "tests/data/output",
   "prefix": "json",
-  "keep_empty": true,
-  "log_level": "INFO",
+  "keep-empty": true,
+  "log-level": "INFO",
   "containers": {
     "json.card": {
       "range": "card.range",
