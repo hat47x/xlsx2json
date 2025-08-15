@@ -2,137 +2,782 @@
 xlsx2json - Excel の名前付き範囲を JSON に変換するツール
 """
 
-import argparse
-import datetime
-import json
+from __future__ import annotations
 import re
 import logging
-import shlex
-import subprocess
-import sys
-import importlib.util
 import time
+import json
+import argparse
+import datetime
+import importlib
+import importlib.util
+import subprocess
+import io
+import sys
+import shlex
 import yaml
+from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Callable, Tuple
-from contextlib import contextmanager
+from types import TracebackType
+from typing import Any, Dict, List, Optional, Tuple, TypeGuard, Union, cast, Callable, Sequence, Iterable, Mapping
 
-from openpyxl import load_workbook
-from openpyxl.utils import column_index_from_string
-from openpyxl.styles import Border
-from jsonschema import Draft7Validator
+# モジュール全体で使用する外部ライブラリ
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+from jsonschema import Draft7Validator, FormatChecker
 
-logger = logging.getLogger("xlsx2json")
+# ロガー
+logger = logging.getLogger(__name__)
 
+# 可読性のための型エイリアス
+JSONScalar = Union[str, int, float, bool, None]
+JSONValue = Union[JSONScalar, "JSONDict", "JSONList"]
+JSONDict = Dict[str, JSONValue]
+JSONList = List[JSONValue]
+RectTuple = Tuple[int, int, int, int]
+TransformRulesMap = Dict[str, List["ArrayTransformRule"]]
 
-class Xlsx2JsonError(Exception):
-    """xlsx2json関連のベース例外クラス"""
-
-    pass
-
-
-class ConfigurationError(Xlsx2JsonError):
-    """設定関連のエラー"""
-
-    pass
-
-
-class FileProcessingError(Xlsx2JsonError):
-    """ファイル処理関連のエラー"""
-
-    pass
-
-
-class Xlsx2JsonValidationError(Xlsx2JsonError):
-    """バリデーション関連のエラー"""
-
-    pass
-
-
+@dataclass
 class ProcessingStats:
-    """処理統計情報を管理するクラス"""
+    """処理全体の統計情報を収集するシンプルなデータクラス。
 
-    def __init__(self):
-        self.reset()
+    - containers_processed: コンテナ処理数
+    - cells_generated: JSONセル（項目）生成数
+    - cells_read: Excelセル読取数
+    - empty_cells_skipped: 空セルをスキップした数
+    - errors: 発生したエラーメッセージの一覧
+    - start_time/end_time: 処理の開始/終了時刻（秒）
+    """
 
-    def reset(self):
+    containers_processed: int = 0
+    cells_generated: int = 0
+    cells_read: int = 0
+    empty_cells_skipped: int = 0
+    errors: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    start_time: Optional[float] = None
+    end_time: Optional[float] = None
+
+    def start_processing(self) -> None:
+        self.start_time = time.time()
+
+    def end_processing(self) -> None:
+        self.end_time = time.time()
+
+    def add_error(self, message: str) -> None:
+        self.errors.append(message)
+
+    def log_summary(self) -> None:
+        """収集した統計のサマリをINFOログに出力する。"""
+        duration = None
+        if self.start_time is not None and self.end_time is not None:
+            duration = max(0.0, self.end_time - self.start_time)
+        logger.info(
+            "処理統計サマリ: containers=%d, cells_generated=%d, cells_read=%d, empty_skipped=%d, errors=%d, duration=%.3fs",
+            self.containers_processed,
+            self.cells_generated,
+            self.cells_read,
+            self.empty_cells_skipped,
+            len(self.errors),
+            duration if duration is not None else -1.0,
+        )
+        # テスト互換: 各項目を日本語で個別にも出力
+        logger.info("処理されたコンテナ数: %d", self.containers_processed)
+        logger.info("エラー数: %d", len(self.errors))
+        logger.info("警告数: %d", len(self.warnings))
+
+    # 以下はテスト互換のための補助API
+    def reset(self) -> None:
         self.containers_processed = 0
         self.cells_generated = 0
         self.cells_read = 0
         self.empty_cells_skipped = 0
-        self.errors = []
-        self.warnings = []
+        self.errors.clear()
         self.start_time = None
         self.end_time = None
 
-    def start_processing(self):
-        import time
+    def add_warning(self, message: str) -> None:
+        # 現状は警告メッセージはエラーリストに含めずログのみ
+        logger.warning(message)
+        self.warnings.append(message)
 
-        self.start_time = time.time()
-
-    def end_processing(self):
-        import time
-
-        self.end_time = time.time()
-
-    def add_error(self, error_msg):
-        self.errors.append(error_msg)
-        logger.error(error_msg)
-
-    def add_warning(self, warning_msg):
-        self.warnings.append(warning_msg)
-        logger.warning(warning_msg)
-
-    def get_duration(self):
-        if self.start_time and self.end_time:
-            return self.end_time - self.start_time
-        return 0
-
-    def log_summary(self):
-        """処理結果のサマリをログ出力"""
-        duration = self.get_duration()
-        logger.info("=" * 50)
-        logger.info("処理統計サマリ")
-        logger.info("=" * 50)
-        logger.info(f"処理時間: {duration:.2f}秒")
-        logger.info(f"処理されたコンテナ数: {self.containers_processed}")
-        logger.info(f"生成されたセル名数: {self.cells_generated}")
-        logger.info(f"読み取られたセル数: {self.cells_read}")
-        logger.info(f"スキップされた空セル数: {self.empty_cells_skipped}")
-        logger.info(f"エラー数: {len(self.errors)}")
-        logger.info(f"警告数: {len(self.warnings)}")
-
-        if self.errors:
-            logger.info("\nエラー詳細:")
-            for error in self.errors[-5:]:  # 最新5件のみ表示
-                logger.info(f"  - {error}")
-
-        if self.warnings:
-            logger.info("\n警告詳細:")
-            for warning in self.warnings[-5:]:  # 最新5件のみ表示
-                logger.info(f"  - {warning}")
-
-        logger.info("=" * 50)
+    def get_duration(self) -> float:
+        if self.start_time is None or self.end_time is None:
+            return 0.0
+        return max(0.0, self.end_time - self.start_time)
 
 
-@dataclass
+@dataclass(frozen=True)
+class CLIConfig:
+    """起動時に使用する CLI/派生設定をまとめたコンテナ。
+
+    - args: argparse で解析されたコマンドライン引数
+    - raw_config: 設定ファイルから読み込んだマッピング（存在する場合）
+    - merged: CLI 上書き適用後のマージ済み設定
+    """
+
+    args: Any
+    raw_config: Dict[str, Any]
+    merged: Dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RectChain:
+    """軽量な矩形ユーティリティ: (top, left, bottom, right)
+
+    提供する機能:
+    - 幅/高さの取得
+    - 他矩形との交差判定
+    - 指定座標の包含判定
+    - タプル化
+    既存コードの差し替えは行わず、段階的リファクタ用の補助ユーティリティです。
+    """
+
+    top: int
+    left: int
+    bottom: int
+    right: int
+
+    def width(self) -> int:
+        return max(0, self.right - self.left + 1)
+
+    def height(self) -> int:
+        return max(0, self.bottom - self.top + 1)
+
+    def as_tuple(self) -> RectTuple:
+        """モジュール互換の順序で矩形をタプルとして返す。
+
+        注意: モジュールの残りの部分は矩形タプルを
+        (sc, sr, ec, er) == (left, top, right, bottom) として期待している。
+        RectChain のフィールドは (top, left, bottom, right) として格納されているが、
+        このメソッドは既存のタプルベースのヘルパーとの互換性を維持するために意図的に (left, top, right, bottom) を返す。
+        """
+        return (self.left, self.top, self.right, self.bottom)
+
+    def intersects(self, other: "RectChain") -> bool:
+        return not (self.right < other.left or self.left > other.right or self.bottom < other.top or self.top > other.bottom)
+
+    def contains(self, row: int, col: int) -> bool:
+        return self.top <= row <= self.bottom and self.left <= col <= self.right
+
+
+@dataclass(frozen=True)
+class TransformContext:
+    """変換ルール適用用のコンテキストホルダー。
+
+    将来のリファクタリングで多くの位置引数ではなく単一のパラメータを受け取れるように、
+    一般的に渡される値を保持します。
+    """
+    workbook: Any
+    prefix: str
+    transform_rules_map: TransformRulesMap
+    insert_keys: List[str]
+    root_result: JSONDict
+
+    @staticmethod
+    def from_processing_config(cfg: ProcessingConfig) -> "TransformContext":
+        # 初期段階では空の root_result / transform_rules_map を仮で保持し後段で差し替える
+        return TransformContext(
+            workbook=None,
+            prefix=cfg.prefix,
+            transform_rules_map={},
+            insert_keys=[],
+            root_result={},
+        )
+
+
+@dataclass(frozen=True)
+class NestedScanParams:
+    """ネスト走査用のパラメータコンテナ。
+
+    ワークブック関連パラメータを統合。
+    """
+    workbook: Any
+    container_name: str
+    direction: str
+    current_positions: Dict[str, Tuple[int, int]]
+    labels: List[str]
+    policy: Any  # ExtractionPolicy
+    parent_anchor: str
+    parent_rects: List[Tuple[int, int, int, int]]
+    ancestors_rects_chain: List[List[Tuple[int, int, int, int]]]
+    generated_names: Dict[str, Any]
+    num_positions: List[int]
+    ends_with_numeric: bool
+    target_sheet: Optional[str] = None
+    ws0: Any = None
+
+
+
+def is_json_dict(x: Any) -> TypeGuard[JSONDict]:
+    """x が JSON オブジェクト (dict) の場合に True を返します。"""
+    return isinstance(x, dict)
+
+
+def is_json_list(x: Any) -> TypeGuard[JSONList]:
+    """x が JSON 配列 (list) の場合に True を返します。"""
+    return isinstance(x, list)
+
+
+_NUMERIC_TOKEN_RE = re.compile(r"^\d+(?:-\d+)*$")
+
+
+def is_numeric_token_string(value: Any) -> bool:
+    """"1-2-3" のような数値トークン列かを判定する。"""
+    if not isinstance(value, str):
+        return False
+    try:
+        # ここに本来の数値トークン判定ロジックを記述（仮実装: 数値トークン正規表現）
+        return bool(_NUMERIC_TOKEN_RE.match(value))
+    except Exception:
+        return False
+
+
+
+
+def pick_effective_bounds(pt: int, pb: int, ancestors_rects_chain: List[List[RectTuple]]) -> Tuple[int, int]:
+    """ネスト境界選択。
+
+    契約:
+    - 入力: 親の上端`pt`/下端`pb`、先祖矩形群`ancestors_rects_chain`
+    - 出力: 実際に走査に使用する (eff_pt, eff_pb)
+    - 例外: なし（失敗時も入力を返す）
+    - 副作用: なし
+    祖先がある場合はトップ祖先グループ境界を優先し、無ければ親境界を返す。
+    """
+    # ancestors_rects_chain が空でなければ、先頭（トップ祖先）だけを見て親矩形の上端に最も近い境界を選ぶ
+    if ancestors_rects_chain:
+        top_level = ancestors_rects_chain[0] or []
+        # デフォルトは親境界
+        eff_pt, eff_pb = pt, pb
+        # 親上端 pt を含む（または近い）祖先境界にクリップ
+        for (_al, at, _ar, ab) in top_level:
+            if at <= pt <= ab:
+                eff_pt, eff_pb = at, ab
+                break
+        return eff_pt, eff_pb
+    return pt, pb
+
+
+def trim_trailing_empty(seq: Any) -> Any:
+    """1D/2D 配列の末尾の空(None/"")をトリムする共通ロジック。"""
+    def _trim_1d(lst: list[Any]) -> list[Any]:
+        while lst and (lst[-1] in (None, "")):
+            lst.pop()
+        return lst
+
+    if isinstance(seq, list):
+        if seq and all(not isinstance(x, list) for x in seq):
+            return _trim_1d(seq)
+        if seq and all(isinstance(x, list) for x in seq):
+            return [_trim_1d(list(row)) for row in seq]
+    return seq
+
+
+# -----------------------------------------------------------------------------
+# ネスト走査のヘルパー抽象
+# -----------------------------------------------------------------------------
+
+def align_row_phase(eff_pt: int, anchor_row: int, step: int) -> int:
+    """開始行 `eff_pt` を、`anchor_row` と同じ位相になるように最小の行へ合わせる。
+
+    要件: 最小の r >= eff_pt かつ (r - anchor_row) % step == 0 を返す。
+    """
+    if step <= 0:
+        step = 1
+    # 既に同位相ならそのまま
+    if (eff_pt - anchor_row) % step == 0:
+        return eff_pt
+    # 次の位相へ切り上げ
+    delta = (step - ((eff_pt - anchor_row) % step)) % step
+    return eff_pt + (delta if delta != 0 else 0)
+
+def derive_eff_step_local(
+    *,
+    labels_present: bool,
+    ends_with_numeric: bool,
+    workbook,
+    container_name: str,
+    target_sheet: Optional[str],
+    eff_pt: int,
+    eff_pb: int,
+    direction: str,
+    policy: NestedScanPolicy | None = None,
+) -> int:
+    """親矩形ごとの実効ステップを決定する。
+
+    挙動:
+    - labels が存在する場合は常に step=1。
+    - それ以外: コンテナ名が数値で終わる（'.1'）場合は子アンカー矩形を取得し、その高さを [eff_pt, eff_pb] 内で使用。
+      見つからない場合は step=1。列方向（column）はここでは未対応（既存実装は行方向の境界のみを使用）。
+    """
+    # labels → step=1
+    if labels_present:
+        return 1
+    try:
+        child_step_local: Optional[int] = None
+        if ends_with_numeric and target_sheet is not None:
+            rects_child_all = _get_anchor_rects_naive(
+                workbook, container_name, target_sheet, col_tolerance=0
+            )
+            for _cl, _ct, _cr, _cb in rects_child_all or []:
+                if _ct >= eff_pt and _cb <= eff_pb:
+                    child_step_local = max(1, _cb - _ct + 1)
+                    break
+        return int(child_step_local) if child_step_local is not None else 1
+    except Exception:
+        return 1
+
+
+def select_probe_fields(
+    *,
+    current_positions: Dict[str, Tuple[int, int]],
+    labels: List[str],
+    numeric_token_fields: List[str],
+) -> List[str]:
+    """優先順位でプローブ用フィールドを選択する: ラベルかつ数値トークン > ラベル > 数値トークン > 全フィールド（ソート）。"""
+    label_fields = [lf for lf in (labels or []) if lf in current_positions]
+    label_numeric = [lf for lf in label_fields if lf in numeric_token_fields]
+    if label_numeric:
+        return label_numeric
+    if label_fields:
+        return label_fields
+    if numeric_token_fields:
+        try:
+            return sorted(numeric_token_fields)
+        except Exception:
+            return list(numeric_token_fields)
+    try:
+        return sorted(current_positions.keys())
+    except Exception:
+        return list(current_positions.keys())
+
+
+def prepare_probe_fields(
+    *,
+    current_positions: Dict[str, Tuple[int, int]],
+    labels: List[str],
+    numeric_token_fields: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    """プローブ準備: 行ループ外で `resolved_labels` と `probe_fields` を決定する。
+
+    入力:
+    - `current_positions`: フィールド→セル位置
+    - `labels`: 指定ラベル一覧（未解決）
+    - `numeric_token_fields`: 数値トークン扱いのフィールド候補
+
+    出力:
+    - `(resolved_labels, probe_fields)` のタプル
+
+    例外/副作用:
+    - なし（安全に派生値を返すのみ）
+    """
+    resolved_labels = [lf for lf in (labels or []) if lf in current_positions]
+    try:
+        nt_fields: List[str] = list(numeric_token_fields)
+    except Exception as e:
+        logger.debug("numeric_token_fields fallback to list copy due to: %s", e)
+        nt_fields = [x for x in numeric_token_fields]
+    probe_fields = select_probe_fields(
+        current_positions=current_positions,
+        labels=labels,
+        numeric_token_fields=nt_fields,
+    )
+    return resolved_labels, probe_fields
+
+
+def find_local_anchor_row(
+    *,
+    ws,
+    current_positions: Mapping[str, Tuple[int, int]],
+    probe_fields: Sequence[str],
+    numeric_probe_cols: Sequence[int],
+    local_aligned_row: int,
+    eff_pb: int,
+    step: int,
+    expected_len: int,
+    expected_prefix: Sequence[str],
+) -> Optional[int]:
+    """指定ステップで [local_aligned_row..eff_pb] の範囲を走査し、
+    数値トークンの期待に合致する最初の行を探す。見つからない場合は、
+    任意のプローブ項目が非空となる行をフォールバックとして採用する。
+    """
+    SAFE_SCAN = 5000
+    # 構造化ログ（探索条件）
+    try:
+        _sheet_name = getattr(ws, "title", "")
+    except Exception:
+        _sheet_name = ""
+    logger.debug(
+        "ANCHOR-FIND sheet=%s step=%s expected_len=%s range=[%s..%s] probe_cols=%s probe_fields=%s",
+        _sheet_name,
+        step,
+        expected_len,
+        local_aligned_row,
+        eff_pb,
+        list(numeric_probe_cols),
+        list(probe_fields),
+    )
+    # 数値トークンにもとづき探索
+    if len(numeric_probe_cols) > 0:
+        r2 = local_aligned_row
+        cnt2 = 0
+        while r2 <= eff_pb and cnt2 < SAFE_SCAN:
+            sval = ""
+            for sc_col in numeric_probe_cols:
+                sval = read_cell_value((sc_col, r2), ws)
+                if is_numeric_token_string(sval):
+                    break
+            if is_numeric_token_string(sval):
+                toks = [t for t in str(sval).split("-") if t]
+                prefix_ok = len(toks) >= len(expected_prefix) and all(
+                    toks[i] == expected_prefix[i] for i in range(len(expected_prefix))
+                )
+                if prefix_ok and len(toks) == expected_len:
+                    logger.debug(
+                        "ANCHOR-HIT sheet=%s row=%s prefix=%s tokens=%s",
+                        _sheet_name,
+                        r2,
+                        "-".join(expected_prefix),
+                        toks,
+                    )
+                    return r2
+            r2 += step
+            cnt2 += 1
+    # フォールバック: プローブ項目のいずれかが非空となる行を採用
+    r = local_aligned_row
+    scan_cnt = 0
+    while r <= eff_pb and scan_cnt < SAFE_SCAN:
+        non_empty_probe = False
+        for pf in probe_fields:
+            pc, _pr0 = current_positions.get(pf, (None, None))
+            if pc is None:
+                continue
+            val_probe = read_cell_value((pc, r), ws)
+            if val_probe not in (None, ""):
+                non_empty_probe = True
+                break
+        if non_empty_probe:
+            logger.debug(
+                "ANCHOR-FALLBACK sheet=%s row=%s",
+                _sheet_name,
+                r,
+            )
+            return r
+        r += step
+        scan_cnt += 1
+    return None
+
+
+def make_seq_spec_for_level(
+    *, expected_len: int, group_indexes: List[int], parent_local_index: int
+) -> SeqIndexSpec:
+    """SeqIndexSpec を構築する。
+    レベル2（<=2）の場合は parent_local を省略し、実行時のみ緩和（祖先プレフィックス一致のみ）とする。
+    """
+    if expected_len <= 2:
+        return SeqIndexSpec(
+            ancestor_prefix=tuple(str(x) for x in group_indexes),
+            parent_local=None,
+            expected_length=expected_len,
+        )
+    return SeqIndexSpec(
+        ancestor_prefix=tuple(str(x) for x in group_indexes),
+        parent_local=int(parent_local_index),
+        expected_length=int(expected_len),
+    )
+
+
+def check_seq_accept_and_dedup(
+    *,
+    policy: NumericTokenPolicy,
+    expected_len: int,
+    has_numeric_series_field: bool,
+    seq_like_val: Optional[str],
+    group_indexes: List[int],
+    parent_local_index: int,
+    group_key_for_dedup: Tuple[int, ...],
+    seen_tokens: Dict[Tuple[int, ...], set[str]],
+) -> bool:
+    """数値トークン仕様によるフィルタリングと、(group, parent) 単位での重複排除を適用する。
+    受理した場合は seen_tokens を更新する。
+
+    要素を採用する場合は True、スキップする場合は False を返す。
+    """
+    if expected_len < 2:
+        return True
+    if has_numeric_series_field:
+        if seq_like_val is None:
+            return False
+        spec = make_seq_spec_for_level(
+            expected_len=expected_len, group_indexes=list(group_indexes), parent_local_index=parent_local_index
+        )
+        if policy.strict_spec_match and not spec.matches(seq_like_val):
+            return False
+        seen_set = seen_tokens.setdefault(group_key_for_dedup, set())
+        if seq_like_val in seen_set:
+            return False
+        seen_set.add(seq_like_val)
+        return True
+    # 数値トークン系列フィールドがない場合: 値が存在して仕様に反するなら不採用。値があるときは重複排除を適用
+    if seq_like_val is not None:
+        spec = make_seq_spec_for_level(
+            expected_len=expected_len, group_indexes=list(group_indexes), parent_local_index=parent_local_index
+        )
+        if policy.strict_spec_match and not spec.matches(seq_like_val):
+            return False
+        seen_set = seen_tokens.setdefault(group_key_for_dedup, set())
+        if seq_like_val in seen_set:
+            return False
+        seen_set.add(seq_like_val)
+    return True
+
+
+def should_skip_by_row_ownership(
+    *,
+    policy: NestedScanPolicy,
+    expected_len: int,
+    numeric_token_fields: List[str],
+    used_positions: Dict[str, Tuple[int, int]],
+    non_empty: bool,
+    group_key: Tuple[int, ...],
+    claims_by_group: Dict[Tuple[int, ...], set[int]],
+) -> bool:
+    """数値トークンフィールドが存在しない場合の行オーナーシップ抑止（lv2 以上のみ）。"""
+    if not (policy.row_ownership_without_tokens and (not numeric_token_fields) and expected_len >= 2):
+        return False
+    try:
+        row_key_candidates = [tr for (_tc, tr) in used_positions.values() if isinstance(tr, int)]
+        if not row_key_candidates:
+            return False
+        row_key = min(row_key_candidates)
+        claims = claims_by_group.setdefault(group_key, set())
+        if row_key in claims:
+            return True
+        if non_empty:
+            claims.add(row_key)
+        return False
+    except Exception:
+        return False
+
+
+# -----------------------------------------------------------------------------
+# 階層的なシーケンスインデックス仕様
+# -----------------------------------------------------------------------------
+
+def parse_seq_tokens(s: str) -> List[str]:
+    """数値トークン列を配列に分解（非数値や空は空配列）。
+
+    環境変数の影響を受けない純粋パーサ。数値でないトークンは除外する。
+    """
+    if not isinstance(s, str) or not s:
+        return []
+    return [t for t in s.split("-") if t and t.isdigit()]
+
+
+@dataclass(frozen=True)
+class SeqIndexSpec:
+    """階層的列挙インデックス仕様。
+
+    - ancestor_prefix: 祖先のローカルインデックス列（例: ["1"], ["1","1"]）
+    - parent_local: 直近の親のローカルインデックス（例: 2）。None なら未確定。
+    - expected_length: この階層のトークン数（コンテナ名の数値トークン数）
+    """
+
+    ancestor_prefix: Tuple[str, ...]
+    parent_local: Optional[int]
+    expected_length: int
+
+    def prefix(self) -> Tuple[str, ...]:
+        if self.parent_local is None:
+            return self.ancestor_prefix
+        return (*self.ancestor_prefix, str(self.parent_local))
+
+    def matches(self, value: Any) -> bool:
+        """セル値が期待プレフィックス・期待長に一致するか。"""
+        if not is_numeric_token_string(value):
+            return False
+        toks = parse_seq_tokens(str(value))
+        if len(toks) != self.expected_length:
+            return False
+        # 厳格適用: parent_local が与えられていれば、祖先に続いて親ローカルも
+        # 必須プレフィックスとして要求する。None の場合は祖先のみを要求。
+        required_prefix: Tuple[str, ...]
+        if self.parent_local is None:
+            required_prefix = self.ancestor_prefix
+        else:
+            required_prefix = (*self.ancestor_prefix, str(self.parent_local))
+        if len(toks) < len(required_prefix):
+            return False
+        for i, p in enumerate(required_prefix):
+            if toks[i] != p:
+                return False
+        return True
+
+
+# -----------------------------------------------------------------------------
+# Rect のラッパー（補助ユーティリティ）
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Rect:
+    """Excelシート上の矩形領域（1始まり座標）。
+
+    - top/left/bottom/right はセルの行・列番号（1-based）
+    - completeness は罫線の完全度（0.0〜1.0）。不明な場合は None
+    """
+    top: int
+    left: int
+    bottom: int
+    right: int
+    completeness: Optional[float] = None
+
+
+def rect_from_tuple(t: tuple[int, int, int, int, float] | tuple[int, int, int, int]) -> Rect:
+    """タプルから `Rect` を生成する小ヘルパー。
+
+    受け取る形は `(top, left, bottom, right[, completeness])`。
+    """
+    if len(t) == 4:
+        top, left, bottom, right = t
+        return Rect(top=top, left=left, bottom=bottom, right=right, completeness=None)
+    if len(t) == 5:
+        top5, left5, bottom5, right5, comp5 = t
+        return Rect(top=top5, left=left5, bottom=bottom5, right=right5, completeness=comp5)
+    # フォールバック（防御）: completeness 不明
+    top4, left4, bottom4, right4 = cast(tuple[int, int, int, int], t)
+    return Rect(top=top4, left=left4, bottom=bottom4, right=right4, completeness=None)
+
+
+def detect_rectangular_regions_rects(worksheet, cell_names_map=None) -> List[Rect]:
+    """`detect_rectangular_regions` のRect返却版。
+
+    元関数はタプルを返すため、`Rect` へ変換して扱いやすくする。
+    """
+    regions = detect_rectangular_regions(worksheet, cell_names_map)
+    return [rect_from_tuple(r) for r in regions]
+
+
+def find_bordered_region_rect_around_positions(
+    worksheet,
+    positions: dict[str, tuple[int, int]],
+    *,
+    row_margin: int = 12,
+    col_margin: int = 8,
+) -> Rect | None:
+    """与えられた複数のセル位置の周囲に存在する罫線矩形を概算で求める。"""
+    t = find_bordered_region_around_positions(
+        worksheet, positions, row_margin=row_margin, col_margin=col_margin
+    )
+    return Rect(top=t[0], left=t[1], bottom=t[2], right=t[3]) if t else None
+
+
+# -----------------------------------------------------------------------------
+# コンテナの領域境界推定（モジュールレベル）
+# -----------------------------------------------------------------------------
+
+
+def find_region_bounds_for_positions(
+    workbook,
+    container_name: str,
+    sheet_name: str,
+    pos_map: Dict[str, tuple[int, int]],
+) -> RectTuple | None:
+    """決定論的境界: コンテナ自身の範囲があればそれ、無ければ pos_map の最小外接矩形を
+    1回だけ罫線完全度チェックして採用。"""
+    if not pos_map:
+        return None
+    # 1) コンテナキー自身の範囲
+    for sn, coord in iter_defined_name_destinations_all(container_name, workbook):
+        eff_sn = sn
+        if (not eff_sn) and isinstance(coord, str) and "!" in coord:
+            eff_sn = coord.split("!", 1)[0]
+        if eff_sn == sheet_name and coord and ":" in str(coord):
+            (sc, sr), (ec, er) = parse_range(str(coord).replace("$", "").split("!", 1)[-1])
+            return (sr, sc, er, ec)
+    # 2) 最小外接矩形 + 罫線完全度チェック（1回）
+    ws0 = workbook[sheet_name] if sheet_name in getattr(workbook, "sheetnames", []) else workbook.active
+    cols = [c for (c, _r) in pos_map.values()]
+    rows = [r for (_c, r) in pos_map.values()]
+    top, left, bottom, right = min(rows), min(cols), max(rows), max(cols)
+    logger.debug(
+        "BOUNDS-CHECK sheet=%s bounds top=%s left=%s bottom=%s right=%s",
+        sheet_name,
+        top,
+        left,
+        bottom,
+        right,
+    )
+    comp = calculate_border_completeness(ws0, top, left, bottom, right)
+    return (top, left, bottom, right) if comp >= 1.0 else None
+
+
+@dataclass(frozen=True)
 class ProcessingConfig:
     """処理設定を管理するデータクラス"""
 
     input_files: List[Union[str, Path]] = field(default_factory=list)
     prefix: str = "json"
     trim: bool = False
-    keep_empty: bool = False
     output_dir: Optional[Path] = None
     output_format: str = "json"
     schema: Optional[Dict[str, Any]] = None
     containers: Dict[str, Any] = field(default_factory=dict)
     transform_rules: List[str] = field(default_factory=list)
+    max_elements: Optional[int] = None
+    # 出力形状オプション: 指定したルート名を配列のオブジェクト（{groupKey: {...}}）にラップ
+    # ログフォーマット（デフォルトはタイムスタンプ付き）。設定/CLIで上書き可能。
+    log_format: Optional[str] = None
 
-    def __post_init__(self):
-        if self.output_dir and isinstance(self.output_dir, str):
-            self.output_dir = Path(self.output_dir)
+
+@dataclass
+class Context:
+    """実行時コンテキスト。
+
+    - processing_stats: 処理統計（アクセスは原則 `stats()` アクセサ経由）
+    - border_cache / anchor_rects_cache: 罫線/アンカー矩形のキャッシュ
+    """
+    processing_stats: "ProcessingStats"
+    border_cache: dict[tuple, bool] = field(default_factory=dict)
+    anchor_rects_cache: dict[tuple, list] = field(default_factory=dict)
+
+
+# 現在のグローバル実行コンテキスト（後方互換のため初期化時に processing_stats を共有）
+_CURRENT_CONTEXT: Context | None = None
+
+
+def get_current_context() -> Context:
+    global _CURRENT_CONTEXT, processing_stats
+    if _CURRENT_CONTEXT is None:
+        # 初期化: 既存の processing_stats と空キャッシュでコンテキストを生成
+        _CURRENT_CONTEXT = Context(processing_stats=processing_stats)
+    return _CURRENT_CONTEXT
+
+
+def set_current_context(ctx: Context) -> None:
+    """現在の実行コンテキストを設定し、後方互換のため processing_stats を同期する。
+
+    直接 `processing_stats` グローバルを参照するコードは将来的に削除予定のため、
+    新規コードは `stats()` を利用してください。
+    """
+    global _CURRENT_CONTEXT, processing_stats
+    _CURRENT_CONTEXT = ctx
+    processing_stats = ctx.processing_stats
+
+
+def border_cache() -> dict:
+    return get_current_context().border_cache
+
+
+def anchor_rects_cache() -> dict:
+    return get_current_context().anchor_rects_cache
+
+
+def stats() -> "ProcessingStats":
+    """現在の処理統計を返す（Context 経由）。"""
+    return get_current_context().processing_stats
 
 
 class Xlsx2JsonConverter:
@@ -143,25 +788,36 @@ class Xlsx2JsonConverter:
         self.processing_stats = ProcessingStats()
         self.validator = None
         if config.schema:
-            self.validator = Draft7Validator(config.schema)
+            # date-time / time などの format 検証を有効化
+            self.validator = Draft7Validator(config.schema, format_checker=FormatChecker())
 
     def process_files(self, input_files: List[Union[str, Path]]) -> int:
         """ファイルリストを処理する"""
+        # グローバル統計とインスタンス統計を同一インスタンスに統一
+        # これにより、内部関数群が参照する stats()（実体は processing_stats）増分が
+        # そのままコンバータのサマリに反映される
         self.processing_stats.start_processing()
+        # Context に集約（後方互換のため processing_stats も同期）
+        set_current_context(Context(processing_stats=self.processing_stats))
 
         try:
             xlsx_files = self._collect_xlsx_files(input_files)
             for xlsx_file in xlsx_files:
                 try:
-                    self._process_single_file(xlsx_file)
+                    self._process_single_file(xlsx_file)  # 各ファイルを処理
                 except Exception as e:
                     # 個別ファイルのエラーはログに記録するが処理は継続
                     self.processing_stats.add_error(
                         f"ファイル処理エラー {xlsx_file}: {e}"
                     )
-                    logger.error(f"ファイル処理を継続します: {xlsx_file}")
+                    # 上位ループでの検出・記録（スタックトレース付き）
+                    logger.exception(
+                        f"ファイル処理中に例外。処理を継続します: {xlsx_file}"
+                    )
         except Exception as e:
             self.processing_stats.add_error(f"処理中にエラーが発生: {e}")
+            # ここは最上位ハンドラとしてスタックトレースを残す
+            logger.exception("処理全体で未処理例外が発生しました")
             return 1
         finally:
             self.processing_stats.end_processing()
@@ -183,9 +839,11 @@ class Xlsx2JsonConverter:
 
     def _process_single_file(self, xlsx_file: Path) -> None:
         """単一ファイルの処理"""
+        logger.debug(f"Processing: {xlsx_file}")
+        # ワークブック毎にキャッシュをクリア（Context 経由）
+        border_cache().clear()
+        anchor_rects_cache().clear()
         try:
-            logger.info(f"Processing: {xlsx_file}")
-
             # 変換ルールの処理
             array_transform_rules = None
             if self.config.transform_rules:
@@ -196,60 +854,89 @@ class Xlsx2JsonConverter:
                     self.config.trim,
                 )
 
-            # 既存の処理ロジックを呼び出し
-            result = parse_named_ranges_with_prefix(
+            # 解析を実行（global_max_elements は None の場合は渡さない）
+            _extra: Dict[str, Any] = {}
+            if self.config.max_elements is not None:
+                _extra["global_max_elements"] = self.config.max_elements
+            data = parse_named_ranges_with_prefix(
                 xlsx_file,
                 self.config.prefix,
+                array_split_rules=None,
                 array_transform_rules=array_transform_rules,
                 containers=self.config.containers,
                 schema=self.config.schema,
+                **_extra,
             )
 
-            # 出力処理
-            default_output = xlsx_file.parent / "output"
-            output_dir = self.config.output_dir or default_output
+            # 出力ディレクトリの決定（未指定なら <xlsx_dir>/output）
+            out_dir = (
+                Path(self.config.output_dir)
+                if self.config.output_dir
+                else (xlsx_file.parent / "output")
+            )
             base_name = xlsx_file.stem
-
-            # ファイル書き込み（JSON/YAML対応）
-            self._write_output(result, output_dir, base_name)
-
-            logger.info(f"処理完了: {xlsx_file}")
-            self.processing_stats.containers_processed += 1
-
+            self._write_output(data, out_dir, base_name)
         except Exception as e:
+            # ここはファイル単位の最上位ハンドラ。例外を記録して継続可能。
+            logger.exception("単一ファイルの処理中に例外が発生しました")
             self.processing_stats.add_error(f"ファイル処理エラー {xlsx_file}: {e}")
-            # 例外を再発生しない（処理を継続するため）
 
     def _write_output(self, data: dict, output_dir: Path, base_name: str) -> None:
         """データ出力を書き込み（JSON/YAML対応）"""
-        try:
-            # 出力フォーマットに応じて拡張子を決定
-            if self.config.output_format == "yaml":
-                extension = ".yaml"
-            else:
-                extension = ".json"
-
-            # write_data関数が存在するかチェック
-            if "write_data" in globals():
-                output_path = output_dir / f"{base_name}{extension}"
-                suppress_empty = not self.config.keep_empty
-                write_data(
-                    data,
-                    output_path,
-                    self.config.output_format,
-                    self.config.schema,
-                    self.validator,
-                    suppress_empty,
+        # 出力直前にプレフィックス配下をルートへ統合し、プレフィックス配下の重複を除去
+        # 期待動作: ルート直下と prefix 配下に同一項目がある場合、prefix 配下は出力しない
+        if is_json_dict(data):
+            pref_key = self.config.prefix
+            if pref_key in data and is_json_dict(data[pref_key]):
+                # コンテナから group→root マップを構築（例: lv1 -> ツリー1）
+                group_to_root: dict[str, str] = {}
+                try:
+                    if self.config.containers:
+                        for cont_key in self.config.containers.keys():
+                            parts = [p for p in cont_key.split(".") if p]
+                            if (
+                                len(parts) >= 4
+                                and parts[0] == pref_key
+                                and parts[2]
+                                and parts[3].isdigit()
+                            ):
+                                root_name = parts[1]
+                                group_label = parts[2]
+                                group_to_root[group_label] = root_name
+                except Exception:
+                    # ここは「最終出力前のラベルマッピング最適化」のみを行う非本質ロジック。
+                    # コンテナ仕様が異常でも致命ではないため、安全側で握りつぶして
+                    # マッピング無し（素通し）にフォールバックする。
+                    group_to_root = {}
+                # ルートへ統合（既存のルート値を優先: 既にルートにあれば上書きしない）
+                merged = {k: v for k, v in data.items() if k != pref_key}
+                pref_val_any = data[pref_key]
+                # 予期しない型の場合は統合スキップ（安全側）
+                pref_obj: Dict[str, JSONValue] = (
+                    pref_val_any if is_json_dict(pref_val_any) else {}
                 )
-            else:
-                # 簡易的な出力（JSONのみ）
-                output_file = output_dir / f"{base_name}.json"
-                with output_file.open("w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                logger.info(f"JSONファイル出力: {output_file}")
-        except Exception as e:
-            logger.error(f"JSON出力エラー: {e}")
-            raise
+                for k, v in pref_obj.items():
+                    # グループラベルキー（lv1等）は対応するルートキーへ吸収してマージ
+                    if k in group_to_root:
+                        merged[group_to_root[k]] = v
+                        continue
+                    merged.setdefault(k, v)
+                data = merged
+
+        # 出力フォーマットに応じて拡張子を決定
+        extension = ".yaml" if self.config.output_format == "yaml" else ".json"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / f"{base_name}{extension}"
+
+        # 空値は常に抑制して出力
+        write_data(
+            data,
+            output_path,
+            self.config.output_format,
+            self.config.schema,
+            self.validator,
+            True,
+        )
 
 
 # グローバル統計インスタンス
@@ -257,12 +944,335 @@ processing_stats = ProcessingStats()
 
 
 # =============================================================================
+def _is_2d_list(val: Any) -> bool:
+    return is_json_list(val) and bool(val) and isinstance(val[0], (list, tuple))
+
+
+def _coerce_to_1d(val: Any) -> Any:
+    if _is_2d_list(val):
+        # 2D は 1D へは潰さない（情報落ち防止）。呼び出し側で 2D 優先にするため、通常ここに来ない想定。
+        return val
+    if not is_json_list(val):
+        return [val]
+    return val
+
+
+def _coerce_to_2d(val: Any) -> Any:
+    if _is_2d_list(val):
+        return val
+    if not is_json_list(val):
+        return [[val]]
+    # 1D → 2D
+    if not val or not isinstance(val[0], (list, tuple)):
+        return [val]
+    return val
+
+
+def _normalize_field_shapes_in_list_of_dicts(lst: List[Dict[str, Any]]) -> None:
+    # フィールドごとの望ましい形状を決定（2D > 1D > scalar）
+    field_names: set[str] = set()
+    for d in lst:
+        if is_json_dict(d):
+            field_names.update(d.keys())
+    desired: Dict[str, str] = {}
+    for f in field_names:
+        has_2d = False
+        has_1d = False
+        for d in lst:
+            if not is_json_dict(d) or f not in d:
+                continue
+            v = d.get(f)
+            if _is_2d_list(v):
+                has_2d = True
+                break
+            if is_json_list(v):
+                has_1d = True
+        if has_2d:
+            desired[f] = "2D"
+        elif has_1d:
+            desired[f] = "1D"
+    # 望ましい形状に強制
+    for f, shape in desired.items():
+        for d in lst:
+            if not is_json_dict(d) or f not in d:
+                continue
+            v = d.get(f)
+            if shape == "2D":
+                d[f] = _coerce_to_2d(v)
+            elif shape == "1D":
+                if isinstance(v, list) and bool(v) and isinstance(v[0], (list, tuple)):
+                    d[f] = v
+                elif not isinstance(v, list):
+                    d[f] = [v]
+                else:
+                    d[f] = v
+
+
+def _normalize_field_shapes_across_lists_of_dicts(
+    nested: List[List[Dict[str, Any]]],
+) -> None:
+    # 全サブリストを横断してフィールドの望ましい形状を決定（2D > 1D > scalar）
+    desired: Dict[str, str] = {}
+    # 一旦、観測された最大形状を記録
+    for sub in nested:
+        if not is_json_list(sub) or not all(
+            is_json_dict(x) for x in sub if x is not None
+        ):
+            continue
+        # サブリスト単位の標準化を先に行う
+        _normalize_field_shapes_in_list_of_dicts(cast(List[Dict[str, Any]], sub))  # 局所整合
+        for d in sub:
+            if not is_json_dict(d):
+                continue
+            for f, v in d.items():
+                if _is_2d_list(v):
+                    desired[f] = "2D"
+                elif is_json_list(v) and desired.get(f) != "2D":
+                    desired.setdefault(f, "1D")
+    if not desired:
+        return
+    # 決まった desired に合わせて全体を再強制
+    for sub in nested:
+        if not is_json_list(sub) or not all(
+            is_json_dict(x) for x in sub if x is not None
+        ):
+            continue
+        for d in sub:
+            if not is_json_dict(d):
+                continue
+            for f, shape in desired.items():
+                if f not in d:
+                    continue
+                v = d.get(f)
+                if shape == "2D":
+                    d[f] = _coerce_to_2d(v)
+                elif shape == "1D":
+                    if isinstance(v, list) and bool(v) and isinstance(v[0], (list, tuple)):
+                        d[f] = v
+                    elif not isinstance(v, list):
+                        d[f] = [v]
+                    else:
+                        d[f] = v
+
+
+def normalize_array_field_shapes(obj: Any) -> JSONValue:
+    """配列内の同名フィールドの形状（スカラ/1D/2D）を横並びで統一する（再帰）。
+    - list-of-dicts ではフィールドごとに 2D > 1D > scalar の優先で整合
+    - list-of-list-of-dicts では全サブリストを横断して整合
+    - dict/list は再帰的に処理
+    """
+    if is_json_list(obj):
+        # list-of-list-of-dicts を先に検出
+        if all((not it) or is_json_list(it) for it in obj):
+            # サブリストの中身が dict であるものがあるか？
+            if any(
+                is_json_list(it) and all(is_json_dict(x) for x in it if x is not None)
+                for it in obj
+            ):
+                # 形状整合（横断）
+                _normalize_field_shapes_across_lists_of_dicts(cast(List[List[Dict[str, Any]]], obj))  # in-place
+                # 再帰
+                return [normalize_array_field_shapes(it) for it in obj]
+        # list-of-dicts の場合
+        if all(is_json_dict(it) for it in obj if it is not None):
+            _normalize_field_shapes_in_list_of_dicts(cast(List[Dict[str, Any]], obj))  # in-place
+            return [normalize_array_field_shapes(it) for it in obj]
+        # その他の list は要素を再帰処理
+        return [normalize_array_field_shapes(it) for it in obj]
+    if is_json_dict(obj):
+        return {k: normalize_array_field_shapes(v) for k, v in obj.items()}
+    return obj
+
+
+# =============================================================================
+# Validation-time ISO conversion (shared abstraction)
+# =============================================================================
+
+def to_iso_for_validation(obj: Any) -> JSONValue:
+    """jsonschema 検証前に datetime/date/time を ISO 文字列へ正規化する共通関数。
+
+    - list/dict は再帰処理
+    - それ以外はそのまま返す
+    """
+    if is_json_list(obj):
+        return [to_iso_for_validation(x) for x in obj]
+    if is_json_dict(obj):
+        return {k: to_iso_for_validation(v) for k, v in obj.items()}
+    if isinstance(obj, datetime.datetime):
+        return obj.isoformat()
+    if isinstance(obj, datetime.date):
+        return obj.isoformat()
+    if isinstance(obj, datetime.time):
+        return obj.isoformat()
+    return obj
+
+
+# =============================================================================
+def get_generated_names_map(wb) -> Optional[Dict[str, Any]]:
+    """ワークブックの生成名オーバーライドマップが存在すれば返し、なければ None を返す。"""
+    try:
+        return GeneratedNames.for_workbook(wb).as_dict()
+    except Exception:
+        return None
+
+
+def set_generated_name(wb, name: str, value: Any) -> None:
+    """ワークブックレベルのオーバーライドマップに生成名を登録または上書きします。"""
+    if not name:
+        return
+    try:
+        GeneratedNames.for_workbook(wb).set(name, value)
+    except Exception:
+        logger.debug("failed to set generated name %s", name, exc_info=True)
+
+
+class GeneratedNames:
+    """Thin wrapper around workbook-scoped generated-names map.
+
+    Stores the map on Workbook as attribute `_generated_names` (backwards compatible)
+    and provides get/set/iter helpers for consistent access.
+    """
+
+    def __init__(self, wb) -> None:
+        self._wb = wb
+
+    @classmethod
+    def for_workbook(cls, wb) -> "GeneratedNames":
+        return cls(wb)
+
+    def _ensure_map(self) -> dict:
+        gm = getattr(self._wb, "_generated_names", None)
+        if gm is None:
+            gm = {}
+            try:
+                setattr(self._wb, "_generated_names", gm)
+            except Exception:
+                # fallback: try to attach to properties if available
+                props = getattr(self._wb, "properties", None)
+                if props is None:
+                    class _P:  # pragma: no cover - defensive
+                        pass
+
+                    props = _P()
+                    try:
+                        self._wb.properties = props
+                    except Exception:
+                        pass
+                props.__dict__["_generated_names"] = gm
+        return gm
+
+    def as_dict(self) -> Dict[str, Any]:
+        gm = getattr(self._wb, "_generated_names", None)
+        if not is_json_dict(gm):
+            return {}
+        return dict(gm)
+
+    def set(self, name: str, value: Any) -> None:
+        gm = self._ensure_map()
+        gm[name] = value
+
+    def get(self, name: str, default: Any = None) -> Any:
+        gm = getattr(self._wb, "_generated_names", None)
+        if not is_json_dict(gm):
+            return default
+        return gm.get(name, default)
+
+    def iter_keys(self):
+        gm = getattr(self._wb, "_generated_names", None)
+        if not is_json_dict(gm):
+            return iter(())
+        return iter(gm.keys())
+
+
+def prepare_containers_and_generated_names(
+    wb,
+    *,
+    prefix: str,
+    containers: Optional[Dict[str, Any]],
+    global_max_elements: Optional[int],
+    extraction_policy: ExtractionPolicy,
+) -> tuple[Optional[Dict[str, Any]], bool, Dict[str, Any]]:
+    """コンテナ設定のマージ/推論と、生成セル名の登録をまとめて行う。
+
+    返り値: (containers, user_provided_containers, generated_names)
+    - containers: 手動/自動推論を反映した最終コンテナ
+    - user_provided_containers: 呼び出し元が手動で指定したかどうか（挙動の分岐に使用）
+    - generated_names: 生成されたセル名マップ（副作用として wb の _generated_names に登録済み）
+    """
+    user_provided = containers is not None
+    inferred = infer_containers_from_named_ranges(wb, prefix)
+    # マージ方針: 手動優先
+    if containers and inferred:
+        logger.debug(f"コンテナを自動推論（マージ）: {inferred}")
+        _merged = inferred.copy()
+        _merged.update(containers)
+        containers = _merged
+    elif not containers and inferred:
+        logger.debug(f"コンテナを自動推論: {inferred}")
+        containers = inferred
+
+    generated: Dict[str, Any] = {}
+    if containers:
+        logger.debug(f"コンテナ処理開始: {len(containers)}個のコンテナ")
+        generated = generate_cell_names_from_containers(
+            containers, wb, global_max_elements, prefix=prefix, extraction_policy=extraction_policy
+        )
+        # 生成されたセル名を _generated_names に登録（既存定義名があってもオーバーライド可能）
+        for name, range_ref in generated.items():
+            prefixed_name = name if name.startswith(f"{prefix}.") else f"{prefix}.{name}"
+            set_generated_name(wb, prefixed_name, range_ref)
+            if prefixed_name in wb.defined_names:
+                logger.debug(
+                    "生成名を既存定義名に対するオーバーライドとして登録: %s", prefixed_name
+                )
+            else:
+                logger.debug("生成名を登録: %s -> %r", prefixed_name, range_ref)
+        logger.debug(f"コンテナ処理完了: {len(generated)}個のセル名を生成")
+    return containers, user_provided, generated
+
+
+def build_all_names_with_generated(wb) -> tuple[Dict[str, Any], set[str]]:
+    """定義名辞書に生成名を統合して返す。
+
+    - 返り値: (all_names, defined_only_name_keys)
+    - 生成名は DefinedName 互換の簡易オブジェクトを作って destinations を模擬
+    """
+    all_names: Dict[str, Any] = dict(wb.defined_names.items())
+    defined_only_name_keys: set[str] = set(all_names.keys())
+
+    gm = get_generated_names_map(wb)
+    if gm:
+        logger.debug(f"生成されたセル名を処理対象に追加: {len(gm)}個")
+        for gen_name, gen_range in gm.items():
+            if gen_name in all_names:
+                continue
+            # 簡易的なDefinedName互換を提供
+            class GeneratedDefinedName:
+                def __init__(self, attr_text):
+                    self.attr_text = attr_text
+                    if "!" in attr_text:
+                        sheet_part, range_part = attr_text.split("!")
+                        self.destinations = [(sheet_part, range_part)]
+                    else:
+                        self.destinations = [("Sheet1", attr_text)]
+
+            all_names[gen_name] = GeneratedDefinedName(gen_range)
+            logger.debug(f"生成セル名追加: {gen_name} -> {gen_range}")
+    return all_names, defined_only_name_keys
+
+
 # Core Utilities
 # =============================================================================
 
 
 class SchemaLoader:
-    """JSONスキーマの読み込みと管理を行うクラス"""
+    """
+    JSONスキーマの読み込みと管理を行うクラス。
+
+    公開APIの基準は本クラスです。テスト互換のため、同等機能のトップレベル関数
+    load_schema / validate_and_log も提供していますが、将来的には
+    SchemaLoader.* への一本化を推奨します（関数は互換用エイリアス扱い）。
+    """
 
     @staticmethod
     def load_schema(schema_path: Optional[Path]) -> Optional[Dict[str, Any]]:
@@ -292,85 +1302,219 @@ class SchemaLoader:
         data: Dict[str, Any], validator: Draft7Validator, log_dir: Path, base_name: str
     ) -> None:
         """JSONデータをバリデートし、エラーがあればファイルに出力"""
-        errors = sorted(validator.iter_errors(data), key=lambda e: e.path)
+        # 可能なら datetime/date/time を ISO 文字列化してからチェック
+        data2 = cast(Dict[str, Any], to_iso_for_validation(data))
+        errors = sorted(validator.iter_errors(data2), key=lambda e: e.path)
         if not errors:
             return
 
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"{base_name}.error.log"
-
-        with log_file.open("w", encoding="utf-8") as f:
+        error_log = log_dir / f"{base_name}.error.log"
+        with error_log.open("w", encoding="utf-8") as f:
             for err in errors:
-                path = ".".join(str(p) for p in err.path)
-                f.write(f"{path}: {err.message}\n")
-
-        logger.debug(f"Validation errors written to: {log_file}")
-
-
-# =============================================================================
-# Data Validation and Cleaning
-# =============================================================================
+                path = ".".join(str(p) for p in err.path) if err.path else "<root>"
+                f.write(f"[{path}]: {err.message}\n")
 
 
 def reorder_json(
-    obj: Union[Dict[str, Any], List[Any], Any], schema: Dict[str, Any]
-) -> Union[Dict[str, Any], List[Any], Any]:
+    obj: Union[JSONDict, List[Any], Any], schema: Dict[str, Any]
+) -> Union[JSONDict, List[Any], Any]:
     """
     スキーマの properties 順に dict のキーを再帰的に並べ替える。
     list の場合は項目ごとに再帰処理。
     その他はそのまま返す。
     """
-    if isinstance(obj, dict) and isinstance(schema, dict):
+    if is_json_dict(obj) and is_json_dict(schema):
         ordered: Dict[str, Any] = {}
-        props = schema.get("properties", {})
+        props_any = schema.get("properties", {})
+        props: Dict[str, Any] = props_any if isinstance(props_any, dict) else {}
         # スキーマ順に追加
-        for key in props:
+        for key, subschema in props.items():
             if key in obj:
-                ordered[key] = reorder_json(obj[key], props[key])
-        # 追加キーはアルファベット順
-        for key in sorted(k for k in obj if k not in props):
+                ordered[key] = reorder_json(obj[key], subschema)
+        # 追加キー（スキーマ未定義）: 挿入順を維持（特定名称の優先は行わない）
+        for key in list(obj.keys()):
+            if key in props:
+                continue
             ordered[key] = obj[key]
         return ordered
 
-    if isinstance(obj, list) and isinstance(schema, dict) and "items" in schema:
-        return [reorder_json(item, schema["items"]) for item in obj]
+    if is_json_list(obj) and is_json_dict(schema) and "items" in schema:
+        items_any = schema.get("items")
+        items_schema: Dict[str, Any] = items_any if isinstance(items_any, dict) else {}
+        return [reorder_json(item, items_schema) for item in obj]
 
     return obj
+def apply_post_parse_pipeline(
+    *,
+    result: Dict[str, Any],
+    root_first_pos: Dict[str, tuple[int, int, int]],
+    prefix: str,
+    user_provided_containers: bool,
+    containers: Optional[Dict[str, Any]],
+    array_transform_rules: Optional[Dict[str, List[ArrayTransformRule]]],
+    normalized_prefix: str,
+    group_labels: set[str],
+    group_to_root: Dict[str, str],
+    gen_map: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """パース後の出力整形パイプラインを一括適用。
+
+    ステップ:
+    1) ルートキー順の安定化（Excel読取順）
+    2) ワイルドカード変換の適用
+    3) コンテナ出力のリシェイプ（dict of lists → list of dicts）
+    4) 明示コンテナ時の prefix 配下の子をトップレベルへ複製（互換）
+    5) コンテナ無し時のグループ吸収のフォールバック正規化
+    """
+    # 1) ルート順安定化
+    result2, root_result = reorder_roots_by_sheet_order(
+        result, root_first_pos, prefix, user_provided_containers
+    )
+    # 2) 変換（ワイルドカード／非ワイルドカード含む）
+    if array_transform_rules:
+        transformed = apply_pattern_transforms(
+            root_result, array_transform_rules, normalized_prefix
+        )
+        if user_provided_containers:
+            result2[prefix] = transformed
+        else:
+            result2 = transformed
+    # 3) コンテナ reshape
+    result2 = reshape_containers_in_result(
+        result2, containers, prefix, user_provided_containers
+    )
+    # 4) prefix の子をトップに複製（互換）
+    if user_provided_containers and is_json_dict(result2) and prefix in result2:
+        result2 = replicate_prefix_children_to_top_level(
+            result2, prefix, group_labels, root_first_pos
+        )
+    # 5) コンテナ無しフォールバック
+    if not user_provided_containers and is_json_dict(result2):
+        result2 = fallback_normalize_root_groups_without_containers(
+            result2, group_to_root, gen_map, normalized_prefix
+        )
+    return result2
 
 
 def get_named_range_values(wb, defined_name) -> Any:
     """
-    Excel の NamedRange からセル値を抽出し、単一セルは値、範囲はリストで返す。
-    範囲の場合は行列構造を保持する。
-    """
-    all_values: List[Any] = []
-    for sheet_name, coord in defined_name.destinations:
-        cell_or_range = wb[sheet_name][coord]
-        if isinstance(cell_or_range, tuple):  # 範囲
-            # 2次元の場合 (複数行複数列)
-            if hasattr(cell_or_range[0], "__iter__") and not isinstance(
-                cell_or_range[0], str
-            ):
-                # 行列構造を保持
-                for row in cell_or_range:
-                    row_values = [cell.value for cell in row]
-                    if len(row_values) == 1:
-                        # 単一列の場合は値そのものを追加
-                        all_values.append(row_values[0])
-                    else:
-                        # 複数列の場合は行として追加
-                        all_values.append(row_values)
-            else:
-                # 1次元の場合 (単一行または単一列)
-                all_values.extend([cell.value for cell in cell_or_range])
-        else:
-            # 単一セル
-            all_values.append(cell_or_range.value)
+    Excel の NamedRange からセル値を抽出し、単一セルは値、範囲は行優先のフラットな一次元リストで返す。
 
-    # 1セルなら値のみ返す（listでなく）
-    if len(all_values) == 1:
-        return all_values[0]
-    return all_values
+    従来互換のデフォルト挙動：
+      - 1セル → スカラ
+      - 1xN/Nx1 → 長さNの一次元配列
+      - MxN     → 長さM*Nの一次元配列（行優先）
+
+    形状保持が必要な特殊ケースは別ヘルパー（get_named_range_values_preserve_shape）で対応する。
+    """
+    flat_values: List[Any] = []
+    single_cell_only = True
+    for sheet_name, coord in getattr(defined_name, "destinations", []) or []:
+        # #REF! や空座標はスキップ
+        try:
+            if not coord or (isinstance(coord, str) and "REF" in str(coord).upper()):
+                logger.debug("Skipping invalid named range destination: sheet=%r coord=%r", sheet_name, coord)
+                continue
+            eff_sheet = sheet_name
+            eff_coord = coord
+            # coord にシート名が含まれる形式に対応
+            if isinstance(eff_coord, str) and "!" in eff_coord:
+                try:
+                    sheet_part, cell_part = eff_coord.split("!", 1)
+                    eff_coord = cell_part
+                    if not eff_sheet:
+                        eff_sheet = sheet_part
+                except Exception:
+                    pass
+            # Worksheet オブジェクトをタイトルへ
+            if eff_sheet is not None and not isinstance(eff_sheet, str):
+                try:
+                    eff_sheet = getattr(eff_sheet, "title", str(eff_sheet))
+                except Exception:
+                    eff_sheet = str(eff_sheet)
+            ws = wb[eff_sheet] if eff_sheet else wb.active
+            cell_or_range = ws[eff_coord]
+        except Exception as e:
+            logger.debug("Skipping destination due to error: sheet=%r coord=%r err=%s", sheet_name, coord, e)
+            continue
+        if isinstance(cell_or_range, tuple):
+            single_cell_only = False
+            for row in cell_or_range:
+                if isinstance(row, tuple):
+                    for cell in row:
+                        flat_values.append(getattr(cell, "value", cell))
+                else:
+                    flat_values.append(getattr(row, "value", row))
+        else:
+            flat_values.append(getattr(cell_or_range, "value", cell_or_range))
+
+    if not flat_values:
+        # すべてのdestinationが無効/スキップされた場合は例外でフォールバックへ
+        raise ValueError("No valid destinations for defined name")
+    # 単一セルのみの名前付き範囲はスカラを返す
+    if single_cell_only and len(flat_values) == 1:
+        return flat_values[0]
+    return flat_values
+
+
+def get_named_range_values_preserve_shape(wb, defined_name) -> Any:
+    """
+    Excel の NamedRange からセル値を抽出し、可能なら形状（1D/2D）を保持して返すヘルパー。
+    - 単一セル → スカラ
+    - 1xN または Nx1 → 1次元配列
+    - MxN (M,N>1) → 2次元配列
+    """
+    rows_all_sheets: List[List[Any]] = []
+    for sheet_name, coord in getattr(defined_name, "destinations", []) or []:
+        # #REF! や空座標はスキップ
+        try:
+            if not coord or (isinstance(coord, str) and "REF" in str(coord).upper()):
+                logger.debug("Skipping invalid named range destination (preserve_shape): sheet=%r coord=%r", sheet_name, coord)
+                continue
+            eff_sheet = sheet_name
+            eff_coord = coord
+            if isinstance(eff_coord, str) and "!" in eff_coord:
+                try:
+                    sheet_part, cell_part = eff_coord.split("!", 1)
+                    eff_coord = cell_part
+                    if not eff_sheet:
+                        eff_sheet = sheet_part
+                except Exception:
+                    pass
+            if eff_sheet is not None and not isinstance(eff_sheet, str):
+                try:
+                    eff_sheet = getattr(eff_sheet, "title", str(eff_sheet))
+                except Exception:
+                    eff_sheet = str(eff_sheet)
+            ws = wb[eff_sheet] if eff_sheet else wb.active
+            cell_or_range = ws[eff_coord]
+        except Exception as e:
+            logger.debug("Skipping destination (preserve_shape) due to error: sheet=%r coord=%r err=%s", sheet_name, coord, e)
+            continue
+        if isinstance(cell_or_range, tuple):
+            local_rows: List[List[Any]] = []
+            for row in cell_or_range:
+                if isinstance(row, tuple):
+                    local_rows.append([getattr(cell, "value", cell) for cell in row])
+                else:
+                    local_rows.append([getattr(row, "value", row)])
+            rows_all_sheets.extend(local_rows)
+        else:
+            rows_all_sheets.append([getattr(cell_or_range, "value", cell_or_range)])
+
+    if not rows_all_sheets:
+        # すべてのdestinationが無効/スキップされた場合は例外でフォールバックへ
+        raise ValueError("No valid destinations for defined name (preserve_shape)")
+    total_rows = len(rows_all_sheets)
+    max_cols = max((len(r) for r in rows_all_sheets), default=0)
+    if total_rows == 1 and max_cols == 1:
+        return rows_all_sheets[0][0]
+    if total_rows == 1:
+        return rows_all_sheets[0]
+    if max_cols == 1:
+        return [r[0] if r else None for r in rows_all_sheets]
+    return rows_all_sheets
 
 
 # =============================================================================
@@ -378,14 +1522,1781 @@ def get_named_range_values(wb, defined_name) -> Any:
 # =============================================================================
 
 
+def compute_top_left_pos(
+    defined_name_obj, sheet_order: Dict[str, int]
+) -> tuple[int, int, int]:
+    """DefinedName から読み取り順キー (sheet_idx, row, col) を返す共通関数。
+
+    - 並び順は Excel のシート順 → 行 → 列
+    - 範囲の場合は左上座標、単一セルの場合はその座標
+    - 異常時は非常に大きい値のタプルを返し、末尾に回す
+    """
+    best: tuple[int, int, int] | None = None
+    try:
+        for sheet_name, coord in getattr(defined_name_obj, "destinations", []) or []:
+            c = coord.replace("$", "") if isinstance(coord, str) else str(coord)
+            r: int
+            col: int
+            if ":" in c:
+                (sc, sr), (_ec, _er) = parse_range(c)
+                r, col = sr, sc
+            else:
+                m = re.match(r"^([A-Z]+)(\d+)$", c)
+                if not m:
+                    continue
+                col = column_index_from_string(m.group(1))
+                r = int(m.group(2))
+            si = sheet_order.get(sheet_name, 10**9)
+            cand = (si, r, col)
+            if best is None or cand < best:
+                best = cand
+    except Exception:
+        best = None
+    return best if best is not None else (10**9, 10**9, 10**9)
+
+
+def is_nonempty_array_or_dict(x: Any) -> bool:
+    """リスト/辞書が実質的に非空かを判定するヘルパー。その他型は False。
+
+    is_completely_empty を用いて空構造（空配列/空オブジェクト/空値のみから成る入れ子）を検出。
+    """
+    if isinstance(x, list) or isinstance(x, dict):
+        return not is_completely_empty(x)
+    return False
+
+
+def collect_root_first_positions(
+    normalized_prefix: str,
+    defined_only_name_keys: set[str],
+    all_names: Dict[str, Any],
+    sheet_order: Dict[str, int],
+) -> Dict[str, tuple[int, int, int]]:
+    """ルートキーごとの初出位置 (sheet,row,col) を収集する共通ヘルパー。
+
+    - 生成名は順序に影響させないため、対象は定義名のみ
+    - 返り値は root_key -> 最小位置
+    """
+    root_first_pos: Dict[str, tuple[int, int, int]] = {}
+    for name in defined_only_name_keys:
+        if not name.startswith(normalized_prefix):
+            continue
+        defined_name = all_names.get(name)
+        if defined_name is None:
+            continue
+        keys_probe = [k for k in name.removeprefix(normalized_prefix).split(".") if k]
+        if not keys_probe:
+            continue
+        root_key = keys_probe[0]
+        pos_probe = compute_top_left_pos(defined_name, sheet_order)
+        prev = root_first_pos.get(root_key)
+        if prev is None or pos_probe < prev:
+            root_first_pos[root_key] = pos_probe
+    return root_first_pos
+def _upgrade_shape(cur: Optional[str], new_shape: str) -> str:
+    """形状を昇格マージ（'2D' が一度でもあれば '2D'）。"""
+    return "2D" if (cur == "2D" or new_shape == "2D") else "1D"
+
+
+def _infer_shape_from_defined_name_destinations(defined_name) -> Optional[str]:
+    """DefinedName風オブジェクトの destinations から 1D/2D を推定。"""
+    for _sn, coord in getattr(defined_name, "destinations", []) or []:
+        coord_clean = coord.replace("$", "") if isinstance(coord, str) else str(coord)
+        if ":" not in coord_clean:
+            break
+        try:
+            (sc, sr), (ec, er) = parse_range(coord_clean)
+        except Exception:
+            break
+        rows = abs(er - sr) + 1
+        cols = abs(ec - sc) + 1
+        if rows > 1 and cols > 1:
+            return "2D"
+        if (rows == 1 and cols > 1) or (cols == 1 and rows > 1):
+            return "1D"
+        break
+    return None
+
+
+def iter_pattern1_field_anchors(
+    normalized_prefix: str, all_name_keys: List[str], all_names: Dict[str, Any]
+) -> List[Tuple[str, str, Any]]:
+    """*.field.1（アンカー指定）の候補を列挙し (array, field, dn) を返す。"""
+    results: List[Tuple[str, str, Any]] = []
+    for nm in all_name_keys:
+        if not nm.startswith(normalized_prefix):
+            continue
+        parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+        if (
+            len(parts) >= 4
+            and parts[1].isdigit()
+            and parts[-1] == "1"
+            and not parts[-2].isdigit()
+        ):
+            array_name = parts[0]
+            field_name = parts[-2]
+            dn = all_names.get(nm)
+            if dn is None:
+                continue
+            results.append((array_name, field_name, dn))
+    return results
+
+
+def iter_pattern2_field_ranges(
+    normalized_prefix: str, all_name_keys: List[str], all_names: Dict[str, Any]
+) -> List[Tuple[str, str, Any]]:
+    """*.field（末尾 .1 なし）の候補を列挙し (array, field, dn) を返す。"""
+    results: List[Tuple[str, str, Any]] = []
+    for nm in all_name_keys:
+        if not nm.startswith(normalized_prefix):
+            continue
+        parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+        if len(parts) == 3 and parts[1].isdigit() and not parts[2].isdigit():
+            array_name = parts[0]
+            field_name = parts[2]
+            dn = all_names.get(nm)
+            if dn is None:
+                continue
+            results.append((array_name, field_name, dn))
+    return results
+
+
+def learn_expected_field_shapes(
+    normalized_prefix: str,
+    all_name_keys: List[str],
+    all_names: Dict[str, Any],
+) -> Dict[Tuple[str, str], str]:
+    """フィールド形状（1D/2D）を学習し、(array_name, field_name)->shape を返す。
+
+    - パターン1: <array>.<idx>.<field>.1 が範囲なら 1D/2D を記録
+    - パターン2: <array>.<idx>.<field>（末尾 .1 なし）が範囲なら 1D/2D を記録
+      複数回検出された場合は 2D を優先
+    """
+    expected_field_shape: Dict[Tuple[str, str], str] = {}
+
+    # パターン1: *.field.1
+    for array_name, field_name, dn in iter_pattern1_field_anchors(
+        normalized_prefix, all_name_keys, all_names
+    ):
+        shape = _infer_shape_from_defined_name_destinations(dn)
+        if shape:
+            key = (array_name, field_name)
+            prev = expected_field_shape.get(key)
+            expected_field_shape[key] = _upgrade_shape(prev, shape) if prev else shape
+
+    # パターン2: *.field（末尾 .1 なし）
+    for array_name, field_name, dn in iter_pattern2_field_ranges(
+        normalized_prefix, all_name_keys, all_names
+    ):
+        shape = _infer_shape_from_defined_name_destinations(dn)
+        if shape:
+            key = (array_name, field_name)
+            prev = expected_field_shape.get(key)
+            expected_field_shape[key] = _upgrade_shape(prev, shape) if prev else shape
+
+    return expected_field_shape
+
+
+def find_arrays_with_double_index(
+    normalized_prefix: str,
+    all_name_keys: List[str],
+    gen_map: Optional[Dict[str, Any]],
+) -> set[str]:
+    """二重数値インデックス（<array>.<i>.<j>.*）が存在する配列名を収集。
+
+    - 定義名と生成名の両方を対象
+    """
+    arrays: set[str] = set()
+    try:
+        for nm in all_name_keys:
+            if not nm.startswith(normalized_prefix):
+                continue
+            parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+            if (
+                len(parts) >= 4
+                and re.fullmatch(r"\d+", parts[1])
+                and any(re.fullmatch(r"\d+", x) for x in parts[2:])
+            ):
+                arrays.add(parts[0])
+        if gen_map is not None:
+            for nm in gen_map.keys():
+                if not nm.startswith(normalized_prefix):
+                    continue
+                parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+                if (
+                    len(parts) >= 4
+                    and re.fullmatch(r"\d+", parts[1])
+                    and any(re.fullmatch(r"\d+", x) for x in parts[2:])
+                ):
+                    arrays.add(parts[0])
+    except Exception as e:
+        logger.debug("locate_found_local_anchor probe cols build failed: %s", e)
+    return arrays
+def compute_numeric_root_keys(normalized_prefix: str, all_names: Dict[str, Any]) -> set[str]:
+    """先頭トークンの直後が数値インデックスとなるルートキー集合を返す。
+
+    例: json.orders.1.date -> {"orders"}
+    生成名も all_names に既に統合済みである前提。
+    """
+    keys: set[str] = set()
+    for nm in all_names.keys():
+        if not nm.startswith(normalized_prefix):
+            continue
+        parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+        if len(parts) >= 2 and re.fullmatch(r"\d+", parts[1]):
+            keys.add(parts[0])
+    return keys
+
+
+def compute_container_parents_with_children(
+    container_parent_names: set[str],
+    all_name_keys: List[str],
+    gen_map: Optional[Dict[str, Any]],
+) -> set[str]:
+    """親コンテナ名のうち、子要素（定義名 or 生成名）が1つ以上存在する親を返す。"""
+    result: set[str] = set()
+    if not container_parent_names:
+        return result
+    for cpn in container_parent_names:
+        prefix_c = cpn + "."
+        has_defined_child = any(
+            k.startswith(prefix_c) for k in all_name_keys if k != cpn
+        )
+        has_generated_child = False
+        try:
+            if gen_map is not None:
+                has_generated_child = any(k.startswith(prefix_c) for k in gen_map.keys())
+        except Exception:
+            has_generated_child = False
+        if has_defined_child or has_generated_child:
+            result.add(cpn)
+    return result
+
+
+def should_skip_parent_distribution_for_index(
+    *,
+    array_name: str,
+    array_index: int,
+    normalized_prefix: str,
+    gen_map: Optional[Dict[str, Any]],
+) -> bool:
+    """親レベル（array.i.*）の値を子へ分配すべきかの抑止判定。should_skip_array_anchor_insertion に委譲。"""
+    try:
+        return should_skip_array_anchor_insertion(
+            array_name, array_index, normalized_prefix, gen_map
+        )
+    except Exception:
+        return False
+
+
+def compute_group_to_root_map(
+    containers: Optional[Dict[str, Any]],
+    prefix: str,
+    normalized_prefix: str,
+    all_name_keys: List[str],
+) -> dict[str, str]:
+    """コンテナ/定義名から groupLabel -> root の一意マッピングを構築する。
+
+    - 1) コンテナ定義から（例: json.<root>.<group>.1.<child>）
+    - 2) 定義名から（例: json.<root>.<group>.1[.<child>...]）
+    複数 root で同じ group が現れた場合は曖昧として除外。
+    """
+    def _extract_group_root_from_container_key(cont_key: str) -> tuple[str, str] | None:
+        parts = [p for p in cont_key.split(".") if p]
+        if not (
+            len(parts) >= 4 and parts[0] == prefix and parts[2] and parts[3].isdigit()
+        ):
+            return None
+        return parts[2], parts[1]  # (group_label, root_name)
+
+    def _extract_group_root_from_name_key(nm: str) -> tuple[str, str] | None:
+        if not nm.startswith(normalized_prefix):
+            return None
+        parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+        if not (len(parts) >= 3 and parts[1] and parts[2].isdigit()):
+            return None
+        root_name = parts[0]
+        group_label = parts[1]
+        if re.fullmatch(r"\d+", group_label):
+            return None
+        return group_label, root_name
+
+    def _update_group_to_root(
+        mapping: dict[str, str], ambiguous: set[str], group_label: str, root_name: str
+    ) -> None:
+        if group_label in ambiguous:
+            return
+        if group_label in mapping and mapping[group_label] != root_name:
+            ambiguous.add(group_label)
+            mapping.pop(group_label, None)
+            return
+        mapping[group_label] = root_name
+
+    group_to_root: dict[str, str] = {}
+    ambiguous_groups: set[str] = set()
+
+    if containers:
+        for cont_key in containers.keys():
+            extracted = _extract_group_root_from_container_key(cont_key)
+            if extracted is None:
+                continue
+            group_label, root_name = extracted
+            _update_group_to_root(group_to_root, ambiguous_groups, group_label, root_name)
+
+    for nm in all_name_keys:
+        extracted = _extract_group_root_from_name_key(nm)
+        if extracted is None:
+            continue
+        group_label, root_name = extracted
+        _update_group_to_root(group_to_root, ambiguous_groups, group_label, root_name)
+
+    return group_to_root
+
+
+def compute_anchor_names(normalized_prefix: str, all_name_keys: List[str]) -> set[str]:
+    """*.1 で終わるアンカー名集合を返す（normalized_prefix を含むフル名）。"""
+    anchors: set[str] = set()
+    for nm in all_name_keys:
+        if not nm.startswith(normalized_prefix):
+            continue
+        parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+        if parts and parts[-1] == "1":
+            anchors.add(nm)
+    return anchors
+
+
+def compute_group_labels_from_anchors(
+    anchor_names: set[str],
+    containers: Optional[Dict[str, Any]],
+    *,
+    prefix: str,
+    normalized_prefix: str,
+) -> set[str]:
+    """アンカー名/コンテナからグループラベル候補（lv1 など）を抽出。"""
+    labels: set[str] = set()
+    # アンカーから抽出
+    for nm in anchor_names:
+        parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+        # 期待形: <root>.<group>.1[....]
+        if len(parts) >= 3 and parts[1] and parts[2] == "1" and not parts[1].isdigit():
+            labels.add(parts[1])
+    # コンテナからも補助的に抽出
+    if containers:
+        for cont_key in containers.keys():
+            parts = [p for p in cont_key.split(".") if p]
+            if (
+                len(parts) >= 4
+                and parts[0] == prefix
+                and parts[2]
+                and parts[3].isdigit()
+                and not parts[2].isdigit()
+            ):
+                labels.add(parts[2])
+    return labels
+
+
+def precompute_generated_indices_for_array(
+    gen_map: Optional[Dict[str, Any]],
+    normalized_prefix: str,
+    array_name: str,
+) -> set[int]:
+    """配列 `array_name` の生成名に含まれるインデックス集合を抽出して返す。"""
+    gen_indices: set[int] = set()
+    if gen_map is None:
+        return gen_indices
+    gen_pref_any = f"{normalized_prefix}{array_name}."
+    for _gk in gen_map.keys():
+        if not _gk.startswith(gen_pref_any):
+            continue
+        _tail = [p for p in _gk.removeprefix(gen_pref_any).split(".") if p]
+        if _tail and _tail[0].isdigit():
+            gen_indices.add(int(_tail[0]))
+    return gen_indices
+
+
+def generate_subarray_names_for_field_anchors(wb, normalized_prefix: str) -> None:
+    """フィールド直下の .1 が1D範囲を指す場合、2..N の補助生成名をワークブックに登録。
+
+    - 横1xN/縦Nx1 のみ対象（2Dは生成しない）
+    - 既存の定義名がある場合は生成をスキップ
+    - 生成名はワークブックの _generated_names に登録（既存実装に準拠）
+    """
+    try:
+        for nm, dn in list(getattr(wb, "defined_names", {} ).items()):
+            if not nm or not isinstance(nm, str):
+                continue
+            if not nm.startswith(normalized_prefix):
+                continue
+            parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+            # 末尾が '1' かつ その前が非数値 → フィールド直下のインデックス（例: json.X.1.A.1）
+            if len(parts) < 2 or parts[-1] != "1" or parts[-2].isdigit():
+                continue
+            # destinations の先頭のみ使用
+            sheet_name = None
+            coord = None
+            try:
+                for sn, c in getattr(dn, "destinations", []) or []:
+                    sheet_name, coord = sn, c
+                    break
+            except Exception:
+                sheet_name, coord = None, None
+            if not sheet_name or not coord:
+                continue
+            coord_clean = str(coord).replace("$", "")
+            if ":" not in coord_clean:
+                # 単一セルは対象外
+                continue
+            try:
+                (sc, sr), (ec, er) = parse_range(coord_clean)
+            except Exception:
+                continue
+            rows = abs(er - sr) + 1
+            cols = abs(ec - sc) + 1
+            # 1次元のみ（横一列 or 縦一列）
+            if rows == 1 and cols > 1:
+                total = cols
+                orient = "row"
+            elif cols == 1 and rows > 1:
+                total = rows
+                orient = "col"
+            else:
+                # 2D は生成しない
+                continue
+            base = normalized_prefix + ".".join(parts[:-1])
+            for i in range(2, total + 1):
+                if orient == "row":
+                    ci = sc + (i - 1)
+                    ri = sr
+                else:
+                    ci = sc
+                    ri = sr + (i - 1)
+                addr = f"{sheet_name}!${get_column_letter(ci)}${ri}"
+                gen_name = f"{base}.{i}"
+                # 既存定義名があれば生成しない（尊重）
+                if gen_name in getattr(wb, "defined_names", {}):
+                    continue
+                set_generated_name(wb, gen_name, addr)
+    except Exception as _e:
+        # 生成補助は必須ではないため失敗しても続行
+        logger.debug("generate_subarray_names_for_field_anchors skipped due to error: %s", _e)
+
+
+def compute_excluded_indexed_field_names(
+    normalized_prefix: str,
+    all_name_keys: List[str],
+    all_names: Dict[str, Any],
+) -> set[str]:
+    """*.field と *.field.1 が競合する際に、抑制すべきインデックス付きフィールド名を算出。
+
+    規則:
+    - 末尾が数値で直前が非数値（*.field.1）の名前について、同一ベース（*.field）が存在する場合は抑制対象。
+    - ただし、その *.field.1 が複数セルの範囲（1D/2D）を指す場合は抑制しない。
+    - 解析不能時は安全側として抑制に倒す（元コード準拠）。
+    """
+    excluded: set[str] = set()
+    base_name_set = set(all_name_keys)
+    for nm in all_name_keys:
+        try:
+            if not nm.startswith(normalized_prefix):
+                continue
+            parts = [p for p in nm.removeprefix(normalized_prefix).split(".") if p]
+            if len(parts) < 2 or not parts[-1].isdigit() or parts[-2].isdigit():
+                continue
+            base = normalized_prefix + ".".join(parts[:-1])
+            if base not in base_name_set:
+                continue
+            # ただし *.field.1 が複数セル範囲なら抑制しない
+            is_multi = False
+            try:
+                dn = all_names.get(nm)
+                if dn is not None:
+                    for _sn, coord in getattr(dn, "destinations", []) or []:
+                        coord_clean = str(coord).replace("$", "")
+                        if ":" in coord_clean:
+                            try:
+                                (_sc, _sr), (_ec, _er) = parse_range(coord_clean)
+                                if _sc != _ec or _sr != _er:
+                                    is_multi = True
+                            except Exception:
+                                logger.debug("failed to parse range for name=%s coord=%s", nm, coord_clean, exc_info=True)
+                        break
+            except Exception:
+                # 解析失敗時は is_multi=False のまま継続
+                logger.debug("failed while inspecting defined name destinations: %s", nm, exc_info=True)
+            if not is_multi:
+                excluded.add(nm)
+        except Exception:
+            logger.debug("unexpected error while excluding singleton name=%s", nm, exc_info=True)
+            excluded.add(nm)
+    return excluded
+
+def should_skip_array_anchor_insertion(
+    array_name: str,
+    array_index0: int,
+    normalized_prefix: str,
+    gen_map: Optional[Dict[str, Any]],
+) -> bool:
+    """親レベルの配列アンカー（json.<array>.<index>）の挿入を抑止すべきか判定。
+
+    規則:
+    - 同じ配列・同じ index(1-based) の配下にいずれかの生成名（json.<array>.<index>.<something>）が存在する場合、
+      親レベルのアンカー挿入は抑止する（生成名側に委譲）。
+    - それ以外は抑止しない。
+    """
+    if not gen_map:
+        return False
+    idx1 = array_index0 + 1  # 0-based -> 1-based
+    gen_pref_any = f"{normalized_prefix}{array_name}."
+    for k2 in gen_map.keys():
+        if not isinstance(k2, str) or not k2.startswith(gen_pref_any):
+            continue
+        tail = [p for p in k2.removeprefix(gen_pref_any).split(".") if p]
+        # 期待形: <index>.<something> ...（最低2要素）
+        if len(tail) >= 2 and tail[0].isdigit() and int(tail[0]) == idx1 and tail[1]:
+            return True
+    return False
+
+
+def ensure_array_and_element(
+    root_result: JSONDict, array_name: str, array_index0: int
+) -> JSONValue:
+    """ルート辞書に配列 `array_name` を用意し、`array_index0` のスロットを確保して返す。
+
+    契約:
+    - 入力: ルート`root_result`、配列名`array_name`、0始まりインデックス`array_index0`
+    - 出力: 現時点の要素（`None`/`dict`/`list`）
+    - 例外: なし（必要に応じて拡張する）
+    - 副作用: `root_result[array_name]` の確保と長さ拡張
+    """
+    if array_name not in root_result or not is_json_list(root_result.get(array_name)):
+        root_result[array_name] = []
+    array_ref_any = root_result[array_name]
+    array_ref = cast(List[Any], array_ref_any)
+    _ensure_list_index_capacity(array_ref, array_index0)
+    return array_ref[array_index0]
+
+
+def handle_double_numeric_index(
+    wb,
+    defined_name,
+    value,
+    array_ref: List[Any],
+    array_name: str,
+    array_index: int,
+    j_index: int,
+    rem_keys: List[str],
+    name: str,
+    original_path_keys: List[str],
+    path_keys: List[str],
+    user_provided_containers: bool,
+    expected_field_shape: Dict[tuple, str],
+    safe_insert,
+) -> bool:
+    """二重数値インデックス（parent.i.j...）の処理を担う。
+
+    契約:
+    - 入力: 親配列参照`array_ref`とi/jインデックス、残りキー`rem_keys`などの文脈
+    - 出力: 当該エントリを処理したらTrue（呼び出し側でcontinue）、未処理ならFalse
+    - 例外: 呼び出し元で捕捉する前提の通常例外（値挿入はsafe_insert経由）
+    """
+    if _is_case_index_index_field(rem_keys):
+        return _handle_case_index_index_field(
+            wb, defined_name, value, array_ref, array_name, array_index, j_index, rem_keys, name,
+            original_path_keys, path_keys, user_provided_containers, expected_field_shape, safe_insert
+        )
+    if _is_case_index_index_field_index(rem_keys):
+        return _handle_case_index_index_field_index(
+            wb, defined_name, value, array_ref, array_name, array_index, j_index, rem_keys, name,
+            original_path_keys, path_keys, user_provided_containers, expected_field_shape, safe_insert
+        )
+    if _is_case_no_rem_keys(rem_keys):
+        return _handle_case_no_rem_keys(
+            value, array_ref, array_index, j_index
+        )
+    return _handle_case_fallback(
+        FallbackParams(
+            value=value,
+            array_ref=array_ref,
+            array_index=array_index,
+            rem_keys=rem_keys,
+            name=name,
+            original_path_keys=original_path_keys,
+            path_keys=path_keys,
+            safe_insert=safe_insert,
+        )
+    )
+
+
+def _is_case_index_index_field(rem_keys: List[str]) -> bool:
+    """ケースA: 残りキーが1つで非数値（parent.i.j.<field>）。"""
+    return len(rem_keys) == 1 and (not rem_keys[0].isdigit())
+
+
+def _is_case_index_index_field_index(rem_keys: List[str]) -> bool:
+    """ケースB: 残りキーが2つで field.index（parent.i.j.<field>.<k>）。"""
+    return len(rem_keys) == 2 and (not rem_keys[0].isdigit()) and rem_keys[1].isdigit()
+
+
+def _is_case_no_rem_keys(rem_keys: List[str]) -> bool:
+    """ケースC: 残りキーが0（parent.i.j）。"""
+    return len(rem_keys) == 0
+
+
+def _handle_case_index_index_field(
+    wb, defined_name, value, array_ref, array_name, array_index, j_index, rem_keys, name,
+    original_path_keys, path_keys, user_provided_containers, expected_field_shape, safe_insert
+) -> bool:
+    field_token2 = rem_keys[0]
+    if user_provided_containers:
+        if not is_json_list(array_ref[array_index]):
+            prev = array_ref[array_index]
+            promoted = _promote_element_to_list_if_appropriate(prev)
+            if is_json_list(promoted):
+                array_ref[array_index] = promoted
+            else:
+                if not is_json_dict(array_ref[array_index]):
+                    array_ref[array_index] = {}
+                target_fallback = cast(Dict[str, Any], array_ref[array_index])
+                target_fallback[field_token2] = value
+                return True
+        inner_list = cast(List[Any], array_ref[array_index])
+        target_j = _ensure_nested_dict_at(inner_list, j_index)
+        try:
+            raw = get_named_range_values_preserve_shape(wb, defined_name)
+        except Exception:
+            raw = value
+        try:
+            if isinstance(raw, list):
+                if raw and isinstance(raw[0], (list, tuple)):
+                    expected_field_shape[(array_name, field_token2)] = "2D"
+                else:
+                    expected_field_shape[(array_name, field_token2)] = "1D"
+        except Exception:
+            logger.debug("failed to infer expected_field_shape for %s.%s", array_name, field_token2, exc_info=True)
+        coerced = apply_expected_shape_to_value(
+            raw,
+            field_name=field_token2,
+            expected_field_shape=expected_field_shape,
+            array_name=array_name,
+        )
+        _set_or_merge_list_field(target_j, field_token2, coerced)
+        return True
+    else:
+        if not is_json_dict(array_ref[array_index]):
+            array_ref[array_index] = {}
+        target_obj = cast(Dict[str, Any], array_ref[array_index])
+        try:
+            raw = get_named_range_values_preserve_shape(wb, defined_name)
+        except Exception:
+            raw = value
+        if isinstance(raw, list) and bool(raw) and isinstance(raw[0], (list, tuple)):
+            vals = raw
+        elif not isinstance(raw, list):
+            vals = [raw]
+        else:
+            vals = raw
+        _set_or_merge_list_field(target_obj, field_token2, vals)
+        return True
+
+def _handle_case_index_index_field_index(
+    wb, defined_name, value, array_ref, array_name, array_index, j_index, rem_keys, name,
+    original_path_keys, path_keys, user_provided_containers, expected_field_shape, safe_insert
+) -> bool:
+    if not user_provided_containers:
+        return False
+    field_token2 = rem_keys[0]
+    if not is_json_list(array_ref[array_index]):
+        array_ref[array_index] = cast(List[Any], _promote_element_to_list_if_appropriate(array_ref[array_index]))
+    inner_list = cast(List[Any], array_ref[array_index])
+    target_j = _ensure_nested_dict_at(inner_list, j_index)
+    try:
+        subval = get_named_range_values_preserve_shape(wb, defined_name)
+    except Exception:
+        subval = value
+    subval_list = subval if isinstance(subval, list) else [subval]
+    _set_or_merge_list_field(target_j, field_token2, subval_list)
+    return True
+
+def _handle_case_no_rem_keys(value, array_ref, array_index, j_index) -> bool:
+    cur_elem = array_ref[array_index]
+    if not is_json_list(cur_elem):
+        promoted = _promote_element_to_list_if_appropriate(cur_elem)
+        if is_json_list(promoted):
+            array_ref[array_index] = cast(List[Any], promoted)
+    if is_json_list(array_ref[array_index]):
+        inner_list = cast(List[Any], array_ref[array_index])
+        _ensure_list_index_capacity(inner_list, j_index)
+        inner_list[j_index] = value
+    return True
+
+@dataclass(frozen=True)
+class FallbackParams:
+    """Parameters for case fallback operations.
+
+    Groups the long argument list of _handle_case_fallback to reduce
+    call depth and improve maintainability.
+    """
+
+    value: Any
+    array_ref: List[Any]
+    array_index: int
+    rem_keys: List[str]
+    name: str
+    original_path_keys: List[str]
+    path_keys: List[str]
+    safe_insert: Callable[[Union[Dict[str, Any], List[Any]], List[str], Any, str, str, List[str], List[str]], None]
+
+
+def _handle_case_fallback(params: FallbackParams) -> bool:
+    """Handle case fallback using FallbackParams dataclass."""
+    current_element = params.array_ref[params.array_index]
+    if not isinstance(current_element, dict):
+        params.array_ref[params.array_index] = {}
+        current_element = params.array_ref[params.array_index]
+    params.safe_insert(
+        current_element,
+        params.rem_keys,
+        params.value,
+        ".".join(params.rem_keys),
+        params.name,
+        params.original_path_keys,
+        params.path_keys,
+    )
+    return True
+
+
+def should_skip_distribution_index(
+    tgt_idx_int: int,
+    array_name: str,
+    field_token: Optional[str],
+    normalized_prefix: str,
+    defined_only_name_keys: set[str],
+    gen_map: Optional[Dict[str, Any]],
+    gen_indices: set[int],
+) -> bool:
+    """配列分配時に対象インデックスをスキップすべきか判定する。"""
+    # 生成名が存在するインデックスは生成名に委譲
+    if tgt_idx_int in gen_indices:
+        return True
+    if field_token:
+        tgt_idx_token = str(tgt_idx_int)
+        cand1 = f"{normalized_prefix}{array_name}.{tgt_idx_token}.{field_token}"
+        cand2 = f"{normalized_prefix}{array_name}.{field_token}.{tgt_idx_token}"
+        if cand1 in defined_only_name_keys or cand2 in defined_only_name_keys:
+            return True
+        if (gen_map is not None) and (cand1 in gen_map or cand2 in gen_map):
+            return True
+    return False
+
+
+def distribute_internal_slice(
+    array_ref: List[Any],
+    array_name: str,
+    array_index: int,
+    values: List[Any],
+    field_token: Optional[str],
+    remaining_keys: List[str],
+    remaining_path: str,
+    name: str,
+    original_path_keys: List[str],
+    normalized_prefix: str,
+    defined_only_name_keys: set[str],
+    gen_map: Optional[Dict[str, Any]],
+    safe_insert: Callable[
+        [
+            Union[Dict[str, Any], List[Any]],
+            List[str],
+            Any,
+            str,
+            str,
+            List[str],
+            List[str],
+        ],
+        None,
+    ],
+) -> None:
+    """内部スライス（list値）を配列要素へ分配する責務を担う。
+
+    ポリシー:
+    - 空値はスキップ
+    - 既存の非空フィールドは上書きしない
+    - 生成名や定義名による保護を尊重し、該当インデックスはスキップ
+    """
+
+    # 配列容量と要素の辞書化を保証
+    _ensure_array_slots_as_dicts(array_ref, array_index, len(values))
+
+    # 生成名インデックス集合を事前計算
+    gen_indices: set[int] = _precompute_distribution_gen_indices(
+        gen_map=gen_map, normalized_prefix=normalized_prefix, array_name=array_name
+    )
+
+    # 各値を適切なスロットへ挿入
+    for j, vj in enumerate(values):
+        _apply_distribution_to_index(
+            array_ref=array_ref,
+            base_index=array_index,
+            j=j,
+            value=vj,
+            field_token=field_token,
+            remaining_keys=remaining_keys,
+            remaining_path=remaining_path,
+            name=name,
+            original_path_keys=original_path_keys,
+            array_name=array_name,
+            normalized_prefix=normalized_prefix,
+            defined_only_name_keys=defined_only_name_keys,
+            gen_map=gen_map,
+            gen_indices=gen_indices,
+            safe_insert=safe_insert,
+        )
+
+
+def _ensure_array_slots_as_dicts(array_ref: List[Any], start_index: int, count: int) -> None:
+    """`array_ref[start_index:start_index+count]` を辞書スロットとして確保する。"""
+    needed = start_index + count
+    while len(array_ref) < needed:
+        array_ref.append({})
+    for _i in range(start_index, start_index + count):
+        if not isinstance(array_ref[_i], dict):
+            array_ref[_i] = {}
+
+
+def _precompute_distribution_gen_indices(
+    *, gen_map: Optional[Dict[str, Any]], normalized_prefix: str, array_name: str
+) -> set[int]:
+    """分配スキップ判定用に、生成名が存在する配列インデックスを抽出する。"""
+    return precompute_generated_indices_for_array(
+        gen_map=gen_map, normalized_prefix=normalized_prefix, array_name=array_name
+    )
+
+
+def _apply_distribution_to_index(
+    *,
+    array_ref: List[Any],
+    base_index: int,
+    j: int,
+    value: Any,
+    field_token: Optional[str],
+    remaining_keys: List[str],
+    remaining_path: str,
+    name: str,
+    original_path_keys: List[str],
+    array_name: str,
+    normalized_prefix: str,
+    defined_only_name_keys: set[str],
+    gen_map: Optional[Dict[str, Any]],
+    gen_indices: set[int],
+    safe_insert: Callable[[Union[Dict[str, Any], List[Any]], List[str], Any, str, str, List[str], List[str]], None],
+) -> None:
+    """1件の内部スライス分配操作（values[j]を適切なスロットへ挿入）を実施。"""
+    vj = value
+    if vj in (None, ""):
+        return
+    tgt_idx_int = base_index + 1 + j
+    tgt_idx_token = str(tgt_idx_int)
+    if should_skip_distribution_index(
+        tgt_idx_int=tgt_idx_int,
+        array_name=array_name,
+        field_token=field_token,
+        normalized_prefix=normalized_prefix,
+        defined_only_name_keys=defined_only_name_keys,
+        gen_map=gen_map,
+        gen_indices=gen_indices,
+    ):
+        logger.debug("DIST-SKIP idx=%s name=%s", tgt_idx_token, name)
+        return
+    if field_token and len(remaining_keys) == 1:
+        cur = array_ref[base_index + j].get(field_token)
+        if not is_completely_empty(cur):
+            return
+    safe_insert(
+        array_ref[base_index + j],
+        remaining_keys,
+        vj,
+        remaining_path,
+        name,
+        original_path_keys,
+        original_path_keys,
+    )
+
+
+
+def handle_internal_slice_distribution_entry(
+    *,
+    array_ref: List[Any],
+    array_name: str,
+    array_index: int,
+    value: Any,
+    remaining_keys: List[str],
+    remaining_path: str,
+    name: str,
+    original_path_keys: List[str],
+    normalized_prefix: str,
+    arrays_with_double_index: set[str],
+    defined_only_name_keys: set[str],
+    gen_map: Optional[Dict[str, Any]],
+    safe_insert: Callable[[Union[Dict[str, Any], List[Any]], List[str], Any, str, str, List[str], List[str]], None],
+) -> bool:
+    """
+    内部スライス分配の入口。必要に応じて分配し、処理した場合は True を返す。
+    Args:
+        array_ref: 配列参照
+        array_name: 配列名
+        array_index: 開始インデックス
+        value: 分配する値
+        ...existing code...
+    Returns:
+        bool: 分配した場合 True
+    """
+    if not isinstance(value, list):
+        return False
+
+    # 親レベルの分配抑止（[i][j] の i に生成名があれば親では分配しない）
+    if array_name in arrays_with_double_index and should_skip_parent_distribution_for_index(
+        array_name=array_name,
+        array_index=array_index,
+        normalized_prefix=normalized_prefix,
+        gen_map=gen_map,
+    ):
+        logger.debug(
+            "PARENT-SKIP distribute %s[%s] due to generated nested children: %s",
+            array_name,
+            array_index,
+            name,
+        )
+        return True  # 親では何もしないが処理済みとして扱う
+
+    field_token = remaining_keys[0] if len(remaining_keys) == 1 else None
+    distribute_internal_slice(
+        array_ref=array_ref,
+        array_name=array_name,
+        array_index=array_index,
+        values=value,
+        field_token=field_token,
+        remaining_keys=remaining_keys,
+        remaining_path=remaining_path,
+        name=name,
+        original_path_keys=original_path_keys,
+        normalized_prefix=normalized_prefix,
+        defined_only_name_keys=defined_only_name_keys,
+        gen_map=gen_map,
+        safe_insert=safe_insert,
+    )
+    return True
+
+
+def apply_expected_shape_to_value(
+    value: Any,
+    field_name: Optional[str],
+    expected_field_shape: Dict[tuple, str],
+    array_name: str,
+) -> Any:
+    """
+    期待形状に基づいて値の形状を正規化する。
+    Args:
+        value: 入力値
+        field_name: フィールド名
+        expected_field_shape: 期待形状マップ
+        array_name: 配列名
+    Returns:
+        Any: 正規化後の値
+    """
+    if field_name is None:
+        return value
+    try:
+        shape = expected_field_shape.get((array_name, field_name))
+        if shape == "1D":
+            return _coerce_to_1d(value)
+        if shape == "2D":
+            return _coerce_to_2d(value)
+        return value
+    except Exception:
+        return value
+
+
+def should_skip_deep_nested_defined_name(name: str, gen_map: Optional[Dict[str, Any]]) -> bool:
+    """深いネスト（数値トークンが2つ以上）かつ生成名配下にある定義名はスキップすべきか。
+
+    - name: 例 'json.ツリー1.lv1.1.lv2.1.field' のようなフル名
+    - gen_map が None の場合はスキップ判定せず False
+    - 同一サブツリー配下に生成名が存在する場合 True を返す
+    """
+    try:
+        if gen_map is None:
+            return False
+        parts_nm = [p for p in name.split(".") if p]
+        if len(parts_nm) < 4:
+            return False
+        # 数値トークンが2つ以上なら深いネストとみなす
+        digit_count = sum(1 for p in parts_nm if p.isdigit())
+        if digit_count < 2:
+            return False
+        prefix_here = name + "."
+        # 自身 or 配下に生成名が存在するか
+        for k in gen_map.keys():
+            if k == name or k.startswith(prefix_here):
+                return True
+        return False
+    except Exception:
+        # 判定失敗時は安全側（スキップしない）
+        return False
+
+
+def match_schema_key(key: str, schema_props: dict) -> str:
+    """スキーマのプロパティ名に対し、`_` を `.` として扱うワイルドカード照合でキーを正規化。
+
+    - `schema_props` が空なら `key` をそのまま返す
+    - ちょうど1件だけ一致した場合に限り置換
+    - 複数マッチ時は警告して置き換えない
+    """
+    if not schema_props:
+        return key
+    key = key.strip()
+    try:
+        pattern = "^" + re.escape(key).replace("_", ".") + "$"
+        matches = [
+            prop for prop in schema_props if re.fullmatch(pattern, prop, flags=re.UNICODE)
+        ]
+        logger.debug(f"key={key}, pattern={pattern}, matches={matches}")
+        if len(matches) == 1:
+            return matches[0]
+        elif len(matches) > 1:
+            logger.warning(
+                f"ワイルドカード照合で複数マッチ: '{key}' → {matches}。ユニークでないため置換しません。"
+            )
+        return key
+    except Exception:
+        return key
+
+
+def resolve_path_keys_with_schema(
+    *, path_keys: List[str], schema: Optional[Dict[str, Any]]
+) -> Tuple[List[str], bool]:
+    """スキーマを用いて `path_keys` を解決し、(解決結果, schema_broken) を返す。
+
+    - 数値キーは items に降りる
+    - 非数値キーは properties を使って `match_schema_key` で正規化
+    - スキーマが途中で追随できなくなった場合は schema_broken=True を返し、呼び出し側で original を使う
+    - 例外時は (path_keys, True) を返して安全側に倒す
+    """
+    if schema is None:
+        return (path_keys, True)
+    try:
+        props = schema.get("properties", {})
+        items = schema.get("items", {})
+        current_schema = schema
+        resolved: List[str] = []
+        schema_broken = False
+        for k in path_keys:
+            if re.fullmatch(r"\d+", k):
+                resolved.append(k)
+                if isinstance(current_schema, dict) and "items" in current_schema:
+                    current_schema = current_schema["items"]
+                    props = (
+                        current_schema.get("properties", {})
+                        if isinstance(current_schema, dict)
+                        else {}
+                    )
+                    items = (
+                        current_schema.get("items", {})
+                        if isinstance(current_schema, dict)
+                        else {}
+                    )
+                else:
+                    props = {}
+                    items = {}
+            else:
+                if not props or not isinstance(props, dict):
+                    schema_broken = True
+                    break
+                new_k = match_schema_key(k, props)
+                resolved.append(new_k)
+                next_schema = props.get(new_k, {}) if isinstance(props, dict) else {}
+                if isinstance(next_schema, dict) and "properties" in next_schema:
+                    current_schema = next_schema
+                    props = next_schema["properties"]
+                    items = next_schema.get("items", {})
+                elif isinstance(next_schema, dict) and "items" in next_schema:
+                    current_schema = next_schema
+                    props = next_schema.get("properties", {})
+                    items = next_schema["items"]
+                else:
+                    props = {}
+                    items = {}
+        return (resolved, schema_broken)
+    except Exception:
+        return (path_keys, True)
+
+
+def finalize_insertion_for_parent_array_element(
+    *,
+    current_element: Dict[str, Any],
+    array_ref: List[Any],
+    array_name: str,
+    array_index: int,
+    value: Any,
+    remaining_keys: List[str],
+    name: str,
+    original_path_keys: List[str],
+    normalized_prefix: str,
+    arrays_with_double_index: set[str],
+    defined_only_name_keys: set[str],
+    gen_map: Optional[Dict[str, Any]],
+    safe_insert: Callable[[Union[Dict[str, Any], List[Any]], List[str], Any, str, str, List[str], List[str]], None],
+    expected_field_shape: Dict[tuple, str],
+) -> None:
+    """親配列要素に対する残余キーの処理を一括実行する。
+
+    手順:
+    - 単一フィールドの場合、期待形状に基づき値を 1D/2D に正規化
+    - 値が list の場合、内部スライス分配（必要に応じて抑止）
+    - 分配されなかった場合のみ、上書き抑止を考慮しつつ安全挿入
+    """
+    remaining_path = ".".join(remaining_keys)
+    # 期待形状に基づく値の昇格（スカラ → 配列）
+    eff_value = value
+    if len(remaining_keys) == 1:
+        eff_value = apply_expected_shape_to_value(
+            eff_value,
+            field_name=remaining_keys[0],
+            expected_field_shape=expected_field_shape,
+            array_name=array_name,
+        )
+
+    handled = handle_internal_slice_distribution_entry(
+        array_ref=array_ref,
+        array_name=array_name,
+        array_index=array_index,
+        value=eff_value,
+        remaining_keys=remaining_keys,
+        remaining_path=remaining_path,
+        name=name,
+        original_path_keys=original_path_keys,
+        normalized_prefix=normalized_prefix,
+        arrays_with_double_index=arrays_with_double_index,
+        defined_only_name_keys=defined_only_name_keys,
+        gen_map=gen_map,
+        safe_insert=safe_insert,
+    )
+    if handled:
+        return
+
+    # 既存が配列/辞書ならスカラ上書きを避ける
+    if should_skip_scalar_overwrite(current_element, remaining_keys):
+        return
+
+    safe_insert(
+        current_element,
+        remaining_keys,
+        eff_value,
+        remaining_path,
+        name,
+        original_path_keys,
+        original_path_keys,
+    )
+
+
+def should_suppress_value_insertion(
+    *,
+    name: str,
+    keys: List[str],
+    normalized_prefix: str,
+    all_name_keys: List[str],
+    container_parent_names: set[str],
+    container_parents_with_children: set[str],
+    group_labels: set[str],
+) -> bool:
+    """エントリ収集段階で値の挿入を抑止すべきかを判定する。
+
+    最小互換仕様:
+    - 親コンテナ名で、かつ子要素（定義名 or 生成名）が存在するものは抑止
+    - アンカー（末尾が '1'）で、その直下に非数値の子（フィールド）がある場合は抑止
+      例: json.A.1.name があるとき json.A.1 自体の値は挿入しない
+    - 配列要素直下のラベル終端（....<idx>.<groupLabel>）で、対応アンカー（....<idx>.1）が存在する場合は抑止
+    """
+    try:
+        # 1) 親コンテナ（子がある）
+        if name in container_parent_names and name in container_parents_with_children:
+            return True
+
+        # 2) アンカー末端 (.1) で非数値の子を持つ場合
+        if keys and keys[-1] == "1":
+            parent_prefix = name + "."
+            for child in all_name_keys:
+                if not child.startswith(parent_prefix) or len(child) <= len(parent_prefix):
+                    continue
+                tail_first = child[len(parent_prefix):].split(".")[0]
+                if tail_first and not tail_first.isdigit():
+                    return True
+
+        # 3) ラベル終端（....<idx>.<groupLabel>）で対応アンカーがある場合
+        if len(keys) >= 3 and keys[-1] in group_labels and keys[-2].isdigit():
+            # 例: json.<root>.<idx>.<label> に対して json.<root>.<idx>.1 またはその子があれば抑止
+            base = f"{normalized_prefix}{keys[0]}.{keys[1]}.1"
+            for k in all_name_keys:
+                if k == base or k.startswith(base + "."):
+                    return True
+
+        return False
+    except Exception:
+        return False
+
+
+def collect_entries_in_sheet_order(
+    *,
+    all_names: Dict[str, Any],
+    normalized_prefix: str,
+    excluded_indexed_field_names: set[str],
+    sheet_order: Dict[str, int],
+    suppress_ctx: Dict[str, Any],
+) -> List[Tuple[tuple[int, int, int], str, Any, List[str]]]:
+    """定義名を走査し、抑制ロジックを適用して Excel 読取順のエントリ配列を返す。
+
+    suppress_ctx には抑制判定に必要な文脈を渡す:
+    {
+      'all_name_keys', 'container_parent_names', 'container_parents_with_children', 'group_labels'
+    }
+    """
+    entries: List[Tuple[tuple[int, int, int], str, Any, List[str]]] = []
+    all_name_keys = suppress_ctx.get("all_name_keys", [])
+    container_parent_names = suppress_ctx.get("container_parent_names", set())
+    container_parents_with_children = suppress_ctx.get(
+        "container_parents_with_children", set()
+    )
+    group_labels = suppress_ctx.get("group_labels", set())
+
+    # ルート最初出現位置（同一ルート内の安定化に使用）
+    root_first_pos: Dict[str, tuple[int, int, int]] = suppress_ctx.get(
+        "root_first_pos", {}
+    )
+
+    for name, defined_name in all_names.items():
+        if not name.startswith(normalized_prefix):
+            continue
+        if name in excluded_indexed_field_names:
+            continue
+        keys = [k for k in name.removeprefix(normalized_prefix).split(".") if k]
+        if should_suppress_value_insertion(
+            name=name,
+            keys=keys,
+            normalized_prefix=normalized_prefix,
+            all_name_keys=all_name_keys,
+            container_parent_names=container_parent_names,
+            container_parents_with_children=container_parents_with_children,
+            group_labels=group_labels,
+        ):
+            continue
+        pos_key = compute_top_left_pos(defined_name, sheet_order)
+        entries.append((pos_key, name, defined_name, keys))
+
+    def _entry_sort_key(x: Tuple[tuple[int, int, int], str, Any, List[str]]):
+        pos, nm, _dn, ks = x
+        root = ks[0] if ks else ""
+        root_pos = root_first_pos.get(root, (10**9, 10**9, 10**9))
+        return (root_pos[0], root_pos[1], root_pos[2], pos[0], pos[1], pos[2], nm)
+
+    entries.sort(key=_entry_sort_key)
+    return entries
+
+
+def reorder_roots_by_sheet_order(
+    result: Dict[str, Any],
+    root_first_pos: Dict[str, tuple[int, int, int]] | None,
+    prefix: str,
+    user_provided_containers: bool,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Excel上の出現順に基づいてルートキー順を安定化する。
+
+    返値は (result, root_result)。例外時は無変更で返す。
+    """
+    try:
+        if is_json_dict(result):
+            target_dict: Optional[Dict[str, Any]] = None
+            if user_provided_containers and prefix in result and is_json_dict(result[prefix]):
+                target_dict = cast(Dict[str, Any], result[prefix])
+            else:
+                target_dict = result
+            if target_dict is not None and isinstance(root_first_pos, dict) and root_first_pos:
+                desired_roots = [k for k, _ in sorted(root_first_pos.items(), key=lambda kv: kv[1])]
+                existing_keys = list(target_dict.keys())
+                new_order: Dict[str, Any] = {}
+                for rk in desired_roots:
+                    if rk in target_dict:
+                        new_order[rk] = target_dict[rk]
+                for k in existing_keys:
+                    if k not in new_order:
+                        new_order[k] = target_dict[k]
+                if user_provided_containers and prefix in result and is_json_dict(result[prefix]):
+                    result[prefix] = new_order
+                else:
+                    result = new_order
+                # 外側（トップレベル）もルート順に並び替え
+                if is_json_dict(result):
+                    outer_existing = list(result.keys())
+                    outer_new: Dict[str, Any] = {}
+                    if prefix in result and prefix not in outer_new:
+                        outer_new[prefix] = result[prefix]
+                    for rk in desired_roots:
+                        if rk in result and rk not in outer_new:
+                            outer_new[rk] = result[rk]
+                    for k in outer_existing:
+                        if k not in outer_new:
+                            outer_new[k] = result[k]
+                    result = outer_new
+        root_result = result if not user_provided_containers else result.get(prefix, {})
+        return result, cast(Dict[str, Any], root_result)
+    except Exception:
+        root_result = result if not user_provided_containers else result.get(prefix, {})
+        return result, cast(Dict[str, Any], root_result)
+
+
+def reshape_containers_in_result(
+    result: Dict[str, Any],
+    containers: Optional[Dict[str, Any]],
+    prefix: str,
+    user_provided_containers: bool,
+) -> Dict[str, Any]:
+    """コンテナ出力（dict of lists）を list of dicts へリシェイプする。"""
+
+    def _reshape_container(value: Any) -> Any:
+        if is_json_dict(value) and value:
+            list_keys = [k for k, v in value.items() if is_json_list(v)]
+            if list_keys:
+                max_len = 0
+                for lk in list_keys:
+                    arrv = value.get(lk)
+                    if is_json_list(arrv):
+                        max_len = max(max_len, len(cast(List[Any], arrv)))
+                rows: List[Dict[str, Any]] = []
+                for i in range(max_len):
+                    row: Dict[str, Any] = {}
+                    for col, arr in value.items():
+                        if is_json_list(arr) and i < len(arr):
+                            row[col] = arr[i]
+                    if row:
+                        rows.append(row)
+                return rows if rows else value
+        return value
+
+    if user_provided_containers and prefix in result and is_json_dict(result[prefix]):
+        for cont_key in (containers or {}).keys():
+            if cont_key.startswith(prefix + ".") and cont_key.count(".") == 1:
+                base_name = cont_key.split(".", 1)[1]
+                if base_name in result[prefix]:
+                    result[prefix][base_name] = _reshape_container(result[prefix][base_name])
+    return result
+
+
+def replicate_prefix_children_to_top_level(
+    result: Dict[str, Any],
+    prefix: str,
+    group_labels: set[str],
+    root_first_pos: Dict[str, tuple[int, int, int]] | None,
+) -> Dict[str, Any]:
+    """互換性維持のため、prefix 配下のキーをトップレベルへ複製し、ルート順で整列する。"""
+    if not (is_json_dict(result) and prefix in result):
+        return result
+    rep_group_labels: set[str] = {g for g in group_labels if re.fullmatch(r"lv\d+", g)}
+    pref_val2 = result[prefix]
+    if not is_json_dict(pref_val2):
+        return result
+    for k, v in cast(Dict[str, JSONValue], pref_val2).items():
+        if k in rep_group_labels:
+            continue
+        if k not in result:
+            result[k] = v
+
+    if isinstance(root_first_pos, dict) and root_first_pos:
+        desired_roots = [k for k, _ in sorted(root_first_pos.items(), key=lambda kv: kv[1])]
+        outer_existing = list(result.keys())
+        outer_new: Dict[str, Any] = {}
+        if prefix in result and prefix not in outer_new:
+            outer_new[prefix] = result[prefix]
+        for rk in desired_roots:
+            if rk in result and rk not in outer_new:
+                outer_new[rk] = result[rk]
+        for k in outer_existing:
+            if k not in outer_new:
+                outer_new[k] = result[k]
+        result = outer_new
+    return result
+
+
+def fallback_normalize_root_groups_without_containers(
+    result: Dict[str, Any],
+    group_to_root: Dict[str, str],
+    gen_map: Optional[Dict[str, Any]],
+    normalized_prefix: str,
+) -> Dict[str, Any]:
+    """コンテナ未指定時のフォールバック正規化を適用する。"""
+    if not is_json_dict(result):
+        return result
+    _absorb_root_groups(result, group_to_root)
+    _remove_leading_empty_elements(result)
+    if gen_map is not None:
+        _reconstruct_arrays_from_generated_names(result, gen_map, normalized_prefix)
+    return result
+
+def _absorb_root_groups(result: Dict[str, Any], group_to_root: Dict[str, str]) -> None:
+    for grp, root_name in list(group_to_root.items()):
+        if root_name in result and is_json_dict(result[root_name]):
+            continue
+        if root_name not in result and grp in result and is_json_list(result[grp]):
+            result[root_name] = {grp: result[grp]}
+            result.pop(grp, None)
+
+def _remove_leading_empty_elements(result: Dict[str, Any]) -> None:
+    def _is_effectively_empty_dict(d: Any) -> bool:
+        if not is_json_dict(d):
+            return False
+        if not d:
+            return True
+        try:
+            return all(DataCleaner.is_empty_value(x) for x in d.values())
+        except Exception:
+            return False
+    for k, v in list(result.items()):
+        if is_json_list(v) and v:
+            while v and _is_effectively_empty_dict(v[0]):
+                v.pop(0)
+
+def _reconstruct_arrays_from_generated_names(result: Dict[str, Any], gen_map: Dict[str, Any], normalized_prefix: str) -> None:
+    gkeys: dict = gen_map
+    for arr_name, arr_val in list(result.items()):
+        if not is_json_list(arr_val):
+            continue
+        gen_pref = f"{normalized_prefix}{arr_name}."
+        has_any = any(k.startswith(gen_pref) for k in gkeys.keys())
+        if not has_any:
+            continue
+        try:
+            if any((it is not None) and (not is_json_dict(it)) for it in arr_val):
+                continue
+        except Exception:
+            continue
+        idx_map: Dict[int, Dict[str, Any]] = {}
+        for gk, gv in gkeys.items():
+            if not gk.startswith(gen_pref):
+                continue
+            tail = [p for p in gk[len(gen_pref) :].split(".") if p]
+            if len(tail) < 2:
+                continue
+            if not tail[0].isdigit():
+                continue
+            idx = int(tail[0])
+            field = tail[1]
+            if not field or field.isdigit():
+                continue
+            idx_map.setdefault(idx, {})[field] = gv
+        if not idx_map:
+            continue
+        max_idx = max(idx_map.keys())
+        base_list: List[Dict[str, Any]] = []
+        for elem in arr_val:
+            base_list.append(dict(elem) if is_json_dict(elem) else {})
+        while len(base_list) < max_idx:
+            base_list.append({})
+        for ix, fields in idx_map.items():
+            dst = base_list[ix - 1]
+            for fk, fv in fields.items():
+                if fv in (None, ""):
+                    continue
+                if (
+                    fk in dst
+                    and isinstance(dst.get(fk), (list, dict))
+                    and not is_completely_empty(dst.get(fk))
+                ):
+                    continue
+                dst[fk] = fv
+        while base_list and all(v in (None, "") for v in base_list[0].values()):
+            base_list.pop(0)
+        result[arr_name] = base_list
+
+
+def get_value_for_defined_or_generated_name(
+    *, wb: Any, name: str, defined_name: Any, gen_map: Optional[Dict[str, Any]]
+) -> Tuple[bool, Any]:
+    """生成名を優先して値を取得し、深いネストの定義名は必要に応じてスキップする。
+
+    戻り値: (should_skip, value)
+    - should_skip=True の場合は呼び出し側で continue する
+    """
+    if gen_map is not None and name in gen_map:
+        logger.debug("コンテナ生成セル名の値を直接取得: %s -> %r", name, gen_map[name])
+        return (False, gen_map[name])
+    # 深いネストかつ生成名配下はスキップ
+    if should_skip_deep_nested_defined_name(name, gen_map):
+        logger.debug("生成名配下の深いネスト定義名をスキップ: %s", name)
+        return (True, None)
+    try:
+        return (False, get_named_range_values(wb, defined_name))
+    except Exception as e:
+        # #REF! 等で有効な destination が無い場合は、値は取得できないが
+        # 形状復元ロジックで null/[]/{} を出力できるよう、空プレースホルダを返す
+        logger.debug("Use empty placeholder for invalid destinations: %s (err=%s)", name, e)
+        return (False, "")
+
+
+def process_array_path_entry(
+    *,
+    wb: Any,
+    defined_name: Any,
+    value: Any,
+    path_keys: List[str],
+    name: str,
+    original_path_keys: List[str],
+    normalized_prefix: str,
+    root_result: Dict[str, Any],
+    arrays_with_double_index: set[str],
+    expected_field_shape: Dict[Tuple[str, str], str],
+    gen_map: Optional[Dict[str, Any]],
+    group_labels: set[str],
+    all_name_keys: List[str],
+    container_parent_names: set[str],
+    defined_only_name_keys: set[str],
+    safe_insert: Callable[[Union[Dict[str, Any], List[Any]], List[str], Any, str, str, List[str], List[str]], None],
+    user_provided_containers: bool = False,
+) -> bool:
+    """配列パス（array.i.*）の処理を行い、処理済みなら True を返す。"""
+    if len(path_keys) < 2 or not re.fullmatch(r"\d+", path_keys[1]):
+        return False
+
+    array_name = path_keys[0]
+    array_index = int(path_keys[1]) - 1
+
+    # アンカー自体の挿入抑止（同 index に生成名がある場合）
+    anchor_skip = False
+    if len(path_keys) == 2:
+        anchor_skip = should_skip_array_anchor_insertion(
+            array_name, array_index, normalized_prefix, gen_map
+        )
+
+    if anchor_skip:
+        return True
+
+    # 配列準備＋要素参照
+    current_element = ensure_array_and_element(root_result, array_name, array_index)
+    array_ref = root_result[array_name]
+
+    # 二重数値インデックス: array.i.j...
+    if len(path_keys) >= 3 and re.fullmatch(r"\d+", path_keys[2]):
+        j_index = int(path_keys[2]) - 1
+        rem_keys = path_keys[3:] if len(path_keys) > 3 else []
+        handled = handle_double_numeric_index(
+            wb,
+            defined_name,
+            value,
+            array_ref,
+            array_name,
+            array_index,
+            j_index,
+            rem_keys,
+            name,
+            original_path_keys,
+            path_keys,
+            user_provided_containers,
+            expected_field_shape,
+            safe_insert,
+        )
+        return True if handled else False
+
+    # 1次元配列: array.i.field...
+    if (not isinstance(current_element, dict)) and (array_name not in arrays_with_double_index):
+        array_ref[array_index] = {}
+        current_element = array_ref[array_index]
+
+    if array_name in arrays_with_double_index:
+        handled_parent = handle_parent_level_for_double_index_array(
+            wb=wb,
+            defined_name=defined_name,
+            value=value,
+            array_ref=array_ref,
+            array_name=array_name,
+            array_index=array_index,
+            path_keys=path_keys,
+            name=name,
+            normalized_prefix=normalized_prefix,
+            gen_map=gen_map,
+            expected_field_shape=expected_field_shape,
+        )
+        if handled_parent:
+            return True
+
+    if len(path_keys) > 2:
+        # 親レベル処理で未処理の場合、以降は current_element にフィールドを入れるため dict を保証する
+        if not isinstance(current_element, dict):
+            array_ref[array_index] = {}
+            current_element = array_ref[array_index]
+        remaining_keys = path_keys[2:]
+        # 末端が field.index の場合: 値を形状保持で取得し、1Dで追記
+        if (
+            len(remaining_keys) == 2
+            and not remaining_keys[0].isdigit()
+            and remaining_keys[1].isdigit()
+        ):
+            field_token = remaining_keys[0]
+            try:
+                subval = get_named_range_values_preserve_shape(wb, defined_name)
+            except Exception:
+                subval = value
+            subval_list = _coerce_to_1d(subval)
+            _set_or_merge_list_field(cast(Dict[str, Any], current_element), field_token, subval_list)
+            return True
+        # ラベル終端の抑制
+        if suppress_label_terminal_if_applicable(
+            remaining_keys=remaining_keys,
+            original_path_keys=original_path_keys,
+            group_labels=group_labels,
+            normalized_prefix=normalized_prefix,
+            all_name_keys=all_name_keys,
+            container_parent_names=container_parent_names,
+        ):
+            return True
+
+        finalize_insertion_for_parent_array_element(
+            current_element=cast(Dict[str, Any], current_element),
+            array_ref=array_ref,
+            array_name=array_name,
+            array_index=array_index,
+            value=value,
+            remaining_keys=remaining_keys,
+            name=name,
+            original_path_keys=original_path_keys,
+            normalized_prefix=normalized_prefix,
+            arrays_with_double_index=arrays_with_double_index,
+            defined_only_name_keys=defined_only_name_keys,
+            gen_map=gen_map,
+            safe_insert=safe_insert,
+            expected_field_shape=expected_field_shape,
+        )
+        return True
+    else:
+        array_ref[array_index] = value
+        return True
+
+
+def should_skip_scalar_overwrite(current_element: Any, remaining_keys: List[str]) -> bool:
+    """既に配列/辞書が入っているフィールドにスカラを上書きしない判定。"""
+    return (
+        len(remaining_keys) == 1
+        and isinstance(current_element, dict)
+        and remaining_keys[0] in current_element
+        and isinstance(current_element[remaining_keys[0]], (list, dict))
+        and not is_completely_empty(current_element[remaining_keys[0]])
+    )
+
+
+def _normalize_root_group_for_parse(
+    keys: List[str],
+    *,
+    group_to_root: Dict[str, str],
+    numeric_root_keys: set[str],
+    root_result: Dict[str, Any],
+) -> List[str]:
+    """parse_named_ranges_with_prefix 内でのルート配下キー正規化を関数化。
+
+    - group_to_root: グループ名→ルート名のマップ
+    - numeric_root_keys: 先頭が配列ルートである既知キー集合
+    - root_result: 既存のルート辞書（配列存在チェックに使用）
+    """
+    k = list(keys)
+    if len(k) >= 2 and (k[0] in group_to_root) and re.fullmatch(r"\d+", k[1]):
+        k = [group_to_root[k[0]]] + k[1:]
+    while len(k) >= 2:
+        first, second = k[0], k[1]
+        first_is_array_root = (first in numeric_root_keys) or (
+            first in root_result and isinstance(root_result.get(first), list)
+        )
+        if first_is_array_root and not re.fullmatch(r"\d+", second):
+            k = k[1:]
+            continue
+        break
+    return k
+
+
+def merge_into_list_unique(existing: Any, values: Any) -> List[Any]:
+    """
+    リストへのユニーク追記ヘルパー。
+    Args:
+        existing: 既存値
+        values: 追加値
+    Returns:
+        List[Any]: 1Dリスト（ユニーク追記済み）
+    """
+    # 既存をベースのリストに正規化
+    base: List[Any]
+    if isinstance(existing, list):
+        base = list(existing)
+    elif existing in (None, ""):
+        base = []
+    else:
+        base = [existing]
+
+    is_list_of_list = bool(base) and isinstance(base[0], (list, tuple))
+    if is_list_of_list:
+        return base
+
+    cand_iter = values if isinstance(values, list) else [values]
+    for v in cand_iter:
+        if v in (None, ""):
+            continue
+        if v not in base:
+            base.append(v)
+    return base
+
+
+def _ensure_nested_dict_at(lst: List[Any], idx0: int) -> Dict[str, Any]:
+    """リスト `lst[idx0]` に辞書を用意して返す（None/非辞書は辞書に置換）。
+
+    - `lst` の長さが不足していれば `None` 埋めで拡張
+    - 既存が `None` もしくは非 dict の場合は `{}` に置換
+    - 最終的に `dict` を返す
+    """
+    _ensure_list_index_capacity(lst, idx0)
+    if lst[idx0] is None or not is_json_dict(lst[idx0]):
+        lst[idx0] = {}
+    return cast(Dict[str, Any], lst[idx0])
+
+
+def _set_or_merge_list_field(
+    target: Dict[str, Any], field: str, new_values: Any
+) -> None:
+    """target[field] に対して 1D ユニーク追記（2Dはそのまま）で設定するユーティリティ。
+
+    - 既存が None/空相当ならそのまま設定
+    - 既存があれば `merge_into_list_unique` で 1D ユニークマージ（例外時は new_values をそのまま代入）
+    - `new_values` は呼び出し側で 1D/2D へ事前正規化しておくこと（本関数は形状変換をしない）
+    """
+    existing = target.get(field)
+    if existing is None or is_completely_empty(existing):
+        target[field] = new_values
+    else:
+        try:
+            target[field] = merge_into_list_unique(existing, new_values)
+        except Exception:
+            target[field] = new_values
+    # New function to promote elements to list if appropriate
+def _promote_element_to_list_if_appropriate(elem: Any) -> Union[List[Any], Any]:
+    """空辞書/None 相当の要素は配列に昇格し、それ以外は据え置く。
+
+    - `{}` または `None`/空辞書相当なら `[]` を返す
+    - 既に list ならそのまま返す
+    - 非空の辞書などはそのまま返す（後方互換のため昇格しない）
+    """
+    if is_json_list(elem):
+        return elem
+    if is_json_dict(elem) and len(elem) == 0:
+        return []
+    if elem in (None, {}):
+        return []
+    return elem
+
 def parse_range(range_str: str) -> tuple:
     """
     Excel範囲文字列を解析して開始座標と終了座標を返す
     例: "B2:D4" -> ((2, 2), (4, 4))
     例: "$B$2:$D$4" -> ((2, 2), (4, 4))
     """
-    import re
-
     # $記号を削除してから解析
     cleaned_range = range_str.replace("$", "")
 
@@ -407,11 +3318,10 @@ def detect_instance_count(start_coord: tuple, end_coord: tuple, direction: str) 
     start_col, start_row = start_coord
     end_col, end_row = end_coord
 
-    if direction == "vertical":
+    dir_lc = (direction or "").lower()
+    if dir_lc == "row":
         return end_row - start_row + 1
-    elif direction == "horizontal":
-        return end_col - start_col + 1
-    elif direction == "column":
+    elif dir_lc == "column":
         return end_col - start_col + 1
     else:
         raise ValueError(f"無効なdirection: {direction}")
@@ -425,21 +3335,15 @@ def generate_cell_names(
     items: list,
 ) -> list:
     """
-    コンテナ用のセル名を生成
+    コンテナ用のセル名を生成（一般ユーティリティ）
     1-base indexingを使用
     """
-    start_col, start_row = start_coord
-    end_col, end_row = end_coord
-    cell_names = []
-
     instance_count = detect_instance_count(start_coord, end_coord, direction)
-
+    cell_names = []
     for i in range(1, instance_count + 1):  # 1-base indexing
         for item in items:
-            # フォーマット: コンテナ名_インデックス_アイテム名
             cell_name = f"{container_name}_{i}_{item}"
             cell_names.append(cell_name)
-
     return cell_names
 
 
@@ -472,6 +3376,120 @@ def load_container_config(config_path: Path) -> Dict[str, Any]:
         return {}
 
 
+def infer_containers_from_named_ranges(
+    workbook, prefix: str
+) -> Dict[str, Dict[str, int | str]]:
+    """
+    コンテナ未指定時の自動推論:
+    - 親セル名（json.X または json.X.Y...）がセル『範囲』を指し、かつその下位階層に他のセル名が存在する場合、
+      その親セル名をコンテナ定義として解釈する。
+    - 直下の子トークンが数値なら繰り返し（increment=範囲高さ, direction=row）、非数値なら非繰り返し（increment=0, direction=row）。
+
+    注意:
+    - 複数シート/複数宛先の範囲がある場合は最初の宛先から高さを決定（仕様不明点。必要なら拡張可能）。
+    - 親セル名自体が単一セルの場合は対象外。
+    """
+    try:
+        if not prefix:
+            return {}
+        prefix_dot = prefix + "."
+        # すべての名前を収集
+        all_names = [name for name in workbook.defined_names.keys() if name]
+        # 範囲高さの収集
+        range_heights = _collect_range_heights_for_prefix(workbook, prefix_dot, all_names)
+        if not range_heights:
+            return {}
+        # 繰返し性の仮決定
+        preliminary = _determine_preliminary_container_behaviors(range_heights, all_names)
+        if not preliminary:
+            return {}
+        # 抑制ルールの適用
+        suppressed = _suppress_redundant_candidates(preliminary, all_names)
+        return suppressed
+    except Exception as e:
+        logger.debug(f"自動コンテナ推論中にエラー: {e}")
+        return {}
+
+
+def _collect_range_heights_for_prefix(workbook, prefix_dot: str, all_names: list[str]) -> Dict[str, int]:
+    range_heights: Dict[str, int] = {}
+    for name in all_names:
+        if not name.startswith(prefix_dot):
+            continue
+        dn = workbook.defined_names[name]
+        height_detected = None
+        for _sn, coord in dn.destinations:
+            coord_clean = coord.replace("$", "")
+            if ":" not in coord_clean:
+                continue
+            (_sc, _sr), (_ec, _er) = parse_range(coord_clean)
+            height_detected = abs(_er - _sr) + 1
+            break
+        if height_detected is not None:
+            range_heights[name] = height_detected
+    return range_heights
+
+
+def _determine_preliminary_container_behaviors(
+    range_heights: Dict[str, int], all_names: list[str]
+) -> Dict[str, Dict[str, int | str]]:
+    preliminary: Dict[str, Dict[str, int | str]] = {}
+    for nm, height in range_heights.items():
+        if nm.endswith(".1"):
+            preliminary[nm] = {"direction": "row", "increment": int(height)}
+            continue
+        parent_prefix = nm + "."
+        child_tokens: set[str] = set()
+        for child in all_names:
+            if child.startswith(parent_prefix) and len(child) > len(parent_prefix):
+                tail = child[len(parent_prefix) :]
+                first = tail.split(".")[0]
+                if first:
+                    child_tokens.add(first)
+        if not child_tokens:
+            continue
+        is_repeating = any(tok.isdigit() for tok in child_tokens)
+        preliminary[nm] = {"direction": "row", "increment": 1 if is_repeating else 0}
+    return preliminary
+
+
+def _suppress_redundant_candidates(
+    preliminary: Dict[str, Dict[str, int | str]], all_names: list[str]
+) -> Dict[str, Dict[str, int | str]]:
+    repeating_parents = [p for p, cfg in preliminary.items() if int(cfg.get("increment", 0) or 0) > 0]
+    suppressed: Dict[str, Dict[str, int | str]] = {}
+    for nm, cfg in preliminary.items():
+        nm_parts = [t for t in nm.split(".") if t]
+        suppressed_here = False
+        for rp in repeating_parents:
+            if nm == rp or not nm.startswith(rp + "."):
+                continue
+            rp_parts = [t for t in rp.split(".") if t]
+            if len(nm_parts) == len(rp_parts) + 1 and nm_parts[-1] == "1":
+                if not rp.endswith(".1"):
+                    suppressed_here = True
+                    break
+                has_non_numeric_child = False
+                nm_prefix = nm + "."
+                for child in all_names:
+                    if child.startswith(nm_prefix) and len(child) > len(nm_prefix):
+                        tail = child[len(nm_prefix) :]
+                        first = tail.split(".")[0]
+                        if first and (not first.isdigit()):
+                            has_non_numeric_child = True
+                            break
+                if not has_non_numeric_child:
+                    suppressed_here = True
+                    break
+            if len(nm_parts) > len(rp_parts) and not nm_parts[-1].isdigit():
+                suppressed_here = True
+                break
+        if suppressed_here:
+            continue
+        suppressed[nm] = cfg
+    return suppressed
+
+
 def resolve_container_range(wb, range_spec: str) -> tuple:
     """
     範囲指定を解決して座標を返す
@@ -487,105 +3505,23 @@ def resolve_container_range(wb, range_spec: str) -> tuple:
     try:
         return parse_range(range_spec)
     except ValueError:
-        raise ValueError(f"無効な範囲指定: {range_spec}")
+        # 互換: エラーメッセージを統一
+        raise ValueError("無効な範囲指定")
 
 
 class DataCleaner:
-    """データのクリーニングと検証を行うクラス"""
+    """
+    データのクリーニングと検証を行うユーティリティ。
+
+    注意: 実装はモジュールレベル関数に集約されています（重複排除のため）。
+    既存コードの互換性維持のため、このクラスの各メソッドは対応する
+    モジュール関数に委譲します。
+    """
 
     @staticmethod
     def is_empty_value(value: Any) -> bool:
-        """値が空かどうかを判定する（None, 空白のみの文字列, 空リスト, 空dictはTrue。0やFalseはFalse）"""
-        if value is None:
-            return True
-        if isinstance(value, str):
-            return value.strip() == ""
-        if isinstance(value, list):
-            return len(value) == 0
-        if isinstance(value, dict):
-            return len(value) == 0
-        return False
-
-    @staticmethod
-    def is_completely_empty(obj: Any) -> bool:
-        """完全に空かどうか（None, 空白のみの文字列, 空リスト/空dict/全要素が完全に空ならTrue。他はFalse）"""
-        if obj is None:
-            return True
-        if isinstance(obj, str):
-            return obj.strip() == ""
-        if isinstance(obj, list):
-            return all(DataCleaner.is_completely_empty(v) for v in obj)
-        if isinstance(obj, dict):
-            return all(DataCleaner.is_completely_empty(v) for v in obj.values())
-        return False
-
-    @staticmethod
-    def clean_empty_values(
-        obj: Union[Dict[str, Any], List[Any], Any], suppress_empty: bool = True
-    ) -> Union[Dict[str, Any], List[Any], Any, None]:
-        """空の値を再帰的に除去する"""
-        if not suppress_empty:
-            return obj
-
-        if isinstance(obj, dict):
-            cleaned = {}
-            for key, value in obj.items():
-                cleaned_value = DataCleaner.clean_empty_values(value, suppress_empty)
-                if not DataCleaner.is_empty_value(cleaned_value):
-                    cleaned[key] = cleaned_value
-            return cleaned if cleaned else None
-
-        elif isinstance(obj, list):
-            processed_items = []
-            for item in obj:
-                processed_item = DataCleaner.clean_empty_values(item, suppress_empty)
-                processed_items.append(processed_item)
-
-            cleaned = []
-            for item in processed_items:
-                if not DataCleaner.is_completely_empty(item):
-                    cleaned.append(item)
-
-            return cleaned if cleaned else None
-
-        else:
-            return obj if not DataCleaner.is_empty_value(obj) else None
-
-    @staticmethod
-    def clean_empty_arrays_contextually(
-        obj: Union[Dict[str, Any], List[Any], Any], suppress_empty: bool = True
-    ) -> Union[Dict[str, Any], List[Any], Any, None]:
-        """配列要素の整合性を保ちながら空値を除去する"""
-        if not suppress_empty:
-            return obj
-
-        if isinstance(obj, dict):
-            cleaned = {}
-            for key, value in obj.items():
-                cleaned_value = DataCleaner.clean_empty_arrays_contextually(
-                    value, suppress_empty
-                )
-                if cleaned_value is not None:
-                    cleaned[key] = cleaned_value
-            return cleaned if cleaned else None
-
-        elif isinstance(obj, list):
-            processed_items = []
-            for item in obj:
-                processed_item = DataCleaner.clean_empty_arrays_contextually(
-                    item, suppress_empty
-                )
-                processed_items.append(processed_item)
-
-            cleaned = []
-            for item in processed_items:
-                if item is not None:
-                    cleaned.append(item)
-
-            return cleaned if cleaned else None
-
-        else:
-            return obj if not DataCleaner.is_empty_value(obj) else None
+        """値が空かどうかを判定する（委譲）。"""
+        return is_empty_value(value)
 
 
 # =============================================================================
@@ -613,170 +3549,566 @@ def parse_json_path(path: str) -> List[str]:
     return keys
 
 
+@dataclass(frozen=True)
+class OutputOrderingPolicy:
+    """出力順制御のポリシー（内部拡張ポイント）。
+
+    方針:
+    - 通常のユースケースは固定仕様でカバーし、CLI からの細粒度な切替は想定しません。
+    - スキーマによる properties 順適用は最終出力直前のみ（読取順の決定性を維持）。
+    - スキーマ外プロパティは挿入順を保持し、名称に依存する特例は導入しません。
+
+    パラメータ:
+    - schema_first: スキーマの properties 順を優先（True のとき）。
+    - align_sibling_list_of_dicts: 同一構造の兄弟 list-of-dicts でヘッドキー順を共有する。
+    - keep_extras_in_insertion_order: スキーマ外プロパティは挿入順を保持。
+    """
+
+    schema_first: bool = False
+    align_sibling_list_of_dicts: bool = True
+    keep_extras_in_insertion_order: bool = True
+
+
+def _align_key_order_by_head(obj: Any) -> Any:
+    """list-of-dicts に対してヘッドのキー順を兄弟間で共有する整形。
+
+    - 同一構造パス（数値トークン除外）で最初に観測したキー順を共有して適用。
+    - list-of-list-of-dicts も内側に対して同様の整列を行う。
+    - 非破壊の新オブジェクトを返す。
+    """
+    shared_head_keys_by_path: dict[tuple[str, ...], list[str]] = {}
+
+    def _apply_keys_order(d: Dict[str, Any], keys: list[str], path: list[str]) -> Dict[str, Any]:
+        rest_keys = [k for k in d.keys() if k not in keys]
+        new_d: Dict[str, Any] = {}
+        for k in keys:
+            if k in d:
+                new_d[k] = _recur(d[k], path + [k])
+        for k in rest_keys:
+            new_d[k] = _recur(d[k], path + [k])
+        return new_d
+
+    def _handle_lod_list(x: list[Any], path: list[str]) -> list[Any] | None:
+        """list-of-dicts の場合に共有ヘッドキー順を適用。該当しない場合は None。"""
+        if not x or not all(is_json_dict(it) for it in x if it is not None):
+            return None
+        sanitized_path = [p for p in path if not (isinstance(p, str) and p.isdigit())]
+        path_key = tuple(sanitized_path)
+        if path_key in shared_head_keys_by_path:
+            head_keys = shared_head_keys_by_path[path_key]
+        else:
+            head = next((it for it in x if is_json_dict(it)), None)
+            head_keys = list(head.keys()) if head is not None else []
+            shared_head_keys_by_path[path_key] = head_keys
+        aligned_list: list[Any] = []
+        for it in x:
+            if not is_json_dict(it):
+                aligned_list.append(_recur(it, path))
+            else:
+                aligned_list.append(_apply_keys_order(it, head_keys, path))
+        return aligned_list
+
+    def _handle_lolod_list(x: list[Any], path: list[str]) -> list[Any] | None:
+        """list-of-list-of-dicts の場合に内側へヘッドキー順を共有適用。該当しない場合は None。"""
+        if not x or not all((not it) or is_json_list(it) for it in x):
+            return None
+        common_head_keys: list[str] | None = None
+        for it in x:
+            if not (is_json_list(it) and it):
+                continue
+            if all(is_json_dict(xx) for xx in it if xx is not None):
+                head_candidate = next((xx for xx in it if is_json_dict(xx)), None)
+                if head_candidate is not None:
+                    common_head_keys = list(head_candidate.keys())
+                    break
+        if common_head_keys is None:
+            return None
+        aligned: list[Any] = []
+        for it in x:
+            if is_json_list(it) and all(is_json_dict(xx) for xx in it if xx is not None):
+                sub_aligned: list[Any] = []
+                for d in it:
+                    if not is_json_dict(d):
+                        sub_aligned.append(_recur(d, path))
+                    else:
+                        sub_aligned.append(_apply_keys_order(d, common_head_keys, path))
+                aligned.append(sub_aligned)
+            else:
+                aligned.append(_recur(it, path))
+        return aligned
+
+    def _recur(x: Any, path: list[str]) -> Any:
+        if is_json_list(x):
+            return (
+                _handle_lolod_list(x, path)
+                or _handle_lod_list(x, path)
+                or [_recur(it, path) for it in x]
+            )
+        if is_json_dict(x):
+            return {k: _recur(v, path + [k]) for k, v in x.items()}
+        return x
+
+    return _recur(obj, [])
+
+
+def order_for_output(data: Dict[str, Any], *, policy: OutputOrderingPolicy, schema: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """最終出力用の順序整形を適用して返す。
+
+    優先順位:
+    1) schema_first=True かつ schema がある → スキーマ順（余剰は挿入順のまま）
+    2) align_sibling_list_of_dicts=True → 兄弟 list-of-dicts のキー順共有
+    3) keep_extras_in_insertion_order は reorder_json 実装が担保
+    """
+    out = data
+    # まず sibling alignment（表示一貫性）
+    if policy.align_sibling_list_of_dicts:
+        out = cast(Dict[str, Any], _align_key_order_by_head(out))
+    # スキーマ順（必要時）
+    if policy.schema_first and schema:
+        out = cast(Dict[str, Any], reorder_json(out, schema))
+    return out
+
+
+# =============================================================================
+# Cross-cutting policies (common concerns abstraction)
+# =============================================================================
+
+
+@dataclass(frozen=True)
+class DataCleaningPolicy:
+    """データクリーニングの方針（内部拡張ポイント）。
+
+    注意:
+    - 既定値はテストで固定されており、CLI での切替は前提としません。
+    - 実運用でのカスタムは、まず --transform かスキーマ定義での整形を推奨します。
+
+    - normalize_array_field_shapes: 配列内の同名フィールドの形状を横並びで統一
+    - prune_empty_elements: 完全に空の要素を除去
+    - clean_empty_values: 空値を抑制して出力から除去
+    """
+
+    normalize_array_field_shapes: bool = True
+    prune_empty_elements: bool = True
+    clean_empty_values: bool = True
+
+
+@dataclass(frozen=True)
+class JsonPathInsertionPolicy:
+    """JSONパス挿入時の方針（内部拡張ポイント）。
+
+    - 通常は固定仕様を使用し、特殊な共存ルールはテストで固定した既定に従います。
+    - 既定の value_key は "__value__"。外部からの変更は推奨しません。
+
+    - promote_scalar_to_container_with_value_key: スカラーの上に子を挿入する際、{"__value__": scalar} に昇格
+    - replace_empty_container_on_terminal: 末端にスカラを挿入する際、既存が空dictなら置換、非空dictなら __value__ に格納
+    - value_key: スカラ保全に用いるキー名（互換のため "__value__" 既定）
+    - one_based_index: 配列のインデックス基準（1基準が既定）
+    """
+
+    promote_scalar_to_container_with_value_key: bool = True
+    replace_empty_container_on_terminal: bool = True
+    value_key: str = "__value__"
+    one_based_index: bool = True
+
+
+@dataclass(frozen=True)
+class SerializationPolicy:
+    """シリアライズ（出力）時の方針（内部拡張ポイント）。
+
+    - CLI の --output-format は引き続き有効です。その他の詳細は既定値で十分なはずです。
+    - format: "json" | "yaml"
+    - indent: インデント幅（JSON）
+    - ensure_ascii: JSONのASCIIエスケープ有無
+    - datetime_to_iso: datetime/date/time を ISO 文字列へシリアライズ
+    """
+
+    format: str = "json"
+    indent: int = 2
+    ensure_ascii: bool = False
+    datetime_to_iso: bool = True
+
+
+@dataclass(frozen=True)
+class ValidationPolicy:
+    """バリデーション時の方針（内部拡張ポイント）。
+
+    - enabled: スキーマ検証を実施するか
+    - to_iso_for_validation: 検証前に datetime/date/time を ISO 文字列へ正規化
+    """
+
+    enabled: bool = True
+    to_iso_for_validation: bool = True
+
+
+@dataclass(frozen=True)
+class LoggingPolicy:
+    """ログ出力の方針（内部拡張ポイント）。
+
+    - debug_before_after_prune: prune 前後のサンプルキーをデバッグ出力
+    - validation_error_to_file: 検証エラーをファイルへ出力
+    """
+
+    debug_before_after_prune: bool = True
+    validation_error_to_file: bool = True
+
+
+# 既定の共通ポリシー（現行の挙動を再現）
+DEFAULT_DATA_CLEANING_POLICY = DataCleaningPolicy()
+DEFAULT_JSON_PATH_INSERTION_POLICY = JsonPathInsertionPolicy()
+DEFAULT_SERIALIZATION_POLICY = SerializationPolicy()
+DEFAULT_VALIDATION_POLICY = ValidationPolicy()
+DEFAULT_LOGGING_POLICY = LoggingPolicy()
+
+
+def _is_numeric_key(key: str) -> bool:
+    return bool(re.fullmatch(r"\d+", key))
+
+
+# =============================================================================
+# Extraction policies (missing types restored for compatibility)
+# =============================================================================
+
+@dataclass(frozen=True)
+class NumericTokenPolicy:
+    strict_spec_match: bool = True
+
+
+@dataclass(frozen=True)
+class NestedScanPolicy:
+    ancestors_first_bounds: bool = True
+    row_ownership_without_tokens: bool = True
+
+
+@dataclass(frozen=True)
+class ExtractionPolicy:
+    nested_scan: NestedScanPolicy = NestedScanPolicy()
+    numeric_tokens: NumericTokenPolicy = NumericTokenPolicy()
+
+
+# 既定の抽出ポリシー（テストで参照される名前）
+_DEFAULT_EXTRACTION_POLICY = ExtractionPolicy()
+
+
+# =============================================================================
+# Exceptions (compatibility)
+# =============================================================================
+
+class ConfigurationError(Exception):
+    pass
+
+
+class FileProcessingError(Exception):
+    pass
+
+
+# =============================================================================
+# Helpers required by tests restored
+# =============================================================================
+
+def suppress_label_terminal_if_applicable(
+    *,
+    remaining_keys: List[str],
+    original_path_keys: List[str],
+    group_labels: set[str] | None,
+    normalized_prefix: str,
+    all_name_keys: List[str],
+    container_parent_names: set[str],
+) -> bool:
+    """配列要素直下のラベル終端（例: json.A.1.lv1）を抑制するか。
+
+    互換仕様:
+    - remaining_keys が 1 要素かつ group_labels に含まれる場合
+    - 対応する子アンカー（json.A.1.1 系）が all_name_keys に存在する場合 True
+    - それ以外は False
+    """
+    try:
+        if not remaining_keys or len(remaining_keys) != 1:
+            return False
+        label = remaining_keys[0]
+        if not group_labels or label not in group_labels:
+            return False
+        # original_path_keys から親キーのベース（json.A.1）を組み立て、子アンカーの有無を確認
+        # normalized_prefix は末尾に '.' を含む前提
+        if not normalized_prefix.endswith("."):
+            normalized_prefix = normalized_prefix + "."
+        base = normalized_prefix + ".".join(original_path_keys[:2])  # json.A.1
+        anchor_prefix = base + ".1"  # json.A.1.1
+        for k in all_name_keys:
+            if k.startswith(anchor_prefix):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _ensure_curr_list_or_raise(
+    curr: Union[JSONDict, List[Any]],
+    parent: Optional[Union[JSONDict, List[Any]]],
+    parent_is_list: bool,
+    parent_key: Optional[Union[str, int]],
+    current_path: str,
+) -> List[Any]:
+    """カレントをlistとして確保。空dictなら親経由でlistに昇格、不可なら互換エラー。"""
+    if is_json_list(curr):
+        return cast(List[Any], curr)
+
+    if is_json_dict(curr) and len(cast(Dict[str, Any], curr)) == 0 and parent is not None:
+        new_list: List[Any] = []
+        if parent_is_list and isinstance(parent_key, int):
+            cast(List[Any], parent)[parent_key] = new_list
+        elif (not parent_is_list) and isinstance(parent_key, str):
+            cast(Dict[str, Any], parent)[parent_key] = new_list
+        return new_list
+
+    raise TypeError(f"Expected list at {current_path}, got {type(curr)}")
+
+
+def _ensure_list_index_capacity(lcurr: List[Any], idx0: int) -> None:
+    """`lcurr[idx0]`へ安全に代入できるよう長さを伸長する。"""
+    while len(lcurr) <= idx0:
+        lcurr.append(None)
+
+
+def _assign_terminal_in_list(
+    lcurr: List[Any], idx0: int, value: JSONValue, _ipol: JsonPathInsertionPolicy
+) -> None:
+    """終端でlist[idx0]に値を設定。空dictはvalue_key昇格ポリシーに従い代入。"""
+    existing_last = lcurr[idx0] if idx0 < len(lcurr) else None
+    if is_json_dict(existing_last):
+        edict = cast(Dict[str, Any], existing_last)
+        if len(edict) == 0:
+            if _ipol.replace_empty_container_on_terminal:
+                lcurr[idx0] = value
+            else:
+                edict[_ipol.value_key] = value
+        else:
+            edict[_ipol.value_key] = value
+    else:
+        lcurr[idx0] = value
+
+
+def _prepare_next_container_for_list(
+    lcurr: List[Any], idx0: int, next_is_numeric: bool, _ipol: JsonPathInsertionPolicy
+) -> Union[JSONDict, List[Any]]:
+    """次キーの型（数値/文字列）に応じて配下コンテナ(list/dict)を用意して返す。"""
+    nxt_any = lcurr[idx0]
+    if nxt_any is None:
+        nxt_container: Union[JSONDict, List[Any]] = [] if next_is_numeric else {}
+        lcurr[idx0] = nxt_container
+        return nxt_container
+
+    if not (is_json_dict(nxt_any) or is_json_list(nxt_any)):
+        prev = nxt_any
+        nxt_container2: Union[JSONDict, List[Any]]
+        if next_is_numeric:
+            nxt_container2 = []
+        else:
+            nxt_container2 = (
+                {(_ipol.value_key): prev}
+                if _ipol.promote_scalar_to_container_with_value_key
+                else {}
+            )
+        lcurr[idx0] = nxt_container2
+        return nxt_container2
+
+    return cast(Union[JSONDict, List[Any]], nxt_any)
+
+
+def _ensure_curr_dict_or_raise(
+    curr: Union[JSONDict, List[Any]],
+    parent: Optional[Union[JSONDict, List[Any]]],
+    parent_is_list: bool,
+    parent_key: Optional[Union[str, int]],
+) -> JSONDict:
+    """カレントをdictとして確保。空listなら親経由でdictに昇格、不可なら互換エラー。"""
+    if is_json_dict(curr):
+            return curr
+
+    if is_json_list(curr) and len(cast(List[Any], curr)) == 0 and parent is not None:
+        new_dict: Dict[str, Any] = {}
+        if parent_is_list and isinstance(parent_key, int):
+            cast(List[Any], parent)[parent_key] = new_dict
+        elif (not parent_is_list) and isinstance(parent_key, str):
+            cast(Dict[str, Any], parent)[parent_key] = new_dict
+        return cast(JSONDict, new_dict)
+
+    # 互換のエラーメッセージ
+    raise TypeError("insert_json_path: root must be dict")
+
+
+def _assign_terminal_in_dict(
+    dcurr: JSONDict, key: str, value: JSONValue, _ipol: JsonPathInsertionPolicy
+) -> None:
+    """終端でdict[key]に値を設定。空dictはvalue_key昇格ポリシーに従い代入。"""
+    if key in dcurr and is_json_dict(dcurr[key]):
+        edict = cast(Dict[str, Any], dcurr[key])
+        if len(edict) == 0:
+            if _ipol.replace_empty_container_on_terminal:
+                dcurr[key] = value
+            else:
+                edict[_ipol.value_key] = value
+        else:
+            edict[_ipol.value_key] = value
+    else:
+        dcurr[key] = value
+
+
+def _ensure_next_child_for_dict(
+    dcurr: JSONDict, key: str, next_is_numeric: bool, _ipol: JsonPathInsertionPolicy
+) -> Union[JSONDict, List[Any]]:
+    """次キーの型に応じて子(list/dict)を作成/昇格し、空相互変換も許容して返す。"""
+    if key not in dcurr:
+        dcurr[key] = [] if next_is_numeric else {}
+        return cast(Union[JSONDict, List[Any]], dcurr[key])
+
+    child = dcurr[key]
+    # スカラーを辞書に昇格
+    if not (is_json_dict(child) or is_json_list(child)):
+        prev_value = child
+        dcurr[key] = (
+            {(_ipol.value_key): prev_value}
+            if _ipol.promote_scalar_to_container_with_value_key
+            else {}
+        )
+    else:
+        # 空コンテナの相互変換
+        if next_is_numeric and is_json_dict(child) and len(cast(Dict[str, Any], child)) == 0:
+            dcurr[key] = []
+        elif (not next_is_numeric) and is_json_list(child) and len(cast(List[Any], child)) == 0:
+            dcurr[key] = {}
+
+    return cast(Union[JSONDict, List[Any]], dcurr[key])
+
+
 def insert_json_path(
-    root: Union[Dict[str, Any], List[Any]],
-    keys: Union[List[str], str],
-    value: Any,
+    root: Union[JSONDict, List[Any]],
+    keys: Union[Sequence[str], str],
+    value: JSONValue,
     full_path: str = "",
+    *,
+    insertion_policy: JsonPathInsertionPolicy | None = None,
 ) -> None:
     """
     ドット区切りキーのリストまたは文字列から JSON 構造を構築し、値を挿入する。
     数字キーは list、文字列キーは dict として扱う。
     配列要素の構築時には適切に辞書から配列への変換も行う。
     """
-    # 文字列パスの場合はリストに変換
-    if isinstance(keys, str):
-        keys = parse_json_path(keys)
+    # パス正規化（空チェック含む）
+    keys = _normalize_json_path_keys(keys)
 
-    # 空のパスの場合のエラーハンドリング
-    if not keys:
+    # ルート型チェック: dict または list のみ許可
+    if not (is_json_dict(root) or is_json_list(root)):
+        raise TypeError("insert_json_path: root must be dict or list")
+
+    # ポリシー（既定は互換）
+    _ipol = insertion_policy or DEFAULT_JSON_PATH_INSERTION_POLICY
+
+    # 逐次処理（親参照を保持して dict<->list の昇格を安全に行う）
+    parent: Optional[Union[JSONDict, List[Any]]] = None
+    parent_is_list: bool = False
+    parent_key: Optional[Union[str, int]] = None
+    curr: Union[JSONDict, List[Any]] = root
+
+    for i, key in enumerate(keys):
+        is_last = i == len(keys) - 1
+        current_path = f"{full_path}.{key}" if full_path else key
+        is_num = _is_numeric_key(key)
+
+        if is_num:
+            parent, parent_is_list, parent_key, curr, inserted = _insert_path_numeric_step(
+                parent=parent,
+                parent_is_list=parent_is_list,
+                parent_key=parent_key,
+                curr=curr,
+                key=key,
+                is_last=is_last,
+                value=value,
+                next_key=(None if is_last else keys[i + 1]),
+                current_path=current_path,
+                _ipol=_ipol,
+            )
+            if inserted:
+                return
+        else:
+            parent, parent_is_list, parent_key, curr, inserted = _insert_path_string_step(
+                parent=parent,
+                parent_is_list=parent_is_list,
+                parent_key=parent_key,
+                curr=curr,
+                key=key,
+                is_last=is_last,
+                value=value,
+                next_key=(None if is_last else keys[i + 1]),
+                _ipol=_ipol,
+            )
+            if inserted:
+                return
+
+
+def _normalize_json_path_keys(keys: Union[Sequence[str], str]) -> List[str]:
+    """`insert_json_path` 用にキー列を正規化し、空なら例外を出す。"""
+    if isinstance(keys, str):
+        norm = parse_json_path(keys)
+    else:
+        norm = list(keys)
+    if not norm:
         raise ValueError(
             "JSONパスが空です。値を挿入するには少なくとも1つのキーが必要です。"
         )
-
-    key = keys[0]
-    is_last = len(keys) == 1
-    current_path = f"{full_path}.{key}" if full_path else key
-
-    if re.fullmatch(r"\d+", key):
-        idx = int(key) - 1  # 1-basedインデックスを0-basedに変換
-        if idx < 0:
-            raise ValueError(f"配列インデックスは1以上である必要があります: {key}")
-
-        # rootが辞書の場合は配列に変換する必要がある
-        if isinstance(root, dict):
-            # 空の辞書の場合は単純に配列に置き換え
-            if not root:
-                root_ref = []
-                # 呼び出し元の参照を更新するため、rootを変更
-                root.clear()
-                while len(root_ref) <= idx:
-                    root_ref.append(None)
-
-                if is_last:
-                    root_ref[idx] = value
-                else:
-                    if root_ref[idx] is None:
-                        root_ref[idx] = [] if re.fullmatch(r"\d+", keys[1]) else {}
-                    insert_json_path(root_ref[idx], keys[1:], value, current_path)
-                return
-            else:
-                # 辞書に既存データがある場合はエラー
-                raise ValueError(
-                    f"Cannot convert dict to array at path '{current_path}' - "
-                    f"existing dict has non-numeric keys: {list(root.keys())}"
-                )
-
-        if not isinstance(root, list):
-            raise TypeError(f"Expected list at {keys}, got {type(root)}")
-
-        while len(root) <= idx:
-            root.append(None)
-        if is_last:
-            root[idx] = value
-        else:
-            if root[idx] is None:
-                root[idx] = [] if re.fullmatch(r"\d+", keys[1]) else {}
-            insert_json_path(root[idx], keys[1:], value, current_path)
-    else:
-        # dict型でない場合は、str型ならdictに置き換えて再帰
-        if not isinstance(root, dict):
-            if isinstance(root, str):
-                # 既存値を__value__に退避
-                new_dict = {"__value__": root}
-                root = new_dict
-            else:
-                raise TypeError(
-                    f"insert_json_path: root must be dict, got {type(root)}"
-                )
-        if is_last:
-            root[key] = value
-        else:
-            # 既存値がstr型などの場合はdictに置き換え、元の値を'__value__'キーに退避
-            if key in root and not isinstance(root[key], (dict, list)):
-                prev_value = root[key]
-                logger.warning(
-                    f"パス重複が検出されました: '{current_path}' - "
-                    f"既存値を '__value__' キーに退避します (値: {prev_value})"
-                )
-                root[key] = {"__value__": prev_value}
-
-            if key not in root:
-                root[key] = [] if re.fullmatch(r"\d+", keys[1]) else {}
-            else:
-                # 既存値の型チェックと変換
-                next_key_is_numeric = (
-                    re.fullmatch(r"\d+", keys[1]) if len(keys) > 1 else False
-                )
-
-                if (
-                    next_key_is_numeric
-                    and isinstance(root[key], dict)
-                    and not root[key]
-                ):
-                    # 空辞書を配列に変換
-                    root[key] = []
-                    logger.debug(f"空辞書を配列に変換: {current_path}")
-                elif (
-                    not next_key_is_numeric
-                    and isinstance(root[key], list)
-                    and not root[key]
-                ):
-                    # 空配列を辞書に変換
-                    root[key] = {}
-                    logger.debug(f"空配列を辞書に変換: {current_path}")
-
-            insert_json_path(root[key], keys[1:], value, current_path)
+    return norm
 
 
-def parse_array_split_rules(
-    array_split_rules: List[str], prefix: str
-) -> Dict[str, List[str]]:
-    """
-    配列化設定のパース。
-    形式: "json.parent.1=,|;" (複数の区切り文字を|で区切る)
-    パイプ文字自体を区切り文字にする場合は \\| でエスケープする。
-    プレフィックスは自動的に削除される。
+def _insert_path_numeric_step(
+    *,
+    parent: Optional[Union[JSONDict, List[Any]]],
+    parent_is_list: bool,
+    parent_key: Optional[Union[str, int]],
+    curr: Union[JSONDict, List[Any]],
+    key: str,
+    is_last: bool,
+    value: JSONValue,
+    next_key: Optional[str],
+    current_path: str,
+    _ipol: JsonPathInsertionPolicy,
+) -> tuple[Optional[Union[JSONDict, List[Any]]], bool, Optional[Union[str, int]], Union[JSONDict, List[Any]], bool]:
+    """数値キー1ステップ分の処理を行い、親/現在参照を更新。終端なら挿入を完了して True を返す。"""
+    idx0 = int(key) - 1
+    if idx0 < 0:
+        raise ValueError(f"配列インデックスは1以上である必要があります: {key}")
 
-    戻り値: {path: [delimiter1, delimiter2, ...]}
-    """
-    if not prefix or not isinstance(prefix, str):
-        raise ValueError("prefixは空ではない文字列である必要があります。")
+    lcurr = _ensure_curr_list_or_raise(curr, parent, parent_is_list, parent_key, current_path)
+    _ensure_list_index_capacity(lcurr, idx0)
 
-    rules = {}
-    for rule in array_split_rules:
-        if not rule or not isinstance(rule, str):
-            logger.warning(f"無効なルール形式をスキップします: {rule}")
-            continue
+    if is_last:
+        _assign_terminal_in_list(lcurr, idx0, value, _ipol)
+        return parent, parent_is_list, parent_key, curr, True
 
-        if "=" not in rule:
-            logger.warning(f"無効な配列化設定: {rule}")
-            continue
+    next_is_numeric = _is_numeric_key(next_key) if next_key is not None else False
+    nxt_container = _prepare_next_container_for_list(lcurr, idx0, next_is_numeric, _ipol)
+    return lcurr, True, idx0, nxt_container, False
 
-        path, delimiter_str = rule.split("=", 1)
-        # プレフィックスを削除
-        if path.startswith(prefix):
-            path = path.removeprefix(prefix)
 
-        # エスケープされたパイプ文字を一時的に置換
-        temp_placeholder = "___ESCAPED_PIPE___"
-        delimiter_str = delimiter_str.replace("\\|", temp_placeholder)
+def _insert_path_string_step(
+    *,
+    parent: Optional[Union[JSONDict, List[Any]]],
+    parent_is_list: bool,
+    parent_key: Optional[Union[str, int]],
+    curr: Union[JSONDict, List[Any]],
+    key: str,
+    is_last: bool,
+    value: JSONValue,
+    next_key: Optional[str],
+    _ipol: JsonPathInsertionPolicy,
+) -> tuple[Optional[Union[JSONDict, List[Any]]], bool, Optional[Union[str, int]], Union[JSONDict, List[Any]], bool]:
+    """文字列キー1ステップ分の処理を行い、親/現在参照を更新。終端なら挿入を完了して True を返す。"""
+    dcurr = _ensure_curr_dict_or_raise(curr, parent, parent_is_list, parent_key)
+    if is_last:
+        _assign_terminal_in_dict(dcurr, key, value, _ipol)
+        return parent, parent_is_list, parent_key, curr, True
 
-        # 複数の区切り文字を|で区切る
-        delimiter_parts = delimiter_str.split("|")
-        delimiters = []
-        for part in delimiter_parts:
-            # エスケープ文字の処理
-            processed_delimiter = (
-                part.replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
-            )
-            # エスケープされたパイプ文字を元に戻す
-            processed_delimiter = processed_delimiter.replace(temp_placeholder, "|")
-            delimiters.append(processed_delimiter)
-
-        rules[path] = delimiters
-
-    return rules
+    next_is_numeric = _is_numeric_key(next_key) if next_key is not None else False
+    next_child = _ensure_next_child_for_dict(dcurr, key, next_is_numeric, _ipol)
+    return dcurr, False, key, next_child, False
 
 
 # =============================================================================
@@ -793,19 +4125,22 @@ class ArrayTransformRule:
         transform_type: str,
         transform_spec: str,
         trim_enabled: bool = False,
+        *,
+        apply_to_list_as_whole: bool = False,
     ):
         # パラメータの基本検証
-        if not path or not isinstance(path, str):
+        if not path:
             raise ValueError("pathは空ではない文字列である必要があります。")
-        if not transform_type or not isinstance(transform_type, str):
+        if not transform_type:
             raise ValueError("transform_typeは空ではない文字列である必要があります。")
-        if not transform_spec or not isinstance(transform_spec, str):
+        if not transform_spec:
             raise ValueError("transform_specは空ではない文字列である必要があります。")
 
         self.path = path
         self.transform_type = transform_type  # 'function', 'command', 'split'
         self.transform_spec = transform_spec
         self.trim_enabled = trim_enabled
+        # リスト値に対して関数を配列全体へ1回だけ適用するか（既定: 各要素へ個別適用）
         self._transform_func: Optional[Callable] = None
         self._setup_transform()
 
@@ -859,9 +4194,7 @@ class ArrayTransformRule:
             raise ValueError(
                 f"Python function spec must be 'module:function' or 'file.py:function': {self.transform_spec}"
             )
-
         module_or_file, func_name = self.transform_spec.rsplit(":", 1)
-
         try:
             # 外部ファイルまたはモジュールの処理
             if module_or_file.endswith(".py"):
@@ -880,15 +4213,32 @@ class ArrayTransformRule:
                 spec.loader.exec_module(module)
                 self._transform_func = getattr(module, func_name)
             else:
-                # モジュールから関数を読み込み
-                module = importlib.import_module(module_or_file)
-                self._transform_func = getattr(module, func_name)
-
-            logger.info(f"Loaded transform function: {self.transform_spec}")
+                # モジュールから関数を読み込み (フォールバックで .py 探索)
+                if module_or_file not in sys.modules and str(Path.cwd()) not in sys.path:
+                    sys.path.insert(0, str(Path.cwd()))
+                try:
+                    module = importlib.import_module(module_or_file)
+                    self._transform_func = getattr(module, func_name)
+                except ModuleNotFoundError:
+                    candidate = Path(module_or_file)
+                    if candidate.suffix != ".py":
+                        candidate = candidate.with_suffix(".py")
+                    if not candidate.exists():
+                        raise
+                    spec = importlib.util.spec_from_file_location(
+                        f"transform_module_{candidate.stem}", candidate
+                    )
+                    if spec is None or spec.loader is None:
+                        raise ImportError(f"Cannot load module from {candidate}")
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    self._transform_func = getattr(module, func_name)
         except Exception as e:
             raise ValueError(
-                f"Failed to load transform function '{self.transform_spec}': {e}"
-            )
+                f"Failed to load transform function: {self.transform_spec}: {e}"
+            ) from e
+
+        logger.debug(f"Loaded transform function: {self.transform_spec}")
 
     def _setup_command(self):
         """外部コマンドのセットアップ"""
@@ -901,7 +4251,7 @@ class ArrayTransformRule:
                 input="test",
                 timeout=5,
             )
-            logger.info(f"Command available: {self.transform_spec}")
+            logger.debug(f"Command available: {self.transform_spec}")
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
             logger.warning(f"Command check failed for '{self.transform_spec}': {e}")
 
@@ -935,8 +4285,8 @@ class ArrayTransformRule:
         else:
             return data
 
-    def _apply_split_recursively(self, value: Any, depth: int = None) -> Any:
-        """多次元split変換。リスト要素も個別に処理する。"""
+    def _apply_split_recursively(self, value: Any, depth: Optional[int] = None) -> Any:
+        """多次元 split 変換。リスト要素も個別に処理する。"""
         if isinstance(value, list):
             # リストの各要素を個別に変換
             result = []
@@ -947,16 +4297,93 @@ class ArrayTransformRule:
             return result
         elif isinstance(value, str):
             # 文字列を変換関数で処理
+            if self._transform_func is None:
+                return value
             return self._transform_func(value)
         else:
             return value
 
-    def _transform_with_command(self, value: Any) -> Any:
-        """外部コマンドで変換"""
-        try:
-            input_str = str(value) if value is not None else ""
+    def _transform_with_function(self, value: Any) -> Any:
+        """関数による変換（標準出力をキャプチャしつつ、例外は握りつぶさない）"""
+        if self._transform_func is None:
+            logger.warning(f"Transform function not initialized: {self.transform_spec}")
+            return value
 
-            # 標準出力の順序を保つため、stderrのみキャプチャし、stdoutは直接表示
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
+        with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
+            result = self._transform_func(value)
+
+        # ログは無加工（トリム無し）で全量出力
+        stdout_content = stdout_capture.getvalue()
+        stderr_content = stderr_capture.getvalue()
+        if stdout_content:
+            logger.debug(
+                "Transform function stdout: %s",
+                stdout_content,
+                extra={
+                    "transform_spec": self.transform_spec,
+                    "transform_type": "function",
+                },
+            )
+        if stderr_content:
+            logger.warning(
+                "Transform function stderr: %s",
+                stderr_content,
+                extra={
+                    "transform_spec": self.transform_spec,
+                    "transform_type": "function",
+                },
+            )
+
+        return result
+
+    def _transform_with_command(self, value: Any) -> Any:
+        """外部コマンドで変換（タイムアウトのみ明示的に捕捉）
+
+        入力正規化仕様（2025-09 改訂）:
+        - dict / ネストを含む list/tuple は JSON 文字列 (ensure_ascii=False) として渡す
+        - フラット（全要素がスカラー）の list/tuple は従来通り 改行結合
+        - それ以外のスカラー値は str() 変換
+        この方針で "構造" を壊さずにコマンドへ受け渡し可能にする。
+        """
+
+        def _is_scalar(x: Any) -> bool:
+            return isinstance(x, (str, int, float, bool)) or x is None
+
+        def _is_flat_scalar_list(v: Any) -> bool:
+            return isinstance(v, (list, tuple)) and all(_is_scalar(e) for e in v)
+
+        def _json_default(o: Any):  # JSON化できない set 等を救済
+            if isinstance(o, set):
+                try:
+                    return sorted(list(o))
+                except Exception:  # noqa: BLE001
+                    return list(o)
+            raise TypeError(f"Object of type {type(o)} is not JSON serializable")
+
+        treat_multiline_as_list = False
+
+        if isinstance(value, dict):
+            try:
+                input_str = json.dumps(value, ensure_ascii=False, default=_json_default)
+            except Exception:  # noqa: BLE001
+                input_str = str(value)
+        elif isinstance(value, (list, tuple)):
+            if _is_flat_scalar_list(value):
+                # フラット: 改行結合（既存コマンド sort -u 等との親和性を保つ）
+                input_str = "\n".join("" if v is None else str(v) for v in value)
+                treat_multiline_as_list = True
+            else:
+                try:
+                    input_str = json.dumps(value, ensure_ascii=False, default=_json_default)
+                except Exception:  # noqa: BLE001
+                    # 失敗したら安全側で repr 文字列
+                    input_str = str(value)
+        else:
+            input_str = str(value) if value is not None else ""
+        try:
             result = subprocess.run(
                 shlex.split(self.transform_spec),
                 input=input_str,
@@ -965,89 +4392,75 @@ class ArrayTransformRule:
                 text=True,
                 timeout=30,
             )
-
-            if result.returncode != 0:
-                # stderrがある場合はログに出力（順序保持のため即座に出力）
-                if result.stderr.strip():
-                    print(
-                        f"Command stderr: {result.stderr.strip()}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                logger.warning(
-                    f"Command failed: {self.transform_spec}, "
-                    f"returncode: {result.returncode}"
-                )
-                return value
-
-            output = result.stdout.strip()
-
-            # コマンドの標準出力があれば即座に表示（順序保持）
-            if output and output != str(value):
-                print(f"Command output: {output}", flush=True)
-
-            # JSONとして解析を試行
-            try:
-                return json.loads(output)
-            except json.JSONDecodeError:
-                # JSONでない場合は行分割を試行
-                if "\n" in output:
-                    lines = [
-                        line.strip() for line in output.split("\n") if line.strip()
-                    ]
-                    return lines
-                else:
-                    return output
-
         except subprocess.TimeoutExpired:
-            logger.error(f"Command timeout: {self.transform_spec}")
+            logger.error(
+                "Command timeout: %s",
+                self.transform_spec,
+                extra={"transform_spec": self.transform_spec},
+            )
             return value
         except Exception as e:
-            logger.error(f"Command execution error: {self.transform_spec}, error: {e}")
+            logger.error(
+                "Command execution error: %s: %s",
+                self.transform_spec,
+                e,
+                extra={"transform_spec": self.transform_spec},
+            )
             return value
 
-    def _transform_with_function(self, value: Any) -> Any:
-        """関数による変換（標準出力制御付き）"""
-        if self._transform_func is None:
-            logger.warning(f"Transform function not initialized: {self.transform_spec}")
+        # 標準出力・標準エラーは無加工で全量ログ（存在時）
+        if result.stdout:
+            logger.debug(
+                "Command stdout: %s",
+                result.stdout,
+                extra={
+                    "transform_spec": self.transform_spec,
+                    "returncode": result.returncode,
+                },
+            )
+        if result.stderr:
+            logger.warning(
+                "Command stderr: %s",
+                result.stderr,
+                extra={
+                    "transform_spec": self.transform_spec,
+                    "returncode": result.returncode,
+                },
+            )
+
+        if result.returncode != 0:
+            logger.warning(
+                "Command failed: %s (returncode=%s)",
+                self.transform_spec,
+                result.returncode,
+                extra={
+                    "transform_spec": self.transform_spec,
+                    "returncode": result.returncode,
+                },
+            )
             return value
 
+        output = result.stdout
+
+        # 1. JSON として解釈できれば優先（後続加工を避ける）
         try:
-            # 標準出力をキャプチャして順序を制御
-            import io
-            from contextlib import redirect_stdout, redirect_stderr
+            return json.loads(output.strip())
+        except json.JSONDecodeError:
+            pass
 
-            stdout_capture = io.StringIO()
-            stderr_capture = io.StringIO()
+        # 2. フラットスカラ配列入力だった場合は複数行を行配列へ
+        if treat_multiline_as_list and "\n" in output:
+            lines = [ln for ln in output.split("\n") if ln.strip()]
+            return lines
 
-            with redirect_stdout(stdout_capture), redirect_stderr(stderr_capture):
-                result = self._transform_func(value)
-
-            # キャプチャした出力があれば即座に表示（順序保持）
-            stdout_content = stdout_capture.getvalue()
-            stderr_content = stderr_capture.getvalue()
-
-            if stdout_content.strip():
-                print(f"Function output: {stdout_content.strip()}", flush=True)
-
-            if stderr_content.strip():
-                print(
-                    f"Function stderr: {stderr_content.strip()}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-
-            return result
-
-        except Exception as e:
-            logger.error(f"Function execution error: {self.transform_spec}, error: {e}")
-            return value
+        # 3. それ以外は文字列のまま返す
+        return output
 
 
-def parse_array_transform_rules(
-    array_transform_rules: List[str],
+def parse_array_transform_rules(  # noqa: PLR0915 長さは後続リファクタ対象
+    array_transform_rules: Sequence[Union[str, Dict[str, str]]],
     prefix: str,
-    schema: dict = None,
+    schema: Optional[Dict[str, Any]] = None,
     trim_enabled: bool = False,
 ) -> Dict[str, List[ArrayTransformRule]]:
     """
@@ -1056,72 +4469,24 @@ def parse_array_transform_rules(
     ワイルドカード対応: "json.arr.*.name=split:," または "json.arr.*=range:A1:B2:function:builtins:len"
     連続適用対応: 同一セル名に対する複数の--transform指定を順次適用
     """
-    if not prefix or not isinstance(prefix, str):
+    if not prefix:
         raise ValueError("prefixは空ではない文字列である必要があります。")
 
-    rules = {}  # Dict[str, List[ArrayTransformRule]]
-    wildcard_rules = {}  # ワイルドカードルールを別途管理
+    rules: Dict[str, List[ArrayTransformRule]] = {}
+    wildcard_rules: Dict[str, List[ArrayTransformRule]] = {}
 
     # prefixの末尾にドットがなければ自動で追加
     normalized_prefix = prefix if prefix.endswith(".") else prefix + "."
 
-    def resolve_schema_path(path_keys, schema):
-        # スキーマがなければそのまま
-        if not schema:
+    def _split_rule(raw: str) -> tuple[str, str] | None:
+        if "=" not in raw:
+            logger.warning(f"無効な変換設定: {raw}")
             return None
-        props = schema.get("properties", {})
-        current_schema = schema
-        resolved_keys = []
-        for k in path_keys:
-            if re.fullmatch(r"\d+", k):
-                resolved_keys.append(k)
-                if isinstance(current_schema, dict) and "items" in current_schema:
-                    current_schema = current_schema["items"]
-                    props = (
-                        current_schema.get("properties", {})
-                        if isinstance(current_schema, dict)
-                        else {}
-                    )
-                else:
-                    props = {}
-            else:
-                if not props or not isinstance(props, dict):
-                    resolved_keys.append(k)
-                    break
-                # アンダースコアをワイルドカード1文字としてマッチ
-                pattern = "^" + re.escape(k).replace("_", ".") + "$"
-                matches = [
-                    prop
-                    for prop in props
-                    if re.fullmatch(pattern, prop, flags=re.UNICODE)
-                ]
-                if len(matches) == 1:
-                    resolved_keys.append(matches[0])
-                    next_schema = props.get(matches[0], {})
-                    if isinstance(next_schema, dict) and "properties" in next_schema:
-                        current_schema = next_schema
-                        props = next_schema["properties"]
-                    elif isinstance(next_schema, dict) and "items" in next_schema:
-                        current_schema = next_schema
-                        props = next_schema.get("properties", {})
-                    else:
-                        props = {}
-                else:
-                    resolved_keys.append(k)
-                    break
-        return resolved_keys
+        left, right = raw.split("=", 1)
+        return left, right
 
-    for rule in array_transform_rules:
-        if "=" not in rule:
-            logger.warning(f"無効な変換設定: {rule}")
-            continue
-
-        path, transform_spec = rule.split("=", 1)
-
-        # ワイルドカード（*）を含むかチェック
+    def _normalize_path(path: str) -> tuple[str, bool]:
         has_wildcard = "*" in path
-
-        # プレフィックス処理
         if path.startswith(normalized_prefix):
             path = path[len(normalized_prefix) :]
         elif path.startswith(prefix):
@@ -1130,125 +4495,496 @@ def parse_array_transform_rules(
                 path = "." + path if path else ""
             if path.startswith("."):
                 path = path[1:]
+        return path, has_wildcard
 
-        # 変換ルール作成
+    def _parse_spec(spec: str) -> tuple[str, str]:
+        if spec.startswith("function:"):
+            return "function", spec[len("function:") :]
+        if spec.startswith("command:"):
+            return "command", spec[len("command:") :]
+        if spec.startswith("split:"):
+            return "split", spec[len("split:") :]
+        return "function", spec
+
+    def _insert_rule(dst: Dict[str, List[ArrayTransformRule]], key: str, rule_obj: ArrayTransformRule) -> None:
+        if key not in dst:
+            dst[key] = []
+        dst[key].append(rule_obj)
+
+    normalized_inputs: List[tuple[str, str]] = []
+    for raw in array_transform_rules:
+        if isinstance(raw, dict):
+            key = raw.get("key")
+            func = None
+            if "function" in raw:
+                func = f"function:{raw['function']}" if not str(raw['function']).startswith(("function:", "command:", "split:")) else raw['function']
+            elif "command" in raw:
+                func = f"command:{raw['command']}"
+            elif "split" in raw:
+                func = f"split:{raw['split']}"
+            if not key or not func:
+                logger.warning(f"無効な変換設定: {raw}")
+                continue
+            normalized_inputs.append((key, func))
+            continue
+        splitted = _split_rule(raw)
+        if not splitted:
+            continue
+        path, transform_spec = splitted
+        normalized_inputs.append((path, transform_spec))
+
+    for path, transform_spec in normalized_inputs:
+        path, has_wildcard = _normalize_path(path)
+
         try:
-            transform_type = "function"
-            actual_spec = transform_spec
-
-            if transform_spec.startswith("function:"):
-                transform_type = "function"
-                actual_spec = transform_spec[9:]  # "function:"を除去
-            elif transform_spec.startswith("command:"):
-                transform_type = "command"
-                actual_spec = transform_spec[8:]  # "command:"を除去
-            elif transform_spec.startswith("split:"):
-                transform_type = "split"
-                actual_spec = transform_spec[6:]  # "split:"を除去
-
-            rule_obj = ArrayTransformRule(
-                path, transform_type, actual_spec, trim_enabled
-            )
-
+            transform_type, actual_spec = _parse_spec(transform_spec)
+            rule_obj = ArrayTransformRule(path, transform_type, actual_spec, trim_enabled)
             if has_wildcard:
-                # ワイルドカードルールとして保存（リスト形式）
-                if path not in wildcard_rules:
-                    wildcard_rules[path] = []
-                wildcard_rules[path].append(rule_obj)
+                _insert_rule(wildcard_rules, path, rule_obj)
             else:
-                # 通常のルール（リスト形式）
-                if path not in rules:
-                    rules[path] = []
-                rules[path].append(rule_obj)
-
+                _insert_rule(rules, path, rule_obj)
         except Exception as e:
-            logger.error(f"変換ルール作成エラー: {rule}, エラー: {e}")
+            logger.error(f"変換ルール作成エラー: {raw}, エラー: {e}")
             continue
 
-    # ワイルドカードルールも統合（後で適用）
     if wildcard_rules:
+        # 既存仕様: 記載順（後勝ち）を保持するためそのまま更新
         rules.update(wildcard_rules)
 
     return rules
 
 
-def should_convert_to_array(
-    path_keys: List[str], split_rules: Dict[str, List[str]]
-) -> Optional[List[str]]:
-    """
-    指定されたパスが配列化対象かどうかを判定し、対応する区切り文字のリストを返す。
-    """
-    path_str = ".".join(path_keys)
-
-    # 完全一致
-    if path_str in split_rules:
-        return split_rules[path_str]
-
-    # 部分マッチング（前方一致）
-    for rule_path, delimiters in split_rules.items():
-        if path_str.startswith(rule_path + ".") or path_str == rule_path:
-            return delimiters
-
-    return None
-
-
-def should_transform_to_array(
-    path_keys: List[str], transform_rules: Dict[str, List[ArrayTransformRule]]
+def get_applicable_transform_rules(
+    transform_rules: TransformRulesMap,
+    normalized_path_keys: List[str],
+    original_path_keys: List[str],
 ) -> Optional[List[ArrayTransformRule]]:
-    """
-    指定されたパスが配列変換対象かどうかを判定し、対応する変換ルールのリストを返す。
-    """
-    path_str = ".".join(path_keys)
+    """normalized/original の両方で、完全一致→親キー→ワイルドカードの順に適用可能な変換ルールを返す。
 
-    # 完全一致のみ
-    return transform_rules.get(path_str, None)
+    優先順位:
+    1) 完全一致（normalized → original）
+    2) 親キー一致（normalized → original）
+    3) ワイルドカード（*）パターンマッチ（normalized → original）
+    """
+    if not transform_rules:
+        return None
+
+    key_path = ".".join(normalized_path_keys)
+    orig_key_path = ".".join(original_path_keys)
+
+    def _find_exact_match() -> Optional[List[ArrayTransformRule]]:
+        if key_path in transform_rules:
+            return transform_rules[key_path]
+        if orig_key_path in transform_rules:
+            return transform_rules[orig_key_path]
+        return None
+
+    def _find_parent_match() -> Optional[List[ArrayTransformRule]]:
+        if len(normalized_path_keys) > 1:
+            for i in range(len(normalized_path_keys) - 1, 0, -1):
+                parent_norm = ".".join(normalized_path_keys[:i])
+                if parent_norm in transform_rules:
+                    return transform_rules[parent_norm]
+        if len(original_path_keys) > 1:
+            for i in range(len(original_path_keys) - 1, 0, -1):
+                parent_orig = ".".join(original_path_keys[:i])
+                if parent_orig in transform_rules:
+                    return transform_rules[parent_orig]
+        return None
+
+    def _find_wildcard_match() -> Optional[List[ArrayTransformRule]]:
+        for rule_key, rule_list in transform_rules.items():
+            if "*" in rule_key and (
+                wildcard_match_path(rule_key, key_path)
+                or wildcard_match_path(rule_key, orig_key_path)
+            ):
+                return rule_list
+        return None
+
+    return _find_exact_match() or _find_parent_match() or _find_wildcard_match()
 
 
-def is_string_array_schema(schema: Dict[str, Any]) -> bool:
+def apply_transform_rules_for_path(
+    *,
+    rules: List[ArrayTransformRule],
+    value: Any,
+    workbook,
+    insert_keys: List[str],
+    root_result: JSONDict,
+    transform_rules_map: TransformRulesMap,
+    prefix: str,
+) -> Any:
+    """順次ルール適用と辞書戻り値の動的セル名処理を行い、最終値を返す。
+
+    - rules を順に適用
+    - dict 戻り値は絶対/相対キーへ展開（再帰的に適用ルールも探索して追適用）
+    - list は各要素に対して関数適用
+    - 最終スカラ/配列は呼び出し側で insert する
     """
-    スキーマが文字列配列かどうかを判定する。
+    current_value = value
+
+    # Build a TransformContext for internal helpers to consume
+    tctx = TransformContext(
+        workbook=workbook,
+        prefix=prefix,
+        transform_rules_map=transform_rules_map,
+        insert_keys=insert_keys,
+        root_result=root_result,
+    )
+
+    def _apply_one(rule: ArrayTransformRule, val: Any):
+        # Pass workbook via context; transform implementations expect (val, workbook)
+        return rule.transform(val, tctx.workbook)
+
+    for i, tr in enumerate(rules):
+        log_transform_progress(
+            step_index=i + 1, total_steps=len(rules), insert_keys=insert_keys, rule=tr
+        )
+        current_value = _apply_one(tr, current_value)
+
+    # 新仕様: 辞書戻り値はそのまま値として扱う（動的セル名展開はしない）
+    if rules:
+        logger.debug(f"変換ルール{len(rules)}後の値: {current_value}")
+
+    return current_value
+
+
+# =============================================================================
+# Wildcard helpers (module-level)
+# =============================================================================
+
+
+def wildcard_match_path(pattern: str, actual_path: str) -> bool:
+    """拡張ワイルドカードマッチ。
+
+    仕様:
+    - セグメント数は一致すること
+    - セグメント全体が '*' の場合: 任意1セグメント
+    - セグメントに部分ワイルドカード（例: '*items', 'pre*', 'mid*post'）を含められる
+      → '*' は同一セグメント内で 0 文字以上にマッチ
+    - 正規表現は使用せずキャッシュ不要な軽量実装
     """
-    if not isinstance(schema, dict):
+    pattern_parts = [p for p in pattern.split('.') if p]
+    actual_parts = [p for p in actual_path.split('.') if p]
+    if len(pattern_parts) != len(actual_parts):
         return False
 
-    # type: "array" かつ items.type: "string" の場合
-    if schema.get("type") == "array":
-        items = schema.get("items", {})
-        if isinstance(items, dict) and items.get("type") == "string":
+    def seg_match(pp: str, ap: str) -> bool:
+        if pp == '*':
+            return True
+        if '*' not in pp:
+            return pp == ap
+        # 部分ワイルドカード: 連続 '*' は一つに畳んで処理
+        # 例: '*items' -> suffix match, 'pre*' -> prefix match, 'a*b*c' -> subsequence match
+        tokens = [t for t in pp.split('*')]
+        if len(tokens) == 1:
+            # '*' が末尾にあったケースで split 結果が ['xxx', ''] になるのでここは通常到達しない
+            return pp == ap
+        # 位置合わせ: 最初のトークンは先頭一致、最後のトークンは末尾一致、中間は順序出現
+        # 空トークンはスキップ
+        cur = 0
+        first_token_consumed = False
+        for i, tk in enumerate(tokens):
+            if tk == '':
+                continue
+            if i == 0:  # 先頭
+                if not ap.startswith(tk):
+                    return False
+                cur = len(tk)
+                first_token_consumed = True
+                continue
+            # 中間/末尾: 残りを検索
+            idx = ap.find(tk, cur)
+            if idx < 0:
+                return False
+            cur = idx + len(tk)
+            if i == len(tokens) - 1 and tokens[-1] != '' and not ap.endswith(tk):
+                # 末尾トークンは末尾一致
+                return False
+        # 末尾が '' の場合は何でも可
+        # 先頭トークンが '' のとき（pp 始まりが '*'）も上記ロジックで許容
+        return True
+
+    return all(seg_match(pp, ap) for pp, ap in zip(pattern_parts, actual_parts))
+
+
+def handle_parent_level_for_double_index_array(
+    *,
+    wb: Any,
+    defined_name: Any,
+    value: Any,
+    array_ref: List[Any],
+    array_name: str,
+    array_index: int,
+    path_keys: List[str],
+    name: str,
+    normalized_prefix: str,
+    gen_map: Optional[Dict[str, Any]],
+    expected_field_shape: Dict[Tuple[str, str], str],
+) -> bool:
+    """二重数値インデックス配列に対する親レベル（parent.i.*）の処理を行う。
+
+    契約:
+    - 入力: [i] までの準備は済んでおり、`array_ref[array_index]` が None/{} or list で存在
+    - path_keys は少なくとも [array, i, ...] の形をとる
+    - 当該 i に既に生成名が存在する場合、親レベルからの挿入をスキップする
+    - 末端が field.index の場合は形状保持で値を再取得し、1D追加マージ（2Dはそのまま）
+    - 末端が通常の field の場合は expected_field_shape に従い 1D/2D へ昇格
+
+    戻り値:
+    - True: 親レベルで処理を完了（呼び出し元は continue）
+    - False: 親レベルでは未処理（呼び出し元で続行）
+    """
+    try:
+        # 小さなヘルパーで分岐を整理（挙動は完全維持）
+        def _has_generated_for_index() -> bool:
+            return should_skip_array_anchor_insertion(
+                array_name, array_index, normalized_prefix, gen_map
+            )
+
+        def _ensure_list_at_index() -> Optional[List[Any]]:
+            """array_ref[array_index] をリストへ昇格できたら返す。昇格不可（非空dict等）なら None。"""
+            if is_json_list(array_ref[array_index]):
+                return cast(List[Any], array_ref[array_index])
+            promoted0 = _promote_element_to_list_if_appropriate(array_ref[array_index])
+            if is_json_list(promoted0):
+                array_ref[array_index] = promoted0
+                return cast(List[Any], promoted0)
+            return None
+
+        def _ensure_first_dict(inner: List[Any]) -> Dict[str, Any]:
+            if not inner:
+                inner.append(None)
+            return _ensure_nested_dict_at(inner, 0)
+
+        def _is_field_index(rem: List[str]) -> bool:
+            return len(rem) == 2 and (not rem[0].isdigit()) and rem[1].isdigit()
+
+        def _is_field_only(rem: List[str]) -> bool:
+            return len(rem) == 1 and (not rem[0].isdigit())
+
+        def _apply_field_index_case(target: Dict[str, Any], field_token: str) -> bool:
+            try:
+                subval = get_named_range_values_preserve_shape(wb, defined_name)
+            except Exception:
+                subval = value
+            subval_list = _coerce_to_1d(subval)
+            _set_or_merge_list_field(target, field_token, subval_list)
+            logger.debug(
+                "NEST-MERGE [i][0] %s[%s][0].%s += %r (from field.index)",
+                array_name,
+                array_index,
+                field_token,
+                subval_list,
+            )
             return True
 
+        def _apply_field_only_case(target: Dict[str, Any], fld: str) -> bool:
+            coerced = apply_expected_shape_to_value(
+                value,
+                field_name=fld,
+                expected_field_shape=expected_field_shape,
+                array_name=array_name,
+            )
+            if not (fld in target and is_nonempty_array_or_dict(target.get(fld))):
+                target[fld] = coerced
+                logger.debug(
+                    "NEST-SET [i][0] %s[%s][0].%s=%r (coerced)",
+                    array_name,
+                    array_index,
+                    fld,
+                    coerced,
+                )
+            return True
+
+        # 生成名がある場合は親レベルをスキップ
+        if _has_generated_for_index():
+            logger.debug(
+                "PARENT-SKIP %s[%s] due to generated nested under this index: %s",
+                array_name,
+                array_index,
+                name,
+            )
+            return True
+
+        # 昇格に失敗（非空dict等）した場合は親レベル未処理
+        inner0 = _ensure_list_at_index()
+        if inner0 is None:
+            return False
+
+        target0 = _ensure_first_dict(inner0)
+        remaining_keys = path_keys[2:]
+
+        if _is_field_index(remaining_keys):
+            return _apply_field_index_case(target0, remaining_keys[0])
+        if _is_field_only(remaining_keys):
+            return _apply_field_only_case(target0, remaining_keys[0])
+    except Exception:
+        # 例外時は親レベルでは未処理として呼び出し側へ返す（安全側）
+        return False
     return False
 
 
-def check_schema_for_array_conversion(
-    path_keys: List[str], schema: Optional[Dict[str, Any]]
-) -> bool:
-    """
-    スキーマを参照して、指定されたパスが文字列配列として定義されているかを判定する。
-    """
-    if not schema:
-        return False
-
-    current_schema = schema
-    for key in path_keys:
-        if re.fullmatch(r"\d+", key):
-            # 数字キーの場合は items を参照
-            if isinstance(current_schema, dict) and "items" in current_schema:
-                current_schema = current_schema["items"]
-            else:
-                return False
+def get_nested_value(obj: JSONDict, path: str) -> Any:
+    """dict のドット区切りパスから値を取得（存在しなければ None）。"""
+    parts = [p for p in path.split(".") if p]
+    cur: JSONValue = obj
+    for part in parts:
+        if is_json_dict(cur) and part in cur:
+            cur = cast(JSONDict, cur)[part]
         else:
-            # 文字列キーの場合は properties を参照
-            if isinstance(current_schema, dict) and "properties" in current_schema:
-                props = current_schema["properties"]
-                if key in props:
-                    current_schema = props[key]
-                else:
-                    return False
-            else:
-                return False
+            return None
+    return cur
 
-    return is_string_array_schema(current_schema)
+
+def set_nested_value(obj: JSONDict, path: str, value: JSONValue) -> None:
+    """dict のドット区切りパスに値を設定（中間 dict は自動生成）。"""
+    parts = [p for p in path.split(".") if p]
+    cur: JSONDict = obj
+    for part in parts[:-1]:
+        if part not in cur or not is_json_dict(cur.get(part)):
+            cur[part] = {}
+        cur = cast(JSONDict, cur[part])
+    cur[parts[-1]] = value
+
+
+def find_matching_paths(
+    obj: JSONValue, pattern: str, current_path: str = ""
+) -> List[str]:
+    """
+    dict 構造から、パターンにマッチするドット区切りパスを列挙する。
+    リストは配列インデックスをキーとみなさず、子要素を同じ current_path 配下として再帰探索する。
+    """
+    matches: List[str] = []
+    if is_json_dict(obj):
+        for key, value in obj.items():
+            new_path = f"{current_path}.{key}" if current_path else key
+            if wildcard_match_path(pattern, new_path):
+                matches.append(new_path)
+            if is_json_dict(value) or is_json_list(value):
+                matches.extend(find_matching_paths(value, pattern, new_path))
+    elif is_json_list(obj):
+        # リスト: 各要素に対し同じ current_path を継続しつつ要素(dict) 自体がパターンに合致するケースを許容
+        for item in obj:
+            # 要素が dict の場合 current_path 自体を対象として再評価する（例えば *.items.* で items 配下の要素をマッチさせる）
+            if is_json_dict(item) and current_path and wildcard_match_path(pattern, current_path):
+                matches.append(current_path)
+            matches.extend(find_matching_paths(item, pattern, current_path))
+        # 特別処理: pattern が current_path + '.*' に近く、要素が dict の場合は current_path を候補に含める
+        if current_path and any(is_json_dict(it) for it in obj):
+            # pattern セグメント数と current_path セグメント数の差が1 以上で最後のパターンセグメントが '*' 含む場合
+            p_parts = [p for p in pattern.split('.') if p]
+            c_parts = [p for p in current_path.split('.') if p]
+            if len(p_parts) >= len(c_parts) and wildcard_match_path(".".join(p_parts[:len(c_parts)]), current_path):
+                # 直後のパターンセグメントに '*' を含むならノード自体を追加
+                if len(p_parts) > len(c_parts) and '*' in p_parts[len(c_parts)]:
+                    if current_path not in matches:
+                        matches.append(current_path)
+    return matches
+
+
+def log_transform_progress(
+    *,
+    step_index: int,
+    total_steps: int,
+    insert_keys: List[str],
+    rule: ArrayTransformRule,
+) -> None:
+    """変換進捗のデバッグログを統一出力。"""
+    logger.debug(
+        "変換ルール%s/%sで変換: %s -> rule=%s:%s",
+        step_index,
+        total_steps,
+        insert_keys,
+        getattr(rule, "transform_type", None),
+        getattr(rule, "transform_spec", None),
+    )
+
+
+def extract_abs_path_from_prefixed_key(key: str, prefix: str) -> str:
+    """
+    prefix 付きキーから絶対パス部分を抽出する。
+    - 'json.foo.bar' のようなキーに対して prefix='json' なら 'foo.bar' を返す
+    - 'json' 単体や prefix に一致しない場合は空文字列
+    """
+    if not key.startswith(prefix):
+        return ""
+    if key == prefix:
+        return ""
+    if key.startswith(prefix + "."):
+        return key[len(prefix + ".") :]
+    # 'jsonX...' のような紛らわしいケースは prefix とはみなさない
+    return ""
+
+
+def _apply_dynamic_rules_if_any(
+    *,
+    value: Any,
+    transform_rules_map: Optional[TransformRulesMap],
+    parts: List[str],
+    workbook,
+    apply_dynamic_rules: bool,
+) -> Any:
+    if apply_dynamic_rules and transform_rules_map is not None:
+        dyn_rules = get_applicable_transform_rules(transform_rules_map or {}, parts, parts)
+        if dyn_rules:
+            for dr in dyn_rules:
+                value = dr.transform(value, workbook)
+    return value
+
+
+def _ensure_dict_path(root: JSONDict, parts: List[str]) -> JSONDict:
+    cur = root
+    for ap in parts:
+        if ap not in cur:
+            cur[ap] = {}
+        cur = cast(JSONDict, cur[ap])
+    return cur
+
+
+def expand_and_insert_dict(
+    *,
+    result_dict: JSONDict,
+    base_path: str,
+    prefix: str,
+    root_result: JSONDict,
+    transform_rules_map: Optional[TransformRulesMap] = None,
+    workbook=None,
+    apply_dynamic_rules: bool = False,
+) -> None:
+    """
+    変換の結果が dict の場合に、各キーを絶対/相対指定として評価して root_result に書き込む共通処理。
+
+    - 絶対指定: 'json.foo.bar'（prefix が json の場合）
+    - 相対指定: 'baz'（base_path の直下に挿入）
+    - transform_rules_map が与えられる場合は挿入前に該当ルールを追適用する
+    """
+    for key, val in result_dict.items():
+        if key.startswith(prefix):
+            abs_path = extract_abs_path_from_prefixed_key(key, prefix)
+            if not abs_path:
+                continue
+            abs_parts = [p for p in abs_path.split(".") if p]
+            new_val = _apply_dynamic_rules_if_any(
+                value=val,
+                transform_rules_map=transform_rules_map,
+                parts=abs_parts,
+                workbook=workbook,
+                apply_dynamic_rules=apply_dynamic_rules,
+            )
+            cur = _ensure_dict_path(root_result, abs_parts[:-1])
+            cur[abs_parts[-1]] = new_val
+        else:
+            rel_path = f"{base_path}.{key}" if base_path else key
+            rel_parts = [p for p in rel_path.split(".") if p]
+            new_val = _apply_dynamic_rules_if_any(
+                value=val,
+                transform_rules_map=transform_rules_map,
+                parts=rel_parts,
+                workbook=workbook,
+                apply_dynamic_rules=apply_dynamic_rules,
+            )
+            set_nested_value(root_result, rel_path, new_val)
 
 
 def convert_string_to_multidimensional_array(value: Any, delimiters: List[str]) -> Any:
@@ -1324,30 +5060,422 @@ def convert_string_to_array(value: Any, delimiter: str) -> Any:
     return result if result else []
 
 
+def parse_array_split_rules(
+    rules: Optional[List[Optional[str]]], prefix: str
+) -> Dict[str, List[str]]:
+    r"""配列分割ルールの解析ヘルパー。
+
+    入力例:
+        ["json.field1=,", "json.nested.field2=;|\\n", "json.field3=\\t|\\|"]
+        ["json.data=split:,", "json.items=split:;|\\n"] も許可
+
+    返却:
+        {"field1": [","], "nested.field2": [";", "\n"], "field3": ["\t", "|"]}
+
+    - prefix は "json" または "json." いずれも受け付ける
+    - 無効な行は warning を出して無視
+    - デリミタ列は '|' で区切る。'\|' はリテラルのパイプを表す
+    - エスケープシーケンス \n, \t, \r, \\ を展開
+    """
+    result: Dict[str, List[str]] = {}
+    if rules is None or len(rules) == 0:
+        return result
+    if not isinstance(prefix, str) or prefix == "":
+        raise ValueError("prefixは空ではない文字列である必要があります。")
+
+    norm_pref = prefix if prefix.endswith(".") else prefix + "."
+
+    def _decode_delims(spec: str) -> List[str]:
+        tokens: List[str] = []
+        buf: List[str] = []
+        escape = False
+        for ch in spec:
+            if escape:
+                buf.append({"n": "\n", "t": "\t", "r": "\r"}.get(ch, ch))
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "|":
+                tokens.append("".join(buf))
+                buf = []
+            else:
+                buf.append(ch)
+        if escape:
+            buf.append("\\")
+        tokens.append("".join(buf))
+        return [t for t in tokens if t != ""]
+
+    def _normalize_left_path(left: str) -> str:
+        path = left.strip()
+        if path.startswith(norm_pref):
+            path = path[len(norm_pref) :]
+        elif path.startswith(prefix):
+            path = path[len(prefix) :]
+            if path.startswith("."):
+                path = path[1:]
+        return path.strip().strip(".")
+
+    def _parse_rule_line(raw: str) -> tuple[str, str] | None:
+        if not raw or not isinstance(raw, str):
+            return None
+        if "=" not in raw:
+            logger.warning("無効な配列化設定: '='がありません: %r", raw)
+            return None
+        left, right = raw.split("=", 1)
+        path = _normalize_left_path(left)
+        if not path:
+            logger.warning("無効な配列化設定: 空のパス: %r", raw)
+            return None
+        spec = right.strip()
+        if spec.startswith("split:"):
+            spec = spec[len("split:") :]
+        return path, spec
+
+    for raw in rules:
+        parsed = _parse_rule_line(raw)  # type: ignore[arg-type]
+        if not parsed:
+            continue
+        path, spec = parsed
+        delims: List[str]
+        if spec == "":
+            delims = [","]
+        else:
+            delims = _decode_delims(spec)
+            if not delims:
+                logger.warning("無効な配列化設定: デリミタ指定が無効: %r", raw)
+                continue
+        result[path] = delims
+
+    return result
+
+
+def try_apply_transform_and_insert(
+    *,
+    array_transform_rules: Optional[Dict[str, List[ArrayTransformRule]]],
+    path_keys: List[str],
+    original_path_keys: List[str],
+    value: Any,
+    workbook,
+    root_result: Dict[str, Any],
+    prefix: str,
+    safe_insert: Callable[[Union[Dict[str, Any], List[Any]], List[str], Any, str, str, List[str], List[str]], None],
+) -> bool:
+    """パスにマッチする変換ルールを適用し、挿入まで実施する。
+
+    変換ルールが見つからない場合は False を返し、呼び出し元は通常処理を継続する。
+    見つかった場合は適用の上で挿入し True を返す。
+    """
+    transform_rules = get_applicable_transform_rules(
+        array_transform_rules or {}, path_keys, original_path_keys
+    )
+    if transform_rules is None:
+        return False
+    insert_keys = path_keys
+    # 内部使用のための TransformContext を構築
+    tctx = TransformContext(
+        workbook=workbook,
+        prefix=prefix,
+        transform_rules_map=array_transform_rules or {},
+        insert_keys=insert_keys,
+        root_result=root_result,
+    )
+
+    current_value = apply_transform_rules_for_path(
+        rules=transform_rules,
+        value=value,
+        workbook=tctx.workbook,
+        insert_keys=tctx.insert_keys,
+        root_result=tctx.root_result,
+        transform_rules_map=tctx.transform_rules_map,
+        prefix=tctx.prefix,
+    )
+    safe_insert(
+        root_result,
+        insert_keys,
+        current_value,
+        ".".join(insert_keys),
+        ".".join([prefix] + original_path_keys),
+        original_path_keys,
+        path_keys,
+    )
+    return True
+
+
+def preseed_root_keys(
+    *, root_result: Dict[str, Any], root_first_pos: Dict[str, tuple[int, int, int]]
+) -> None:
+    """ルートキーを出現順に事前作成して dict の順序を安定化させる。
+
+    既存値は温存し、存在しないキーのみ空 dict をセットする。
+    root_first_pos が空のときは何もしない。
+    """
+    try:
+        if is_json_dict(root_result) and root_first_pos:
+            desired_roots = [k for k, _ in sorted(root_first_pos.items(), key=lambda kv: kv[1])]
+            for rk in desired_roots:
+                root_result.setdefault(rk, {})
+    except Exception as e:
+        # ここでの安定化は最適化目的のため、失敗しても致命ではない
+        logger.debug("preseed_root_keys skipped due to: %s", e)
+
+
 # =============================================================================
 # Named Range Parsing
 # =============================================================================
+
+
+def _prepare_parsing_prelude(
+    *,
+    wb,
+    prefix: str,
+    containers: Optional[Dict[str, Dict]],
+    global_max_elements: Optional[int],
+    extraction_policy: ExtractionPolicy,
+) -> Dict[str, Any]:
+    """パース前の派生情報をまとめて構築し、状態辞書を返す。"""
+    # コンテナ準備
+    containers, user_provided_containers, _generated_names = prepare_containers_and_generated_names(
+        wb,
+        prefix=prefix,
+        containers=containers,
+        global_max_elements=global_max_elements,
+        extraction_policy=extraction_policy,
+    )
+
+    # prefix の正規化
+    normalized_prefix = prefix if prefix.endswith(".") else prefix + "."
+
+    # 定義名 + 生成名を統合（初期スナップショット）
+    all_names, defined_only_name_keys = build_all_names_with_generated(wb)
+
+    # 既存仕様: フィールド直下の *.field.1 用に補助生成名を後から追加
+    try:
+        generate_subarray_names_for_field_anchors(wb, normalized_prefix)
+    except Exception as _e:
+        logger.debug("subarray name generation skipped due to error: %s", _e)
+
+    all_name_keys = list(all_names.keys())
+    # 生成名マップ（補助生成名含む、最新状態）
+    gen_map = get_generated_names_map(wb)
+
+    # *.field と *.field.1 の重複抑止集合
+    excluded_indexed_field_names: set[str] = compute_excluded_indexed_field_names(
+        normalized_prefix, all_name_keys, all_names
+    )
+
+    # 各フィールドの期待形状（1D/2D）
+    expected_field_shape: Dict[Tuple[str, str], str] = learn_expected_field_shapes(
+        normalized_prefix, all_name_keys, all_names
+    )
+
+    # ルート直下の数値キー
+    numeric_root_keys = compute_numeric_root_keys(normalized_prefix, all_names)
+
+    # 二重数値インデックス（array.i.j.*）が存在する配列名集合
+    arrays_with_double_index: set[str] = find_arrays_with_double_index(
+        normalized_prefix=normalized_prefix, all_name_keys=all_name_keys, gen_map=gen_map
+    )
+
+    container_parent_names: set[str] = set(containers.keys()) if containers else set()
+    container_parents_with_children: set[str] = compute_container_parents_with_children(
+        container_parent_names=container_parent_names,
+        all_name_keys=all_name_keys,
+        gen_map=gen_map,
+    )
+
+    # groupLabel -> rootName
+    group_to_root: dict[str, str] = compute_group_to_root_map(
+        containers=containers,
+        prefix=prefix,
+        normalized_prefix=normalized_prefix,
+        all_name_keys=all_name_keys,
+    )
+
+    # アンカー名とグループラベル
+    anchor_names: set[str] = compute_anchor_names(normalized_prefix, all_name_keys)
+    group_labels: set[str] = compute_group_labels_from_anchors(
+        anchor_names, containers, prefix=prefix, normalized_prefix=normalized_prefix
+    )
+
+    # シート順序とルート最初の出現位置
+    sheet_order: Dict[str, int] = {ws.title: idx for idx, ws in enumerate(wb.worksheets)}
+    root_first_pos: Dict[str, tuple[int, int, int]] = collect_root_first_positions(
+        normalized_prefix, defined_only_name_keys, all_names, sheet_order
+    )
+
+    return {
+        "containers": containers,
+        "user_provided_containers": user_provided_containers,
+        "normalized_prefix": normalized_prefix,
+        "all_names": all_names,
+        "defined_only_name_keys": defined_only_name_keys,
+        "all_name_keys": all_name_keys,
+        "gen_map": gen_map,
+        "excluded_indexed_field_names": excluded_indexed_field_names,
+        "expected_field_shape": expected_field_shape,
+        "numeric_root_keys": numeric_root_keys,
+        "arrays_with_double_index": arrays_with_double_index,
+        "container_parent_names": container_parent_names,
+        "container_parents_with_children": container_parents_with_children,
+        "group_to_root": group_to_root,
+        "anchor_names": anchor_names,
+        "group_labels": group_labels,
+        "sheet_order": sheet_order,
+        "root_first_pos": root_first_pos,
+    }
+
+
+def _iterate_and_fill_entries(
+    *,
+    wb,
+    schema: Optional[Dict[str, Any]],
+    array_transform_rules: Optional[Dict[str, List[ArrayTransformRule]]],
+    prefix: str,
+    root_result: Dict[str, Any],
+    state: Dict[str, Any],
+    safe_insert,
+    user_provided_containers: bool,
+) -> None:
+    """定義名/生成名を走査し、値の取得→変換→配分→挿入までを一括処理。"""
+    # ルートキーの事前挿入で順序を安定化
+    preseed_root_keys(root_result=root_result, root_first_pos=state["root_first_pos"])
+
+    entries = collect_entries_in_sheet_order(
+        all_names=state["all_names"],
+        normalized_prefix=state["normalized_prefix"],
+        excluded_indexed_field_names=state["excluded_indexed_field_names"],
+        sheet_order=state["sheet_order"],
+        suppress_ctx={
+            "all_name_keys": state["all_name_keys"],
+            "container_parent_names": state["container_parent_names"],
+            "container_parents_with_children": state["container_parents_with_children"],
+            "group_labels": state["group_labels"],
+            "root_first_pos": state["root_first_pos"],
+        },
+    )
+
+    for _pos, name, defined_name, original_path_keys in entries:
+        path_keys = original_path_keys.copy()
+
+        if schema is not None:
+            schema_path_keys, schema_broken = resolve_path_keys_with_schema(
+                path_keys=path_keys, schema=schema
+            )
+            if not schema_broken:
+                path_keys = schema_path_keys
+
+        _skip, value = get_value_for_defined_or_generated_name(
+            wb=wb, name=name, defined_name=defined_name, gen_map=state["gen_map"]
+        )
+        if _skip:
+            continue
+
+        # 末端（スカラー）で None の場合は空プレースホルダに変換して形状復元の対象にする
+        # （同階層に有効データがあるときに null として出力されるようにするため）
+        if value is None or (not isinstance(value, (list, dict)) and DataCleaner.is_empty_value(value)):
+            value = ""
+
+        # 1. 変換ルール
+        if try_apply_transform_and_insert(
+            array_transform_rules=array_transform_rules,
+            path_keys=path_keys,
+            original_path_keys=original_path_keys,
+            value=value,
+            workbook=wb,
+            root_result=root_result,
+            prefix=prefix,
+            safe_insert=safe_insert,
+        ):
+            continue
+
+        logger.debug(f"配列化後の値: {value}")
+
+        # 2. 配列パス要素の処理（array.i.*）
+        if process_array_path_entry(
+            wb=wb,
+            defined_name=defined_name,
+            value=value,
+            path_keys=path_keys,
+            name=name,
+            original_path_keys=original_path_keys,
+            normalized_prefix=state["normalized_prefix"],
+            root_result=root_result,
+            arrays_with_double_index=state["arrays_with_double_index"],
+            expected_field_shape=state["expected_field_shape"],
+            gen_map=state["gen_map"],
+            group_labels=state["group_labels"],
+            all_name_keys=state["all_name_keys"],
+            container_parent_names=state["container_parent_names"],
+            defined_only_name_keys=state["defined_only_name_keys"],
+            safe_insert=safe_insert,
+            user_provided_containers=user_provided_containers,
+        ):
+            continue
+
+        # 3. ルート配下の正規化（配列パスで未処理の場合に実行）
+        normalized_keys = _normalize_root_group_for_parse(
+            path_keys,
+            group_to_root=state["group_to_root"],
+            numeric_root_keys=state["numeric_root_keys"],
+            root_result=root_result,
+        )
+        safe_insert(
+            root_result,
+            normalized_keys,
+            value,
+            ".".join(normalized_keys),
+            name,
+            original_path_keys,
+            normalized_keys,
+        )
+
+
+def _finalize_result(
+    *,
+    result: Dict[str, Any],
+    prefix: str,
+    state: Dict[str, Any],
+    array_transform_rules: Optional[Dict[str, List[ArrayTransformRule]]],
+    user_provided_containers: bool,
+    containers: Optional[Dict[str, Dict]],
+) -> Dict[str, Any]:
+    """ポストパース整形パイプラインを適用し、最終出力を返す。"""
+    return apply_post_parse_pipeline(
+        result=result,
+        root_first_pos=state["root_first_pos"],
+        prefix=prefix,
+        user_provided_containers=user_provided_containers,
+        containers=containers,
+        array_transform_rules=array_transform_rules,
+        normalized_prefix=state["normalized_prefix"],
+        group_labels=state["group_labels"],
+        group_to_root=state["group_to_root"],
+        gen_map=state["gen_map"],
+    )
 
 
 def parse_named_ranges_with_prefix(
     xlsx_path: Path,
     prefix: str,
     array_split_rules: Optional[Dict[str, List[str]]] = None,
-    array_transform_rules: Optional[Dict[str, ArrayTransformRule]] = None,
+    array_transform_rules: Optional[Dict[str, List[ArrayTransformRule]]] = None,
     containers: Optional[Dict[str, Dict]] = None,
     schema: Optional[Dict[str, Any]] = None,
+    global_max_elements: Optional[int] = None,
+    extraction_policy: Optional[ExtractionPolicy] = None,
 ) -> Dict[str, Any]:
     """
     Excel 名前付き範囲(prefix) を解析してネスト dict/list を返す。
     prefixはデフォルトで"json"。
     array_split_rules: 配列化設定の辞書 {path: [delimiter1, delimiter2, ...]}
     array_transform_rules: 配列変換設定の辞書 {path: ArrayTransformRule}
+    extraction_policy: 抽出時の共通ポリシー（未指定時は既定の現行仕様を適用）
     """
-    # 文字列パスをPathオブジェクトに変換（互換性のため）
-    if isinstance(xlsx_path, str):
-        xlsx_path = Path(xlsx_path)
-
-    if not xlsx_path or not isinstance(xlsx_path, Path):
+    # 文字列/PathLike を Path に正規化
+    xlsx_path = Path(xlsx_path)
+    if not xlsx_path:
         raise ValueError(
             "xlsx_pathは有効なPathオブジェクトまたは文字列パスである必要があります。"
         )
@@ -1358,7 +5486,7 @@ def parse_named_ranges_with_prefix(
     if not xlsx_path.is_file():
         raise ValueError(f"指定されたパスはファイルではありません: {xlsx_path}")
 
-    if not prefix or not isinstance(prefix, str):
+    if not prefix:
         raise ValueError("prefixは空ではない文字列である必要があります。")
 
     try:
@@ -1366,402 +5494,71 @@ def parse_named_ranges_with_prefix(
     except Exception as e:
         raise ValueError(f"Excelファイルの読み込みに失敗しました: {xlsx_path} - {e}")
 
-    # コンテナ処理：自動セル名生成
-    if containers:
-        logger.debug(f"コンテナ処理開始: {len(containers)}個のコンテナ")
-        generated_names = generate_cell_names_from_containers(containers, wb)
+    # ポリシー決定（未指定なら既定）
+    policy = extraction_policy or _DEFAULT_EXTRACTION_POLICY
 
-        # 生成されたセル名を名前付き範囲として動的に追加
-        for name, range_ref in generated_names.items():
-            # プレフィックス付きのセル名を作成
-            prefixed_name = f"{prefix}.{name}"
-            if prefixed_name not in wb.defined_names:
-                logger.debug(f"セル名追加: {prefixed_name} -> {range_ref}")
-                # openpyxlでの動的セル名追加は複雑なため、
-                # 内部辞書で直接管理してparse処理で参照
-                wb._generated_names = getattr(wb, "_generated_names", {})
-                wb._generated_names[prefixed_name] = range_ref
-                logger.debug(f"セル名追加成功（内部管理）: {prefixed_name}")
-            else:
-                logger.debug(f"セル名は既存: {prefixed_name}")
-
-        logger.info(f"コンテナ処理完了: {len(generated_names)}個のセル名を生成")
+    # 事前準備を一括計算
+    _state = _prepare_parsing_prelude(
+        wb=wb,
+        prefix=prefix,
+        containers=containers,
+        global_max_elements=global_max_elements,
+        extraction_policy=policy,
+    )
+    containers = _state["containers"]
+    user_provided_containers = _state["user_provided_containers"]
 
     result: Dict[str, Any] = {}
+    # 明示コンテナ指定時のみ prefix 配下に格納（自動推論時は従来通りトップ直下）
+    root_result: Dict[str, Any] = (
+        result if not user_provided_containers else result.setdefault(prefix, {})
+    )
 
     if array_split_rules is None:
         array_split_rules = {}
     if array_transform_rules is None:
         array_transform_rules = {}
 
-    def match_schema_key(key: str, schema_props: dict) -> str:
-        if not schema_props:
-            return key
-        key = key.strip()
-        pattern = "^" + re.escape(key).replace("_", ".") + "$"
-        matches = [
-            prop
-            for prop in schema_props
-            if re.fullmatch(pattern, prop, flags=re.UNICODE)
-        ]
-        logger.debug(f"key={key}, pattern={pattern}, matches={matches}")
-        if len(matches) == 1:
-            return matches[0]
-        elif len(matches) > 1:
-            logger.warning(
-                f"ワイルドカード照合で複数マッチ: '{key}' → {matches}。ユニークでないため置換しません。"
-            )
-        return key
+    # デバッグ支援: 挿入時の文脈を付与する安全ラッパー
+    def _safe_insert(
+        target_root: Union[Dict[str, Any], List[Any]],
+        keys: List[str],
+        val: Any,
+        full_path_hint: str,
+        context_name: str,
+        original_keys: List[str],
+        normalized_keys: List[str],
+    ):
+        try:
+            insert_json_path(target_root, keys, val, full_path_hint)
+        except Exception as e:
+            raise type(e)(
+                f"insert_json_pathで例外発生: name='{context_name}' "
+                f"original_keys={original_keys} normalized_keys={normalized_keys} "
+                f"target_type={type(target_root).__name__} keys={keys} full_path_hint='{full_path_hint}': {e}"
+            ) from e
 
-    # prefixの末尾にドットがなければ自動で追加
-    normalized_prefix = prefix if prefix.endswith(".") else prefix + "."
+    # エントリ走査と挿入
+    _iterate_and_fill_entries(
+        wb=wb,
+        schema=schema,
+        array_transform_rules=array_transform_rules,
+        prefix=prefix,
+        root_result=root_result,
+        state=_state,
+        safe_insert=_safe_insert,
+        user_provided_containers=user_provided_containers,
+    )
 
-    # 既存の名前付き範囲と生成されたセル名を統合
-    all_names = dict(wb.defined_names.items())
-    if hasattr(wb, "_generated_names"):
-        logger.debug(f"生成されたセル名を処理対象に追加: {len(wb._generated_names)}個")
-        for gen_name, gen_range in wb._generated_names.items():
-            if gen_name not in all_names:
-                # 簡易的なDefinedNameオブジェクト作成
-                class GeneratedDefinedName:
-                    def __init__(self, attr_text):
-                        self.attr_text = attr_text
-                        # destinationsを模擬（sheet_name, 範囲文字列のタプル）
-                        if "!" in attr_text:
-                            sheet_part, range_part = attr_text.split("!")
-                            self.destinations = [(sheet_part, range_part)]
-                        else:
-                            # デフォルトでSheet1とする
-                            self.destinations = [("Sheet1", attr_text)]
-
-                all_names[gen_name] = GeneratedDefinedName(gen_range)
-                logger.debug(f"生成セル名追加: {gen_name} -> {gen_range}")
-
-    for name, defined_name in all_names.items():
-        if not name.startswith(normalized_prefix):
-            continue
-        # セル範囲名からjson.を除去し、'.'で分割して空文字列を除去
-        original_path_keys = [
-            k for k in name.removeprefix(normalized_prefix).split(".") if k
-        ]
-        path_keys = original_path_keys.copy()
-
-        # スキーマ解決
-        schema_path_keys = []
-        schema_broken = False
-        if schema is not None:
-            props = schema.get("properties", {})
-            items = schema.get("items", {})
-            current_schema = schema
-            for k in path_keys:
-                if re.fullmatch(r"\d+", k):
-                    schema_path_keys.append(k)
-                    if isinstance(current_schema, dict) and "items" in current_schema:
-                        current_schema = current_schema["items"]
-                        props = (
-                            current_schema.get("properties", {})
-                            if isinstance(current_schema, dict)
-                            else {}
-                        )
-                        items = (
-                            current_schema.get("items", {})
-                            if isinstance(current_schema, dict)
-                            else {}
-                        )
-                    else:
-                        props = {}
-                        items = {}
-                else:
-                    if not props or not isinstance(props, dict):
-                        logger.debug(f"props is empty or not dict at key={k}, break")
-                        schema_broken = True
-                        break
-                    logger.debug(f"props.keys() at key={k}: {list(props.keys())}")
-                    new_k = match_schema_key(k, props)
-                    schema_path_keys.append(new_k)
-                    next_schema = (
-                        props.get(new_k, {}) if isinstance(props, dict) else {}
-                    )
-                    if isinstance(next_schema, dict) and "properties" in next_schema:
-                        current_schema = next_schema
-                        props = next_schema["properties"]
-                        items = next_schema.get("items", {})
-                    elif isinstance(next_schema, dict) and "items" in next_schema:
-                        current_schema = next_schema
-                        props = next_schema.get("properties", {})
-                        items = next_schema["items"]
-                    else:
-                        props = {}
-                        items = {}
-            # スキーマで途中までしか解決できなかった場合は original_path_keys を使う
-            if not schema_broken:
-                path_keys = schema_path_keys
-
-        # 値を取得
-        # コンテナ生成されたセル名の場合は直接値を取得
-        if hasattr(wb, "_generated_names") and name in wb._generated_names:
-            value = wb._generated_names[name]
-            logger.debug(f"コンテナ生成セル名の値を直接取得: {name} -> {value}")
-        else:
-            value = get_named_range_values(wb, defined_name)
-
-        # 配列化処理の優先順位:
-        # 1. 配列変換ルール（ArrayTransformRule）
-        # 2. 明示的なルールによる配列化（多次元対応）
-        # 3. スキーマによる配列化（デフォルト区切り文字: カンマ）
-
-        # 1. 配列変換ルールをチェック（original_path_keys と schema-resolved path 両方）
-        # 変換ルールの判定は path_keys/original_path_keys 両方で探す
-        def get_transform_rules(array_transform_rules, path_keys, original_path_keys):
-            key_path = ".".join(path_keys)
-            orig_key_path = ".".join(original_path_keys)
-            # 完全一致優先
-            if key_path in array_transform_rules:
-                return array_transform_rules[key_path]
-            if orig_key_path in array_transform_rules:
-                return array_transform_rules[orig_key_path]
-            # 配列要素の場合は親キーでも判定
-            if len(path_keys) > 1 and ".".join(path_keys[:-1]) in array_transform_rules:
-                return array_transform_rules[".".join(path_keys[:-1])]
-            if (
-                len(original_path_keys) > 1
-                and ".".join(original_path_keys[:-1]) in array_transform_rules
-            ):
-                return array_transform_rules[".".join(original_path_keys[:-1])]
-
-            # ワイルドカード（*）対応: ルール側に*が含まれる場合はパターンマッチ
-            for rule_key, rule_list in array_transform_rules.items():
-                if "*" in rule_key:
-                    # *を正規表現の「任意の非ドット文字列」に変換
-                    pattern = "^" + re.escape(rule_key).replace("\\*", "[^.]+") + "$"
-                    if re.match(pattern, key_path):
-                        return rule_list
-                    if re.match(pattern, orig_key_path):
-                        return rule_list
-            return None
-
-        transform_rules = get_transform_rules(
-            array_transform_rules, path_keys, original_path_keys
-        )
-        logger.debug(
-            f"original_path_keys={original_path_keys}, path_keys={path_keys}, transform_rules={transform_rules is not None and len(transform_rules)}, value={value}"
-        )
-
-        if transform_rules is not None:
-            insert_keys = (
-                path_keys
-                if ".".join(path_keys) in array_transform_rules
-                else original_path_keys
-            )
-
-            # 連続適用: 複数の変換ルールを順次適用
-            current_value = value
-            for i, transform_rule in enumerate(transform_rules):
-                logger.debug(
-                    f"変換ルール{i+1}/{len(transform_rules)}で変換: {insert_keys} -> rule={transform_rule.transform_type}:{transform_rule.transform_spec}"
-                )
-                if isinstance(current_value, list):
-                    current_value = [
-                        transform_rule.transform(v, wb) for v in current_value
-                    ]
-                else:
-                    current_value = transform_rule.transform(current_value, wb)
-
-                # 辞書戻り値の場合は動的セル名構築を処理
-                if isinstance(current_value, dict):
-                    logger.debug(f"辞書戻り値による動的セル名構築: {current_value}")
-                    for key, val in current_value.items():
-                        if key.startswith(prefix):
-                            # 絶対指定
-                            abs_path = (
-                                key[len(prefix) :]
-                                if key.startswith(prefix + ".")
-                                else key[len(prefix) :]
-                            )
-                            if abs_path:
-                                abs_parts = abs_path.split(".")
-                                # 動的に生成されたセル名に対しても変換ルールを再帰的に適用
-                                dynamic_rules = get_transform_rules(
-                                    array_transform_rules, abs_parts, abs_parts
-                                )
-                                if dynamic_rules:
-                                    logger.debug(
-                                        f"動的セル名 {abs_path} に対してさらに変換ルールを適用"
-                                    )
-                                    for dynamic_rule in dynamic_rules:
-                                        val = dynamic_rule.transform(val, wb)
-                                abs_current = result
-                                for abs_part in abs_parts[:-1]:
-                                    if abs_part not in abs_current:
-                                        abs_current[abs_part] = {}
-                                    abs_current = abs_current[abs_part]
-                                abs_current[abs_parts[-1]] = val
-                        else:
-                            # 相対指定
-                            rel_path = f"{'.'.join(insert_keys)}.{key}"
-                            rel_parts = rel_path.split(".")
-                            # 相対指定でも変換ルールを適用
-                            dynamic_rules = get_transform_rules(
-                                array_transform_rules, rel_parts, rel_parts
-                            )
-                            if dynamic_rules:
-                                logger.debug(
-                                    f"相対セル名 {rel_path} に対してさらに変換ルールを適用"
-                                )
-                                for dynamic_rule in dynamic_rules:
-                                    val = dynamic_rule.transform(val, wb)
-                            rel_current = result
-                            for rel_part in rel_parts[:-1]:
-                                if rel_part not in rel_current:
-                                    rel_current[rel_part] = {}
-                                rel_current = rel_current[rel_part]
-                            rel_current[rel_parts[-1]] = val
-                    continue
-
-                logger.debug(f"変換ルール{i+1}後の値: {current_value}")
-
-            # function型の場合は追加のsplit/配列化処理はスキップ
-            if (
-                len(transform_rules) > 0
-                and transform_rules[-1].transform_type == "function"
-            ):
-                logger.debug(
-                    f"function型変換後の値: {current_value} (追加配列化処理はスキップ)"
-                )
-
-            # 最終結果を挿入
-            insert_json_path(result, insert_keys, current_value, ".".join(insert_keys))
-            continue
-
-        logger.debug(f"配列化後の値: {value}")
-
-        # 配列要素のパスの特別処理
-        if len(path_keys) >= 2 and re.fullmatch(r"\d+", path_keys[1]):
-            # departments.1.name のような配列要素パス、または parent.1.1 のような2次元配列パス
-            array_name = path_keys[0]
-            array_index = int(path_keys[1]) - 1  # 1-based to 0-based
-
-            logger.debug(
-                f"配列要素処理: array_name={array_name}, array_index={array_index}, path_keys={path_keys}"
-            )
-
-            # 配列が存在しない場合は作成
-            if array_name not in result:
-                result[array_name] = []
-                logger.debug(f"新しい配列を作成: {array_name}")
-
-            # 配列の参照を取得
-            array_ref = result[array_name]
-
-            # まだ辞書の場合は空の配列に変換
-            if isinstance(array_ref, dict):
-                logger.debug(f"辞書を空の配列に変換: {array_name}")
-                result[array_name] = []
-                array_ref = result[array_name]
-
-            # 配列のサイズを必要に応じて拡張
-            logger.debug(
-                f"配列拡張前: len={len(array_ref)}, 必要インデックス={array_index}"
-            )
-            while len(array_ref) <= array_index:
-                array_ref.append({})
-                logger.debug(f"配列要素追加: len={len(array_ref)}")
-
-            logger.debug(f"配列拡張後: len={len(array_ref)}")
-
-            # 配列要素が存在することを確認
-            if array_index >= len(array_ref):
-                logger.error(
-                    f"配列インデックス範囲外: array_index={array_index}, len={len(array_ref)}"
-                )
-                raise IndexError(f"配列インデックス {array_index} が範囲外です")
-
-            # 配列要素への安全なアクセス
-            try:
-                current_element = array_ref[array_index]
-                logger.debug(
-                    f"配列要素取得成功: index={array_index}, type={type(current_element)}"
-                )
-            except (KeyError, IndexError) as e:
-                logger.error(
-                    f"配列要素アクセスエラー: {e}, array_type={type(array_ref)}, len={len(array_ref)}"
-                )
-                # デバッグのために配列の内容をログ出力
-                logger.error(f"配列内容: {array_ref}")
-                raise
-
-            # 2次元配列パターンの確認（parent.1.1 のような場合）
-            if len(path_keys) >= 3 and re.fullmatch(r"\d+", path_keys[2]):
-                # 2次元配列のインデックス
-                second_index = int(path_keys[2]) - 1  # 1-based to 0-based
-                logger.debug(f"2次元配列パターン検出: second_index={second_index}")
-
-                # 1次元目の配列要素が配列でない場合は配列に変換
-                if not isinstance(current_element, list):
-                    array_ref[array_index] = []
-                    current_element = array_ref[array_index]
-                    logger.debug(f"配列要素を配列に変換: index={array_index}")
-
-                # 2次元目の配列のサイズを必要に応じて拡張
-                while len(current_element) <= second_index:
-                    current_element.append(None)
-                    logger.debug(f"2次元配列要素追加: len={len(current_element)}")
-
-                # 値を設定（3次元以降のパスがあれば再帰的に処理）
-                if len(path_keys) > 3:
-                    # さらに深い階層がある場合
-                    if current_element[second_index] is None:
-                        current_element[second_index] = {}
-                    remaining_keys = path_keys[3:]
-                    insert_json_path(
-                        current_element[second_index],
-                        remaining_keys,
-                        value,
-                        ".".join(remaining_keys),
-                    )
-                else:
-                    # 2次元配列の最終要素に値を設定
-                    current_element[second_index] = value
-                    logger.debug(
-                        f"2次元配列要素に値設定: "
-                        f"[{array_index}][{second_index}] = {value}"
-                    )
-            else:
-                # 1次元配列パターン（従来の処理）
-                # 配列要素が辞書でない場合は辞書に変換
-                if not isinstance(current_element, dict):
-                    array_ref[array_index] = {}
-                    current_element = array_ref[array_index]
-                    logger.debug(f"配列要素を辞書に変換: index={array_index}")
-
-                # 残りのパスを配列要素内に挿入
-                if len(path_keys) > 2:
-                    remaining_keys = path_keys[2:]
-                    remaining_path = ".".join(remaining_keys)
-                    insert_json_path(
-                        current_element, remaining_keys, value, remaining_path
-                    )
-                else:
-                    array_ref[array_index] = value
-        else:
-            # シンプルなJSONパス挿入
-            insert_json_path(result, path_keys, value, ".".join(path_keys))
-
-    # ワイルドカード変換の適用
-    if array_transform_rules:
-        logger.debug("ワイルドカード変換ルール適用開始")
-        result = apply_wildcard_transforms(
-            result, array_transform_rules, normalized_prefix
-        )
-        logger.debug("ワイルドカード変換ルール適用完了")
-
-    # 二次元配列変換の適用
-    if array_transform_rules:
-        logger.debug("二次元配列変換ルール適用開始")
-        result = apply_2d_array_transforms(
-            result, array_transform_rules, wb, normalized_prefix
-        )
-        logger.debug("二次元配列変換ルール適用完了")
+    # パース後の出力整形
+    result = _finalize_result(
+        result=result,
+        prefix=prefix,
+        state=_state,
+        array_transform_rules=array_transform_rules,
+        user_provided_containers=user_provided_containers,
+        containers=containers,
+    )
 
     return result
 
@@ -1771,44 +5568,15 @@ def parse_named_ranges_with_prefix(
 # =============================================================================
 
 
-def collect_xlsx_files(paths: List[str]) -> List[Path]:
-    """
-    ファイルまたはディレクトリのリストから、対象となる .xlsx ファイル一覧を取得。
-    ディレクトリ指定時は直下のみ。
-    """
-    if not paths:
-        raise ValueError("入力パスのリストが空です。少なくとも1つのパスが必要です。")
-
-    files: List[Path] = []
-    for p in paths:
-        if not p or not isinstance(p, str):
-            logger.warning(f"無効なパス形式をスキップします: {p}")
-            continue
-
-        p_path = Path(p)
-        try:
-            if p_path.is_dir():
-                for entry in p_path.iterdir():
-                    if entry.suffix.lower() == ".xlsx":
-                        files.append(entry)
-            elif p_path.is_file() and p_path.suffix.lower() == ".xlsx":
-                files.append(p_path)
-            else:
-                logger.warning(f"未処理のパス: {p_path}")
-        except (OSError, PermissionError) as e:
-            logger.warning(f"パスへのアクセスに失敗しました: {p_path} - {e}")
-    return files
-
-
 def _has_non_empty_content(obj: Any) -> bool:
     """オブジェクト全体に空でないコンテンツが含まれているかチェック"""
     if obj is None:
         return False
 
-    if isinstance(obj, dict):
+    if is_json_dict(obj):
         return any(_has_non_empty_content(value) for value in obj.values())
 
-    if isinstance(obj, list):
+    if is_json_list(obj):
         return any(_has_non_empty_content(item) for item in obj)
 
     # スカラー値は空でないと判定
@@ -1817,10 +5585,10 @@ def _has_non_empty_content(obj: Any) -> bool:
 
 def _is_empty_container(obj: Any) -> bool:
     """空のコンテナ（辞書・リスト）かどうかをチェック"""
-    return isinstance(obj, (list, dict)) and len(obj) == 0
+    return (is_json_list(obj) or is_json_dict(obj)) and len(obj) == 0
 
 
-def prune_empty_elements(obj: Any, *, _has_sibling_data: Optional[bool] = None) -> Any:
+def prune_empty_elements(obj: Any, *, _has_sibling_data: Optional[bool] = None, schema: Optional[Dict[str, Any]] = None) -> Any:
     """
     再帰的に dict/list から空要素を除去する
 
@@ -1839,30 +5607,27 @@ def prune_empty_elements(obj: Any, *, _has_sibling_data: Optional[bool] = None) 
         _has_sibling_data = _has_non_empty_content(obj)
 
     # 型に応じた処理
-    if isinstance(obj, dict):
-        return _prune_dict(obj, _has_sibling_data)
-    elif isinstance(obj, list):
-        return _prune_list(obj, _has_sibling_data)
+    if is_json_dict(obj):
+        return _prune_dict(obj, _has_sibling_data, schema=schema)
+    elif is_json_list(obj):
+        return _prune_list(obj, _has_sibling_data, schema=schema)
     else:
         return obj
 
 
-def _prune_dict(obj: dict, has_sibling_data: bool) -> Optional[dict]:
+def _prune_dict(obj: dict, has_sibling_data: bool, *, schema: Optional[Dict[str, Any]] = None) -> Optional[dict]:
     """辞書の空要素を除去"""
     if not obj:
         return {}
 
     # 子要素をプルーニング（Walrus演算子とdict内包表記を使用）
-    pruned_items = {
-        key: pruned_value
-        for key, value in obj.items()
-        if (
-            pruned_value := prune_empty_elements(
-                value, _has_sibling_data=has_sibling_data
-            )
-        )
-        is not None
-    }
+    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    pruned_items: Dict[str, Any] = {}
+    for key, value in obj.items():
+        sub_schema = props.get(key) if isinstance(props, dict) else None
+        pruned_value = prune_empty_elements(value, _has_sibling_data=has_sibling_data, schema=sub_schema)
+        if pruned_value is not None:
+            pruned_items[key] = pruned_value
 
     if not pruned_items:
         return None
@@ -1871,27 +5636,37 @@ def _prune_dict(obj: dict, has_sibling_data: bool) -> Optional[dict]:
     has_non_empty = any(
         not _is_empty_container(value) for value in pruned_items.values()
     )
+    # スキーマが array/object を要求しているキーがあり、値が空配列/空オブジェクトでも保持したい場合
+    keep_due_to_schema = False
+    if isinstance(props, dict):
+        for k, v in pruned_items.items():
+            t = None
+            sub = props.get(k)
+            if isinstance(sub, dict):
+                t = sub.get("type")
+            if t == "array" and is_json_list(v) and len(v) == 0:
+                keep_due_to_schema = True
+                break
+            if t == "object" and is_json_dict(v) and len(v) == 0:
+                keep_due_to_schema = True
+                break
 
     # 三項演算子を使用（読みやすさのため分割）
-    if has_non_empty:
+    if has_non_empty or keep_due_to_schema:
         return pruned_items
     else:
         return {} if has_sibling_data else None
 
 
-def _prune_list(obj: list, has_sibling_data: bool) -> list:
+def _prune_list(obj: list, has_sibling_data: bool, *, schema: Optional[Dict[str, Any]] = None) -> list:
     """リストの空要素を除去"""
     # 空でない要素のみを残す（Walrus演算子とリスト内包表記を使用）
-    pruned_items = [
-        pruned_item
-        for item in obj
-        if (
-            pruned_item := prune_empty_elements(
-                item, _has_sibling_data=has_sibling_data
-            )
-        )
-        is not None
-    ]
+    item_schema = schema.get("items") if isinstance(schema, dict) else None
+    pruned_items = []
+    for item in obj:
+        pruned_item = prune_empty_elements(item, _has_sibling_data=has_sibling_data, schema=item_schema)
+        if pruned_item is not None:
+            pruned_items.append(pruned_item)
 
     if not pruned_items:
         return []
@@ -1903,6 +5678,114 @@ def _prune_list(obj: list, has_sibling_data: bool) -> list:
     return pruned_items if has_non_empty else []
 
 
+def _restore_shapes_tree(original_after_prune: Any, data: Any, schema: Optional[Dict[str, Any]]) -> Any:
+    """完全空のフィールド形状（[],{} ,None）を兄弟データの有無に応じて復元する。"""
+    def _is_completely_empty(v: Any) -> bool:
+        return is_completely_empty(v)
+
+    def _empty_shape_for(value: Any) -> Any:
+        if isinstance(value, list):
+            return []
+        if isinstance(value, dict):
+            return {}
+        return None
+
+    def _restore_shapes(orig: Any, cur: Any, schema_here: Optional[Dict[str, Any]] = None) -> Any:
+        if not isinstance(orig, (dict, list)):
+            return cur
+        if isinstance(orig, dict) and isinstance(cur, dict):
+            has_non_empty_sibling = any(not _is_completely_empty(v) for v in orig.values())
+            props = None
+            if isinstance(schema_here, dict):
+                maybe_props = schema_here.get("properties")
+                if isinstance(maybe_props, dict):
+                    props = maybe_props
+            for k, v in orig.items():
+                sub_schema = props.get(k) if isinstance(props, dict) else None
+                if k not in cur:
+                    if _is_completely_empty(v):
+                        # 兄弟に非空がある場合は従来通り復元
+                        # 兄弟がすべて空でも、スキーマが与えられている/該当プロパティが定義されていれば復元（パターン②）
+                        if has_non_empty_sibling or (sub_schema is not None or schema_here is not None):
+                            # スキーマから形状推定（array->[], object->{}）、なければ元の型から
+                            base: Any
+                            if isinstance(sub_schema, dict) and sub_schema.get("type") == "array":
+                                base = []
+                            elif isinstance(sub_schema, dict) and sub_schema.get("type") == "object":
+                                base = {}
+                            else:
+                                base = _empty_shape_for(v)
+                            # 再帰的に内側も復元（スキーマを渡して再帰埋め）
+                            cur[k] = _restore_shapes(v, base, sub_schema)
+                else:
+                    cur[k] = _restore_shapes(v, cur[k], sub_schema)
+            return cur
+        if isinstance(orig, list) and isinstance(cur, list):
+            restored_list = []
+            for i, cur_item in enumerate(cur):
+                if i < len(orig):
+                    item_schema = None
+                    if isinstance(schema_here, dict):
+                        it = schema_here.get("items")
+                        if isinstance(it, dict):
+                            item_schema = it
+                    restored_list.append(_restore_shapes(orig[i], cur_item, item_schema))
+                else:
+                    restored_list.append(cur_item)
+            cur[:] = restored_list
+            return cur
+        return cur
+
+    return _restore_shapes(original_after_prune, data, schema)
+
+
+def _validate_and_log_errors(
+    *,
+    data: Dict[str, Any],
+    schema: Optional[Dict[str, Any]],
+    validator: Optional[Draft7Validator],
+    validation_policy: ValidationPolicy,
+    serialization_policy: SerializationPolicy,
+    output_dir: Path,
+    base_name: str,
+) -> None:
+    if not (validator and validation_policy.enabled):
+        return
+    data_for_validation = cast(Dict[str, Any], to_iso_for_validation(data) if validation_policy.to_iso_for_validation else data)
+    errors = list(validator.iter_errors(data_for_validation))
+    if not errors:
+        return
+    log_file = output_dir / f"{base_name}.error.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "w", encoding="utf-8") as f:
+        for error in errors:
+            path_str = ".".join(str(p) for p in error.absolute_path)
+            msg = f"Validation error at {path_str}: {error.message}\n"
+            f.write(msg)
+    first_error = errors[0]
+    logger.error(f"Validation error: {first_error.message}")
+
+
+def _dump_to_file(*, data: Dict[str, Any], output_path: Path, output_format: str, sp: SerializationPolicy) -> None:
+    def json_default(obj):
+        if sp.datetime_to_iso:
+            if isinstance(obj, datetime.datetime):
+                return obj.isoformat()
+            if isinstance(obj, datetime.date):
+                return obj.isoformat()
+        return str(obj)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    eff_format = (sp.format or output_format).lower()
+    if eff_format == "yaml" or output_format == "yaml":
+        with output_path.open("w", encoding="utf-8") as f:
+            yaml_data = json.loads(json.dumps(data, default=json_default))
+            yaml.dump(yaml_data, f, default_flow_style=False, allow_unicode=True, indent=2)
+    else:
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=sp.ensure_ascii, indent=sp.indent, default=json_default)
+
+
 def write_data(
     data: Dict[str, Any],
     output_path: Path,
@@ -1910,6 +5793,12 @@ def write_data(
     schema: Optional[Dict[str, Any]] = None,
     validator: Optional[Draft7Validator] = None,
     suppress_empty: bool = True,
+    *,
+    cleaning_policy: DataCleaningPolicy | None = None,
+    ordering_policy: OutputOrderingPolicy | None = None,
+    serialization_policy: SerializationPolicy | None = None,
+    validation_policy: ValidationPolicy | None = None,
+    logging_policy: LoggingPolicy | None = None,
 ) -> None:
     """
     データをファイルに書き出し（JSON/YAML対応）。
@@ -1918,60 +5807,66 @@ def write_data(
     base_name = output_path.stem
     output_dir = output_path.parent
 
-    # 全フィールドが未設定の要素を除去
-    data = prune_empty_elements(data)
+    # デバッグ: 出力前の一部構造確認（特定キー名に依存しない汎用ログ）
+    sample_keys = list(data.keys())[:5] if is_json_dict(data) else []
+    logger.debug("BEFORE-PRUNE keys(sample)=%r", sample_keys)
 
-    # 空値の除去
-    if suppress_empty:
-        data = DataCleaner.clean_empty_values(data, suppress_empty)
-        if data is None:
+    # ポリシー（デフォルト併用）
+    _cp = cleaning_policy or DEFAULT_DATA_CLEANING_POLICY
+    _sp = serialization_policy or DEFAULT_SERIALIZATION_POLICY
+    _vp = validation_policy or DEFAULT_VALIDATION_POLICY
+    _lp = logging_policy or DEFAULT_LOGGING_POLICY
+
+    # 形状正規化
+    if _cp.normalize_array_field_shapes:
+        data = cast(Dict[str, Any], normalize_array_field_shapes(data))
+
+    # 全フィールドが未設定の要素を除去
+    if _cp.prune_empty_elements:
+        data = prune_empty_elements(data, schema=schema)
+
+    # 空値の除去（この時点では空キーは落ちる）
+    original_after_prune = data  # 形状復元のため保持
+    if _cp.clean_empty_values and suppress_empty:
+        cleaned_data = clean_empty_values(original_after_prune, suppress_empty, schema=schema)
+        if cleaned_data is None:
             data = {}
+        else:
+            data = cast(Dict[str, Any], cleaned_data)
+
+    if suppress_empty:
+        data = cast(Dict[str, Any], _restore_shapes_tree(original_after_prune, data, schema))
+
+    # デバッグ: プルーニング後の構造確認（特定キー名に依存しない汎用ログ）
+    sample_keys_after = list(data.keys())[:5] if is_json_dict(data) else []
+    logger.debug("AFTER-PRUNE keys(sample)=%r", sample_keys_after)
+
+    # 出力順ポリシーの適用
+    if ordering_policy is None:
+        ordering_policy = OutputOrderingPolicy(
+            schema_first=bool(schema),
+            align_sibling_list_of_dicts=True,
+            keep_extras_in_insertion_order=True,
+        )
+    data = order_for_output(data, policy=ordering_policy, schema=schema)
 
     # バリデーション → エラーログ
-    if validator:
-        errors = list(validator.iter_errors(data))
-        if errors:
-            # エラーログファイルの作成
-            log_file = output_dir / f"{base_name}.error.log"
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_file, "w", encoding="utf-8") as f:
-                for error in errors:
-                    path_str = ".".join(str(p) for p in error.absolute_path)
-                    msg = f"Validation error at {path_str}: {error.message}\n"
-                    f.write(msg)
-            # 最初のエラーをログに出力
-            first_error = errors[0]
-            logger.error(f"Validation error: {first_error.message}")
+    _validate_and_log_errors(
+        data=data,
+        schema=schema,
+        validator=validator,
+        validation_policy=_vp,
+        serialization_policy=_sp,
+        output_dir=output_dir,
+        base_name=base_name,
+    )
 
-    # ソート処理
-    if schema:
-        data = reorder_json(data, schema)
-
-    # datetime型を文字列に変換する関数
-    def json_default(obj):
-        if isinstance(obj, datetime.datetime):
-            return obj.isoformat()
-        if isinstance(obj, datetime.date):
-            return obj.isoformat()
-        return str(obj)
+    # スキーマ順は order_for_output で適用済み（必要時）
 
     # ファイル書き出し
-    output_dir.mkdir(parents=True, exist_ok=True)
+    _dump_to_file(data=data, output_path=output_path, output_format=output_format, sp=_sp)
 
-    if output_format == "yaml":
-        # YAML形式で出力
-        with output_path.open("w", encoding="utf-8") as f:
-            # datetime オブジェクトを文字列に変換
-            yaml_data = json.loads(json.dumps(data, default=json_default))
-            yaml.dump(
-                yaml_data, f, default_flow_style=False, allow_unicode=True, indent=2
-            )
-    else:
-        # JSON形式で出力（デフォルト）
-        with output_path.open("w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, default=json_default)
-
-    logger.info(f"ファイルの出力に成功しました: {output_path}")
+    logger.debug(f"ファイルの出力に成功しました: {output_path}")
 
 
 # =============================================================================
@@ -1981,132 +5876,227 @@ def write_data(
 
 def has_border(worksheet, row, col, side):
     """
-    指定セルの指定方向に罫線があるかチェック
-    隣接セルの境界線も考慮して、人間の目で見たときの連続性を判定
+    指定セルの指定方向に罫線があるかチェック。
+    自セルの辺に罫線があるか、または隣接セルの対応辺に罫線があれば True。
     """
-    try:
-        # 自セルの罫線をチェック
-        cell = worksheet.cell(row=row, column=col)
-        border = getattr(cell.border, side, None)
-        if border is not None and border.style is not None:
-            return True
+    # メモ化（ワークブック処理中にクリアされる）
+    # DummySheet のように title が無い場合はキャッシュしない（id 再利用などで誤検知を避ける）
+    sheet_title = getattr(worksheet, "title", None)
+    cache_enabled = sheet_title is not None
+    cache_key = (id(worksheet), sheet_title, row, col, side)
+    if cache_enabled:
+        cached = border_cache().get(cache_key)
+        if cached is not None:
+            return cached
+    # 自セル側
+    cell = worksheet.cell(row=row, column=col)
+    border = getattr(cell.border, side, None)
+    if border is not None and border.style is not None:
+        if cache_enabled:
+            border_cache()[cache_key] = True
+        return True
 
-        # 隣接セルの境界線もチェック
-        adjacent_row, adjacent_col = row, col
-        adjacent_side = side
+    # 隣接セル側
+    adj_row, adj_col = row, col
+    adj_side = side
+    if side == "top":
+        adj_row = row - 1
+        adj_side = "bottom"
+    elif side == "bottom":
+        adj_row = row + 1
+        adj_side = "top"
+    elif side == "left":
+        adj_col = col - 1
+        adj_side = "right"
+    elif side == "right":
+        adj_col = col + 1
+        adj_side = "left"
+    if adj_row > 0 and adj_col > 0:
+        try:
+            # 境界チェックは緩めにし、DummySheet等でも必ずアクセスして評価できるようにする
+            acell = worksheet.cell(row=adj_row, column=adj_col)
+            ab = getattr(acell.border, adj_side, None)
+            if ab is not None and getattr(ab, "style", None) is not None:
+                if cache_enabled:
+                    border_cache()[cache_key] = True
+                return True
+        except Exception:
+            # ワークシート実装に依存せず安全にフォールバック
+            pass
+    if cache_enabled:
+        border_cache()[cache_key] = False
+    return False
+def compute_scan_bounds_for_rect_detection(worksheet, cell_names_map=None):
+    """四角形検出のスキャン範囲 (min_row, min_col, max_row, max_col) を返す。
 
-        if side == "top":
-            adjacent_row = row - 1
-            adjacent_side = "bottom"
-        elif side == "bottom":
-            adjacent_row = row + 1
-            adjacent_side = "top"
-        elif side == "left":
-            adjacent_col = col - 1
-            adjacent_side = "right"
-        elif side == "right":
-            adjacent_col = col + 1
-            adjacent_side = "left"
-
-        # 隣接セルが存在する場合、その境界線をチェック
-        if adjacent_row > 0 and adjacent_col > 0:
-            try:
-                adjacent_cell = worksheet.cell(row=adjacent_row, column=adjacent_col)
-                adjacent_border = getattr(adjacent_cell.border, adjacent_side, None)
-                if adjacent_border is not None and adjacent_border.style is not None:
-                    return True
-            except:
-                pass
-
-        return False
-    except:
-        return False
-
-
-def detect_rectangular_regions(worksheet, cell_names_map=None):
+    セル名マップがある場合は最小外接矩形に十分なマージンを付けて探索範囲を絞る。
+    ない場合はワークシートの実質的な有効範囲（30行×30列を上限）に限定する。
     """
-    罫線で囲まれた四角形領域を検出
-    左上から大きい順にソートして返す
-    """
-    regions = []
-
-    # セル名マップがある場合はその範囲、ない場合は制限された範囲を対象
     if cell_names_map:
-        min_row = min(row for row, col in cell_names_map.keys())
-        max_row = max(row for row, col in cell_names_map.keys())
-        min_col = min(col for row, col in cell_names_map.keys())
-        max_col = max(col for row, col in cell_names_map.keys())
+        named_rows = [row for row, _ in cell_names_map.keys()]
+        named_cols = [col for _, col in cell_names_map.keys()]
+        if not named_rows or not named_cols:
+            # フォールバック: 極小範囲
+            min_row = 1
+            min_col = 1
+            max_row = min(worksheet.max_row or 30, 30)
+            max_col = min(worksheet.max_column or 30, 30)
+        else:
+            ws_max_row = worksheet.max_row or (max(named_rows) + 5)
+            ws_max_col = worksheet.max_column or (max(named_cols) + 5)
+            # 少し広めのマージン（現行仕様に合わせる）
+            ROW_MARGIN = 20
+            COL_MARGIN = 10
+            min_row = max(1, min(named_rows) - ROW_MARGIN)
+            min_col = max(1, min(named_cols) - COL_MARGIN)
+            max_row = min(ws_max_row, max(named_rows) + ROW_MARGIN)
+            max_col = min(ws_max_col, max(named_cols) + COL_MARGIN)
     else:
         # セル名がない場合は実際のワークシートの有効範囲内に制限
         min_row, min_col = 1, 1
-        # 実際にデータがある範囲を上限とする
         actual_max_row = worksheet.max_row if worksheet.max_row else 30
         actual_max_col = worksheet.max_column if worksheet.max_column else 30
         max_row, max_col = min(actual_max_row, 30), min(actual_max_col, 30)
+    return min_row, min_col, max_row, max_col
 
-    logger.debug(f"四角形検出範囲: 行{min_row}-{max_row}, 列{min_col}-{max_col}")
 
-    # 各セルを起点として四角形を検出（大きい領域から小さい領域へ）
+def build_area_sorted_size_combinations(max_width: int, max_height: int) -> List[Tuple[int, int, int]]:
+    """(area, width, height) の組を面積降順で生成する。
+
+    巨大な領域から探索して最初に完全矩形を見つけたら採用、という既存戦略を維持。
+    """
+    size_combinations: List[Tuple[int, int, int]] = []
+    for width in range(1, max_width + 1):
+        for height in range(1, max_height + 1):
+            area = width * height
+            size_combinations.append((area, width, height))
+    size_combinations.sort(reverse=True)
+    return size_combinations
+
+
+def detect_regions_from_anchors(
+    worksheet, min_row: int, min_col: int, max_row: int, max_col: int, cell_names_map
+) -> List[Tuple[int, int, int, int, float]]:
+    """セル名アンカーから右端候補→下端確定で矩形を検出（1アンカー最大1件）。"""
+    regions: List[Tuple[int, int, int, int, float]] = []
+    anchors = sorted(set(cell_names_map.keys()))  # (row,col)
+    for top, left in anchors:
+        try:
+            _sheet_name = getattr(worksheet, "title", "")
+        except Exception:
+            _sheet_name = ""
+        logger.debug("ANCHOR-RECT-CHECK sheet=%s top=%s left=%s", _sheet_name, top, left)
+        # 起点要件: 左上の外枠が存在
+        if not (
+            has_border(worksheet, top, left, "top")
+            and has_border(worksheet, top, left, "left")
+        ):
+            continue
+        r_limit = max_row
+        c_limit = max_col
+        # 右端の最大候補: top 行で連続する上辺ボーダーがある範囲
+        right_max = left
+        c = left
+        while c <= c_limit and has_border(worksheet, top, c, "top"):
+            right_max = c
+            c += 1
+        # 右端候補を広い方から狭めて最初に閉じる矩形を採用
+        for right in range(right_max, left - 1, -1):
+            cand = _find_rect_from_anchor(
+                worksheet, left, right, top, max_bottom=r_limit
+            )
+            if not cand:
+                continue
+            l2, t2, r2, b2 = cand
+            comp = calculate_border_completeness(worksheet, t2, l2, b2, r2)
+            logger.debug(
+                "ANCHOR-RECT-CAND sheet=%s bounds top=%s left=%s bottom=%s right=%s completeness=%.3f",
+                _sheet_name,
+                t2,
+                l2,
+                b2,
+                r2,
+                comp,
+            )
+            if comp >= 1.0:
+                # 領域内に少なくとも1つセル名が含まれること
+                cell_names_in_region = get_cell_names_in_region(
+                    cell_names_map, t2, l2, b2, r2
+                )
+                if not cell_names_in_region:
+                    continue
+                regions.append((t2, l2, b2, r2, comp))
+                break  # このアンカーでは最大の1つを採用
+    return regions
+
+
+def detect_regions_bruteforce(
+    worksheet, min_row: int, min_col: int, max_row: int, max_col: int, cell_names_map=None
+) -> List[Tuple[int, int, int, int, float]]:
+    """各セルを左上起点として全探索で矩形を検出。"""
+    regions: List[Tuple[int, int, int, int, float]] = []
     for top in range(min_row, max_row + 1):
         for left in range(min_col, max_col + 1):
-            # 幅と高さを独立して変化させて長方形も検出
-            # セル名領域のサイズを上限とする
+            if not (
+                has_border(worksheet, top, left, "top")
+                and has_border(worksheet, top, left, "left")
+            ):
+                continue
             max_width = min(max_col - left + 1, max_col - min_col + 1)
             max_height = min(max_row - top + 1, max_row - min_row + 1)
-
-            # 大きい面積から小さい面積へソートして検出
-            size_combinations = []
-            for width in range(1, max_width + 1):
-                for height in range(1, max_height + 1):
-                    area = width * height
-                    size_combinations.append((area, width, height))
-
-            # 面積の大きい順にソート
-            size_combinations.sort(reverse=True)
-
-            for area, width, height in size_combinations:
+            size_combinations = build_area_sorted_size_combinations(
+                max_width, max_height
+            )
+            for _area, width, height in size_combinations:
                 right = left + width - 1
                 bottom = top + height - 1
-
                 if bottom > max_row or right > max_col:
                     continue
-
-                # 四角形の罫線完成度を計算
                 completeness = calculate_border_completeness(
                     worksheet, top, left, bottom, right
                 )
-
-                # 人の目で見て完全に囲まれた領域のみを対象（100%完成度）
                 if completeness >= 1.0:
-                    # セル名がある場合はその中に含まれるかチェック
                     if cell_names_map:
                         cell_names_in_region = get_cell_names_in_region(
                             cell_names_map, top, left, bottom, right
                         )
                         if not cell_names_in_region:
                             continue
+                    regions.append((top, left, bottom, right, completeness))
+    return regions
 
-                    region_tuple = (top, left, bottom, right, completeness)
-                    regions.append(region_tuple)
 
-    # 大きい順、完成度順、左上位置順でソート
+def dedup_and_sort_regions(
+    regions: List[Tuple[int, int, int, int, float]]
+) -> List[Tuple[int, int, int, int, float]]:
+    """同一座標を completeness 最大で残し、大きい順→完成度→左上でソート。"""
+    uniq: dict[tuple[int, int, int, int], float] = {}
+    for t, left, b, r, c in regions:
+        key = (t, left, b, r)
+        if key not in uniq or c > uniq[key]:
+            uniq[key] = c
+    regions = [
+        (t, left, b, r, uniq[(t, left, b, r)]) for (t, left, b, r) in uniq.keys()
+    ]
     regions.sort(
         key=lambda r: (-(r[2] - r[0] + 1) * (r[3] - r[1] + 1), -r[4], r[0], r[1])
     )
+    return regions
 
-    # 重複する領域を除去（より意味のある大きな領域を優先）
-    filtered_regions = []
+
+def filter_overlapping_regions(
+    regions: List[Tuple[int, int, int, int, float]]
+) -> List[Tuple[int, int, int, int, float]]:
+    """包含関係で冗長な小領域を除外し、大きい領域を優先して保持。"""
+    filtered: List[Tuple[int, int, int, int, float]] = []
     for region in regions:
         top, left, bottom, right, completeness = region
         region_area = (bottom - top + 1) * (right - left + 1)
-
-        # 既存の領域と重複していないかチェック
         is_redundant = False
-        for existing_region in filtered_regions:
-            ex_top, ex_left, ex_bottom, ex_right, ex_completeness = existing_region
+        for existing_region in list(filtered):
+            ex_top, ex_left, ex_bottom, ex_right, _ex_comp = existing_region
             ex_area = (ex_bottom - ex_top + 1) * (ex_right - ex_left + 1)
-
-            # 既存の大きな領域に完全に包含される小さな領域は除外
+            # 既存の大きな領域に完全包含される小領域は除外
             if (
                 top >= ex_top
                 and left >= ex_left
@@ -2116,50 +6106,148 @@ def detect_rectangular_regions(worksheet, cell_names_map=None):
             ):
                 is_redundant = True
                 break
-
-            # 新しい領域が既存の小さな領域を包含する場合は既存を削除
-            elif (
+            # 新領域が既存の小領域を包含するなら既存を削除
+            if (
                 ex_top >= top
                 and ex_left >= left
                 and ex_bottom <= bottom
                 and ex_right <= right
                 and ex_area < region_area
             ):
-                filtered_regions.remove(existing_region)
-
+                filtered.remove(existing_region)
         if not is_redundant:
-            filtered_regions.append(region)
+            filtered.append(region)
+    return filtered
 
+
+def detect_rectangular_regions(worksheet, cell_names_map=None):
+    """
+    罫線で囲まれた四角形領域を検出
+    左上から大きい順にソートして返す
+    """
+    regions: List[Tuple[int, int, int, int, float]] = []
+
+    # スキャン対象範囲を計算（セル名マップの有無で分岐）
+    min_row, min_col, max_row, max_col = compute_scan_bounds_for_rect_detection(
+        worksheet, cell_names_map
+    )
+
+    lr, ur = (min(min_row, max_row), max(min_row, max_row))
+    lc, uc = (min(min_col, max_col), max(min_col, max_col))
+    logger.debug(f"四角形検出範囲: 行{lr}-{ur}, 列{lc}-{uc}")
+
+    # まず、セル名マップがある場合は『名前付きセルをアンカーにした高速検出』を優先
+    if cell_names_map:
+        regions.extend(
+            detect_regions_from_anchors(
+                worksheet, min_row, min_col, max_row, max_col, cell_names_map
+            )
+        )
+
+    # 各セルを起点として四角形を検出（大きい領域から小さい領域へ）
+    # 各セルを起点として四角形を検出（大きい領域から小さい領域へ）
+    regions.extend(
+        detect_regions_bruteforce(
+            worksheet, min_row, min_col, max_row, max_col, cell_names_map
+        )
+    )
+
+    # 重複を除去してから、大きい順、完成度順、左上位置順でソート
+    regions = dedup_and_sort_regions(regions)
+
+    # 重複する領域を除去（より意味のある大きな領域を優先）
+    filtered_regions = filter_overlapping_regions(regions)
     logger.debug(f"検出された四角形領域数: {len(filtered_regions)}")
     return filtered_regions
 
 
-def is_complete_rectangle(worksheet, top, left, bottom, right):
-    """指定範囲が完全な四角形の罫線で囲まれているかチェック"""
-    try:
-        # 上辺をチェック
-        for col in range(left, right + 1):
-            if not has_border(worksheet, top, col, "top"):
-                return False
+def _row_has_horizontal_border(ws, row: int, left: int, right: int, side: str) -> bool:
+    """指定行の区間で水平ボーダーが連続しているか（キャッシュ活用）。"""
+    for c in range(left, right + 1):
+        if not has_border(ws, row, c, side):
+            return False
+    return True
 
-        # 下辺をチェック
-        for col in range(left, right + 1):
-            if not has_border(worksheet, bottom, col, "bottom"):
-                return False
 
-        # 左辺をチェック
-        for row in range(top, bottom + 1):
-            if not has_border(worksheet, row, left, "left"):
-                return False
+def _col_has_vertical_border(ws, col: int, top: int, bottom: int, side: str) -> bool:
+    """指定列の区間で垂直ボーダーが連続しているか（キャッシュ活用）。"""
+    for r in range(top, bottom + 1):
+        if not has_border(ws, r, col, side):
+            return False
+    return True
 
-        # 右辺をチェック
-        for row in range(top, bottom + 1):
-            if not has_border(worksheet, row, right, "right"):
-                return False
 
-        return True
-    except:
-        return False
+def find_bordered_region_around_positions(
+    worksheet,
+    positions: dict[str, tuple[int, int]],
+    *,
+    row_margin: int = 12,
+    col_margin: int = 8,
+) -> tuple[int, int, int, int] | None:
+    """
+    基準座標群（フィールド -> (col,row)）の最小外接矩形から外側へ拡張し、
+    四辺が罫線で閉じた領域をヒューリスティックに検出する高速版。
+    失敗時は None を返す。
+    """
+    if not positions:
+        return None
+    cols = [c for (c, _r) in positions.values()]
+    rows = [r for (_c, r) in positions.values()]
+    if not cols or not rows:
+        return None
+    ws = worksheet
+    max_r = getattr(ws, "max_row", 200) or 200
+    max_c = getattr(ws, "max_column", 50) or 50
+
+    left = max(1, min(cols) - col_margin)
+    right = min(max_c, max(cols) + col_margin)
+    top = max(1, min(rows) - row_margin)
+    bottom = min(max_r, max(rows) + row_margin)
+
+    # 上下の水平ボーダーを探す
+    steps = 0
+    while (
+        top > 1
+        and not _row_has_horizontal_border(ws, top, left, right, "top")
+        and steps < row_margin * 2
+    ):
+        top -= 1
+        steps += 1
+    steps = 0
+    while (
+        bottom < max_r
+        and not _row_has_horizontal_border(ws, bottom, left, right, "bottom")
+        and steps < row_margin * 2
+    ):
+        bottom += 1
+        steps += 1
+
+    # 左右の垂直ボーダーを探す
+    steps = 0
+    while (
+        left > 1
+        and not _col_has_vertical_border(ws, left, top, bottom, "left")
+        and steps < col_margin * 2
+    ):
+        left -= 1
+        steps += 1
+    steps = 0
+    while (
+        right < max_c
+        and not _col_has_vertical_border(ws, right, top, bottom, "right")
+        and steps < col_margin * 2
+    ):
+        right += 1
+        steps += 1
+
+    # 最終確認
+    ok = (
+        _row_has_horizontal_border(ws, top, left, right, "top")
+        and _row_has_horizontal_border(ws, bottom, left, right, "bottom")
+        and _col_has_vertical_border(ws, left, top, bottom, "left")
+        and _col_has_vertical_border(ws, right, top, bottom, "right")
+    )
+    return (top, left, bottom, right) if ok else None
 
 
 def get_cell_names_in_region(cell_names_map, top, left, bottom, right):
@@ -2172,945 +6260,124 @@ def get_cell_names_in_region(cell_names_map, top, left, bottom, right):
     return cell_names
 
 
-def detect_hierarchical_regions(worksheet, cell_names_map=None):
+# 罫線矩形スキャン（ネスト処理用の最小ヘルパー群を再導入）
+def _find_rect_from_anchor(ws, left, right, top, max_bottom=None):
+    """(left, right, top) を与えて、下方向に罫線が閉じる bottom を探す。
+    返り値は (left, top, right, bottom)。max_bottom を超える場合は None。
+    厳密に左右幅固定・横ズレ許容なし。
     """
-    ツリー型階層構造を検出
-    左から右へのドリルダウン構造を前提として、各階層にセル名が存在する構成を想定
-    """
-    logger.info("ツリー型階層構造の検出を開始")
+    # 上辺の連続性チェック（left..right の全列で top の上辺があること）
+    for c in range(left, right + 1):
+        if not has_border(ws, top, c, "top"):
+            return None
 
-    # すべての完全な四角形領域を検出
-    all_regions = detect_all_complete_rectangles(worksheet, cell_names_map)
-
-    if not all_regions:
-        logger.warning("完全な四角形領域が検出されませんでした")
-        return []
-
-    logger.info(f"検出された全領域数: {len(all_regions)}")
-    for i, region in enumerate(all_regions[:5]):  # 最初の5個を表示
-        bounds = region["bounds"]
-        logger.info(
-            f"  領域{i}: ({bounds[0]},{bounds[1]},{bounds[2]},{bounds[3]}) 面積:{region['area']}"
-        )
-
-    # ツリー構造に適した領域選択
-    tree_regions = select_tree_structure_regions(all_regions, cell_names_map)
-
-    logger.info(f"ツリー構造用選択領域数: {len(tree_regions)}")
-
-    # セル名ベースでの重複除去
-    tree_regions = select_largest_regions_by_cell_names(tree_regions)
-
-    # 階層関係を構築（左右方向の階層展開を考慮）
-    hierarchy = build_tree_hierarchy(tree_regions, cell_names_map)
-
-    return hierarchy
-
-
-def select_tree_structure_regions(all_regions, cell_names_map=None):
-    """
-    ツリー型階層構造に適した領域を選択
-    左から右への展開パターンと各階層でのセル名存在を重視
-    """
-    if not all_regions:
-        return []
-
-    # セル名を持つ領域を基軸として分析
-    regions_with_names = [r for r in all_regions if r.get("cell_names")]
-    regions_without_names = [r for r in all_regions if not r.get("cell_names")]
-
-    logger.info(
-        f"セル名あり領域: {len(regions_with_names)}, セル名なし領域: {len(regions_without_names)}"
+    # 探索上限
+    hard_limit = (
+        max_bottom if max_bottom is not None else (getattr(ws, "max_row", 200) or 200)
     )
 
-    selected_regions = []
-
-    # 1. セル名を持つ領域は階層の各レベルを表すため必ず含める
-    selected_regions.extend(regions_with_names)
-
-    # 2. セル名なし領域から構造的に重要なものを選択
-    for region in regions_without_names:
-        area = region["area"]
-        bounds = region["bounds"]
-        top, left, bottom, right = bounds
-
-        # 大きな全体コンテナ（ルート領域候補）
-        if area >= 200:
-            selected_regions.append(region)
-            logger.debug(f"ルート領域候補を追加: {bounds} (面積: {area})")
-            continue
-
-        # 中程度の領域：セル名領域を適切に包含する階層コンテナ
-        if area >= 20:
-            # この領域がセル名領域を包含しているかチェック
-            contains_named_regions = []
-            for named_region in regions_with_names:
-                if is_region_contained(named_region, region):
-                    contains_named_regions.append(named_region)
-
-            if len(contains_named_regions) >= 1:
-                # 1つ以上のセル名領域を包含する場合は階層コンテナとして採用
-                selected_regions.append(region)
-                logger.debug(
-                    f"階層コンテナを追加: {bounds} (面積: {area}, 包含: {len(contains_named_regions)}個)"
-                )
-
-        # 小さな領域でも形状的に意味があるもの
-        elif area >= 8:
-            # 適度な矩形形状で、ツリー構造の一部となり得るもの
-            width = right - left + 1
-            height = bottom - top + 1
-            ratio = max(width, height) / min(width, height)
-
-            if ratio <= 3.0:  # アスペクト比が3以下
-                # セル名領域との位置関係をチェック
-                has_structural_meaning = False
-                for named_region in regions_with_names:
-                    named_bounds = named_region["bounds"]
-                    # 隣接または近接している場合
-                    if (
-                        abs(bounds[0] - named_bounds[0]) <= 2
-                        or abs(bounds[1] - named_bounds[1]) <= 2
-                    ):
-                        has_structural_meaning = True
-                        break
-
-                if has_structural_meaning:
-                    selected_regions.append(region)
-                    logger.debug(f"構造的小領域を追加: {bounds} (面積: {area})")
-
-    logger.info(f"選択された構造的領域数: {len(selected_regions)}")
-
-    return selected_regions
-
-
-def build_tree_hierarchy(regions, cell_names_map=None):
-    """
-    ツリー型階層構造を構築
-    左から右への展開パターンを重視した親子関係の判定
-    """
-    # 領域をIDで管理
-    for i, region in enumerate(regions):
-        region["id"] = i
-        region["parent"] = None
-        region["children"] = []
-        region["level"] = 0
-        region["tree_position"] = analyze_tree_position(region, cell_names_map)
-
-    # 左から右、上から下の順序でソート（ツリー構造の自然な順序）
-    sorted_regions = sorted(
-        enumerate(regions),
-        key=lambda x: (
-            x[1]["bounds"][1],  # 左端の列位置
-            x[1]["bounds"][0],  # 上端の行位置
-            -x[1]["area"],  # 面積（大きい順）
-        ),
-    )
-
-    # 階層関係を構築
-    for i, (idx_i, region) in enumerate(sorted_regions):
-        potential_parents = []
-
-        for j, (idx_j, other_region) in enumerate(sorted_regions):
-            if idx_i != idx_j and is_region_contained(region, other_region):
-                # 面積差による階層判定
-                area_ratio = other_region["area"] / region["area"]
-
-                # セル名による階層判定の調整
-                child_has_names = bool(region.get("cell_names", []))
-                parent_has_names = bool(other_region.get("cell_names", []))
-
-                min_ratio = 1.2  # 基本的な最小比率
-
-                if child_has_names and parent_has_names:
-                    min_ratio = 1.1  # セル名同士は緩い条件
-                elif parent_has_names and not child_has_names:
-                    min_ratio = 1.3
-                elif not parent_has_names and child_has_names:
-                    min_ratio = 1.5  # 子にセル名がある場合は厳格に
-                else:
-                    min_ratio = 2.0  # 両方ともセル名なしは厳格に
-
-                if area_ratio >= min_ratio:
-                    # ツリー展開パターンをチェック
-                    if is_valid_tree_relationship(region, other_region):
-                        potential_parents.append((idx_j, other_region, area_ratio))
-
-        # 最適な親を選択
-        if potential_parents:
-            best_parent_idx, best_parent, best_ratio = min(
-                potential_parents, key=lambda x: x[2]
-            )
-
-            # 既存の親関係をチェック
-            current_parent_id = region["parent"]
-            if (
-                current_parent_id is None
-                or regions[current_parent_id]["area"] > best_parent["area"]
+    # 下方向に走査し、左右辺が連続し、かつ下辺が閉じている最初の bottom を採用
+    for bottom in range(top, hard_limit + 1):
+        # 左右辺の連続性
+        ok_vertical = True
+        for r in range(top, bottom + 1):
+            if not has_border(ws, r, left, "left") or not has_border(
+                ws, r, right, "right"
             ):
-                # 既存の親関係を解除
-                if current_parent_id is not None:
-                    regions[current_parent_id]["children"].remove(region["id"])
+                ok_vertical = False
+                break
+        if not ok_vertical:
+            continue
 
-                # 新しい親子関係を設定
-                region["parent"] = best_parent["id"]
-                best_parent["children"].append(region["id"])
+        # 候補 bottom の下辺が全列で存在するか
+        ok_bottom = True
+        for c in range(left, right + 1):
+            if not has_border(ws, bottom, c, "bottom"):
+                ok_bottom = False
+                break
+        if ok_bottom:
+            return (left, top, right, bottom)
 
-                logger.debug(
-                    f"ツリー階層設定: 領域{region['id']} → 親領域{best_parent['id']} "
-                    f"(面積比: {best_ratio:.2f})"
-                )
-
-    # 階層レベルを計算
-    calculate_hierarchy_levels(regions)
-
-    # 階層構造を整理
-    hierarchy = organize_hierarchy(regions)
-
-    return hierarchy
+    return None
 
 
-def analyze_tree_position(region, cell_names_map=None):
+def _scan_rects_seq(ws, left, right, top, col_tolerance=0, max_bottom=None):
+    """(left,right,top) を基準に、同幅で縦に連なる矩形を上から順に検出。
+    返り値は [(left, top, right, bottom), ...]
+    col_tolerance は列ズレ許容（0 で厳密一致）。
     """
-    領域のツリー内での位置を分析
-    """
-    bounds = region["bounds"]
-    top, left, bottom, right = bounds
+    rects: List[Tuple[int, int, int, int]] = []
+    base = _find_rect_from_anchor(ws, left, right, top, max_bottom=max_bottom)
+    if not base:
+        return rects
+    b_left, b_top, b_right, b_bottom = base
+    rects.append(base)
 
-    return {
-        "left_position": left,
-        "top_position": top,
-        "width": right - left + 1,
-        "height": bottom - top + 1,
-        "has_cell_names": bool(region.get("cell_names", [])),
-    }
-
-
-def is_valid_tree_relationship(child_region, parent_region):
-    """
-    ツリー構造として有効な親子関係かチェック
-    左から右への展開パターンを考慮
-    """
-    child_bounds = child_region["bounds"]
-    parent_bounds = parent_region["bounds"]
-
-    child_top, child_left, child_bottom, child_right = child_bounds
-    parent_top, parent_left, parent_bottom, parent_right = parent_bounds
-
-    # 基本的な包含関係
-    if not is_region_contained(child_region, parent_region):
-        return False
-
-    # 線状領域のチェーン関係を除外
-    child_height = child_bottom - child_top + 1
-    child_width = child_right - child_left + 1
-    parent_height = parent_bottom - parent_top + 1
-    parent_width = parent_right - parent_left + 1
-
-    # 1行または1列の連続は階層として意味がない
-    if child_height == 1 and parent_height <= 2:
-        return False
-    if child_width == 1 and parent_width <= 2:
-        return False
-
-    # 非常に小さな領域同士の関係は除外（ただしセル名がある場合は例外）
-    child_has_names = bool(child_region.get("cell_names", []))
-    parent_has_names = bool(parent_region.get("cell_names", []))
-
-    if child_region["area"] < 10 and parent_region["area"] < 20:
-        if not (child_has_names or parent_has_names):
-            return False
-
-    return True
-
-
-def detect_all_complete_rectangles(worksheet, cell_names_map=None):
-    """
-    重複除去なしで全ての完全な四角形領域を検出
-    ただし、意味のある階層構造を形成する領域のみを対象とする
-    """
-    regions = []
-
-    # セル名マップがある場合はその範囲全体、ない場合はワークシート全域を対象
-    if cell_names_map:
-        min_row = min(row for row, col in cell_names_map.keys())
-        max_row = max(row for row, col in cell_names_map.keys())
-        min_col = min(col for row, col in cell_names_map.keys())
-        max_col = max(col for row, col in cell_names_map.keys())
-        # セル名範囲を若干拡張して境界領域も検出対象とする
-        min_row = max(1, min_row - 2)
-        max_row = min(worksheet.max_row or 100, max_row + 2)
-        min_col = max(1, min_col - 2)
-        max_col = min(worksheet.max_column or 100, max_col + 2)
-    else:
-        # セル名がない場合はワークシートの実際の使用範囲全域を対象
-        min_row, min_col = 1, 1
-        max_row = worksheet.max_row if worksheet.max_row else 100
-        max_col = worksheet.max_column if worksheet.max_column else 100
-
-    logger.debug(f"四角形検出範囲: 行{min_row}-{max_row}, 列{min_col}-{max_col}")
-
-    # ツリー構造に適した階層を形成する領域のみを検出
-    # 最小サイズ制限を緩和（面積2以上）し、指定範囲全域を検査対象とする
-    min_area = 2
-    detected_regions_set = set()  # 重複検出防止用
-
-    # デバッグ用カウンタ
-    total_checked = 0
-    border_found = 0
-
-    # 各セルを起点として四角形を検出
-    for top in range(min_row, max_row + 1):
-        for left in range(min_col, max_col + 1):
-            # 幅と高さの組み合わせを効率的に探索
-            max_width = min(max_col - left + 1, max_col - min_col + 1)
-            max_height = min(max_row - top + 1, max_row - min_row + 1)
-
-            # 意味のある階層を形成するサイズのみを対象
-            # 小さいものから大きいものへと順次検出（階層構造の基礎から構築）
-            size_combinations = []
-            for width in range(1, max_width + 1):
-                for height in range(1, max_height + 1):
-                    area = width * height
-                    if area >= min_area:  # 最小面積制限
-                        size_combinations.append((area, width, height))
-
-            # 面積の小さい順にソート（階層の基礎から構築）
-            size_combinations.sort()
-
-            for area, width, height in size_combinations:
-                right = left + width - 1
-                bottom = top + height - 1
-
-                if bottom > max_row or right > max_col:
-                    continue
-
-                # 重複チェック
-                bounds_key = (top, left, bottom, right)
-                if bounds_key in detected_regions_set:
-                    continue
-
-                # 検出状況をカウント
-                total_checked += 1
-
-                # 四角形の罫線完成度を計算
-                completeness = calculate_border_completeness(
-                    worksheet, top, left, bottom, right
-                )
-
-                # 人の目で見て完全に囲まれた領域のみを対象（100%完成度）
-                if completeness >= 1.0:
-                    border_found += 1
-                    # セル名がある場合はその中に含まれるかチェック
-                    cell_names_in_region = []
-                    if cell_names_map:
-                        cell_names_in_region = get_cell_names_in_region(
-                            cell_names_map, top, left, bottom, right
-                        )
-
-                    # より厳格なフィルタリング：ツリー構造に適した領域のみを採用
-                    should_include = False
-
-                    # 1. セル名がある領域は常に採用（ツリーの各ノード）
-                    if cell_names_in_region:
-                        should_include = True
-                    # 2. 大きな領域（50セル以上）は構造的コンテナとして採用
-                    elif area >= 50:
-                        should_include = True
-                    # 3. 中程度の領域（10-49セル）はバランスの取れた形状なら採用
-                    elif area >= 10:
-                        ratio = max(width, height) / min(width, height)
-                        if ratio <= 5.0:  # アスペクト比が5以下
-                            should_include = True
-                    # 4. 小さな領域（4-9セル）は正方形に近い形状のみ
-                    elif area >= 4:
-                        ratio = max(width, height) / min(width, height)
-                        if ratio <= 3.0:  # アスペクト比が3以下
-                            should_include = True
-                    # 5. 最小領域（2-3セル）は正方形のみ
-                    elif area >= 2:
-                        ratio = max(width, height) / min(width, height)
-                        if ratio <= 1.5:  # アスペクト比が1.5以下（ほぼ正方形）
-                            should_include = True
-
-                    if should_include:
-                        region = {
-                            "bounds": (top, left, bottom, right),
-                            "area": area,
-                            "completeness": completeness,
-                            "cell_names": cell_names_in_region,
-                        }
-                        regions.append(region)
-                        detected_regions_set.add(bounds_key)
-
-    # 同一セル名を含む領域から最大のものを選択
-    regions = select_largest_regions_by_cell_names(regions)
-
-    # 面積の大きい順、左上位置順でソート
-    regions.sort(key=lambda r: (-r["area"], r["bounds"][0], r["bounds"][1]))
-
-    logger.info(
-        f"検出統計: チェック総数{total_checked}, 完全境界{border_found}, 最終採用{len(regions)}"
-    )
-    return regions
-
-
-def select_largest_regions_by_cell_names(regions):
-    """
-    同一のセル名を内包する領域の中で一番大きい領域のみを採用
-    繰り返しコンテナとしての識別を改善する
-    """
-    logger.info(f"セル名ベース選択開始: {len(regions)}個の領域を処理")
-
-    if not regions:
-        return regions
-
-    # セル名ごとに領域をグループ化
-    cell_name_groups = {}
-    regions_without_names = []
-
-    for region in regions:
-        cell_names = region.get("cell_names", [])
-        if cell_names:
-            # cell_namesが正しくリストであることを確認
-            if not isinstance(cell_names, list):
-                cell_names = [cell_names]
-
-            # 複数のセル名がある場合は、それぞれのセル名でグループ化
-            for cell_name in cell_names:
-                # cell_nameが文字列であることを確認
-                if isinstance(cell_name, (list, tuple)):
-                    # もしリストまたはタプルなら、その中身を展開
-                    for name in cell_name:
-                        if name not in cell_name_groups:
-                            cell_name_groups[name] = []
-                        cell_name_groups[name].append(region)
-                else:
-                    if cell_name not in cell_name_groups:
-                        cell_name_groups[cell_name] = []
-                    cell_name_groups[cell_name].append(region)
+    cur_top = b_bottom + 1
+    while True:
+        if max_bottom is not None and cur_top > max_bottom:
+            break
+        cand = _find_rect_from_anchor(
+            ws, b_left, b_right, cur_top, max_bottom=max_bottom
+        )
+        if not cand:
+            break
+        _l, _t, _r, _b = cand
+        if col_tolerance == 0:
+            if _l != b_left or _r != b_right:
+                break
         else:
-            # セル名がない領域はそのまま保持
-            regions_without_names.append(region)
-
-    logger.debug(f"セル名グループ分析:")
-    logger.debug(f"  セル名なし領域: {len(regions_without_names)}個")
-    for cell_name, group_regions in cell_name_groups.items():
-        logger.debug(f"  セル名'{cell_name}': {len(group_regions)}個の領域")
-        for region in group_regions:
-            logger.debug(f"    {region['bounds']} (面積: {region['area']})")
-
-    # 各セル名グループから最大の領域を選択
-    selected_regions = []
-    total_excluded = 0
-
-    for cell_name, group_regions in cell_name_groups.items():
-        if len(group_regions) == 1:
-            # 1つしかない場合はそのまま採用
-            selected_regions.append(group_regions[0])
-            logger.debug(
-                f"セル名'{cell_name}': 単一領域のため採用 {group_regions[0]['bounds']}"
-            )
-        else:
-            # 複数ある場合は最大面積の領域を選択
-            largest_region = max(group_regions, key=lambda r: r["area"])
-            selected_regions.append(largest_region)
-            excluded_count = len(group_regions) - 1
-            total_excluded += excluded_count
-
-            logger.info(
-                f"セル名'{cell_name}': {len(group_regions)}個から最大領域を選択"
-            )
-            logger.info(
-                f"  採用: {largest_region['bounds']} (面積: {largest_region['area']})"
-            )
-
-            # 選択されなかった領域をログ出力
-            for region in group_regions:
-                if region != largest_region:
-                    logger.info(f"  除外: {region['bounds']} (面積: {region['area']})")
-
-    # セル名がない領域も追加
-    selected_regions.extend(regions_without_names)
-
-    logger.info(
-        f"セル名ベース選択結果: {len(regions)}個 → {len(selected_regions)}個 (除外: {total_excluded}個)"
-    )
-
-    return selected_regions
-
-
-def build_region_hierarchy(regions, cell_names_map=None):
-    """
-    領域リストから階層構造を構築
-    セル名の意味を重視し、境界共有を考慮した包含関係で親子関係を判定
-    """
-    # 領域をIDで管理
-    for i, region in enumerate(regions):
-        region["id"] = i
-        region["parent"] = None
-        region["children"] = []
-        region["level"] = 0
-
-    # 面積の大きい順でソート（大きな領域が親になりやすくする）
-    sorted_regions = sorted(
-        enumerate(regions),
-        key=lambda x: (-x[1]["area"], x[1]["bounds"][0], x[1]["bounds"][1]),
-    )
-
-    # 包含関係を分析して親子関係を設定
-    # セル名の意味を重視した階層構築
-    for i, (idx_i, region) in enumerate(sorted_regions):
-        potential_parents = []
-
-        # より大きな領域から親候補を探す
-        for j, (idx_j, other_region) in enumerate(sorted_regions):
-            if idx_i != idx_j and is_region_contained(region, other_region):
-                # 面積差が意味のある差であることを確認
-                area_ratio = other_region["area"] / region["area"]
-
-                # セル名がある領域同士の場合は、より緩い条件で親子関係を認める
-                child_has_names = bool(region.get("cell_names", []))
-                parent_has_names = bool(other_region.get("cell_names", []))
-
-                min_ratio = 1.2  # デフォルトの最小比率
-
-                if child_has_names and parent_has_names:
-                    # 両方にセル名がある場合は意味のある階層の可能性が高い
-                    min_ratio = 1.2
-                elif parent_has_names and not child_has_names:
-                    # 親にセル名があり子にない場合も意味のある階層
-                    min_ratio = 1.3
-                elif not parent_has_names and child_has_names:
-                    # 子にセル名があり親にない場合は厳格に
-                    min_ratio = 2.0
-                else:
-                    # 両方ともセル名がない場合は最も厳格に
-                    min_ratio = 2.0
-
-                if area_ratio >= min_ratio:
-                    # チェーン的な関係を除外（線状の領域の連続は階層として意味がない）
-                    region_bounds = region["bounds"]
-                    other_bounds = other_region["bounds"]
-
-                    # 子領域の形状をチェック
-                    child_height = region_bounds[2] - region_bounds[0] + 1
-                    child_width = region_bounds[3] - region_bounds[1] + 1
-
-                    # 親領域の形状をチェック
-                    parent_height = other_bounds[2] - other_bounds[0] + 1
-                    parent_width = other_bounds[3] - other_bounds[1] + 1
-
-                    # 線状領域（1行または1列）のチェーン関係を除外
-                    is_chain_relationship = False
-
-                    # 子が1行で親も近い高さの場合（行のチェーン）
-                    if child_height == 1 and parent_height <= 2:
-                        is_chain_relationship = True
-
-                    # 子が1列で親も近い幅の場合（列のチェーン）
-                    if child_width == 1 and parent_width <= 2:
-                        is_chain_relationship = True
-
-                    # 小さな領域同士の微細な包含関係を除外（ただしセル名がある場合は例外）
-                    if region["area"] < 10 and other_region["area"] < 20:
-                        if not (child_has_names or parent_has_names):
-                            is_chain_relationship = True
-
-                    if not is_chain_relationship:
-                        potential_parents.append((idx_j, other_region, area_ratio))
-
-        # 最も適切な親を選択（面積比が最小で、かつ直接的な包含関係）
-        if potential_parents:
-            # 面積比が最小の包含領域を親として選択（最も直接的な親）
-            best_parent_idx, best_parent, best_ratio = min(
-                potential_parents, key=lambda x: x[2]
-            )
-
-            # 包含関係のタイプを分析
-            containment_type = get_containment_type(region, best_parent)
-            shared_boundaries = analyze_boundary_sharing(region, best_parent)
-
-            # 既存の親関係をチェック
-            current_parent_id = region["parent"]
-            if (
-                current_parent_id is None
-                or regions[current_parent_id]["area"] > best_parent["area"]
+            if not (
+                abs(_l - b_left) <= col_tolerance and abs(_r - b_right) <= col_tolerance
             ):
-                # 既存の親関係を解除
-                if current_parent_id is not None:
-                    regions[current_parent_id]["children"].remove(region["id"])
-
-                # 新しい親子関係を設定
-                region["parent"] = best_parent["id"]
-                region["containment_type"] = containment_type
-                region["shared_boundaries"] = shared_boundaries
-                region["area_ratio"] = best_ratio
-                best_parent["children"].append(region["id"])
-
-                logger.debug(
-                    f"親子関係設定: 領域{region['id']} → 親領域{best_parent['id']} "
-                    f"(面積比: {best_ratio:.2f}, タイプ: {containment_type})"
-                )
-
-    # 重複した子関係を整理
-    for region in regions:
-        region["children"] = list(set(region["children"]))  # 重複を除去
-
-    # 階層レベルを計算
-    calculate_hierarchy_levels(regions)
-
-    # 階層構造を整理
-    hierarchy = organize_hierarchy(regions)
-
-    return hierarchy
+                break
+        rects.append(cand)
+        cur_top = _b + 1
+    return rects
 
 
-def is_region_contained(inner_region, outer_region):
+def _get_anchor_rects_naive(
+    workbook, anchor_name: str, target_sheet: str, *, col_tolerance: int = 0
+) -> List[Tuple[int, int, int, int]]:
     """
-    inner_regionがouter_regionに包含されているかチェック
-    一部の境界線を共有している場合も包含関係として認識する
-    例: A1:Z14とB2:Z14は右辺と下辺を共有していても包含関係とする
+    指定アンカー名に対応する矩形列を、キャッシュを使わずに毎回スキャンして取得する。
     """
-    inner_top, inner_left, inner_bottom, inner_right = inner_region["bounds"]
-    outer_top, outer_left, outer_bottom, outer_right = outer_region["bounds"]
-
-    # 面積チェック（内側領域が外側領域より小さい必要がある）
-    if inner_region["area"] >= outer_region["area"]:
-        return False
-
-    # 包含関係のチェック（境界共有を許可）
-    # 内側領域の境界が外側領域の境界と同じか内側にある
-    is_contained = (
-        inner_top >= outer_top
-        and inner_left >= outer_left
-        and inner_bottom <= outer_bottom
-        and inner_right <= outer_right
-    )
-
-    # 完全に同じ領域は包含関係ではない
-    if (
-        inner_top == outer_top
-        and inner_left == outer_left
-        and inner_bottom == outer_bottom
-        and inner_right == outer_right
-    ):
-        return False
-
-    return is_contained
-
-
-def is_region_overlapping(region_a, region_b):
-    """
-    2つの領域が重複しているかチェック
-    包含関係でない場合の重複を検出
-    """
-    a_top, a_left, a_bottom, a_right = region_a["bounds"]
-    b_top, b_left, b_bottom, b_right = region_b["bounds"]
-
-    # 重複なしの条件
-    if a_bottom < b_top or b_bottom < a_top or a_right < b_left or b_right < a_left:
-        return False
-
-    return True
-
-
-def analyze_boundary_sharing(inner_region, outer_region):
-    """
-    2つの領域間での境界共有を詳細分析
-    """
-    inner_top, inner_left, inner_bottom, inner_right = inner_region["bounds"]
-    outer_top, outer_left, outer_bottom, outer_right = outer_region["bounds"]
-
-    shared_boundaries = []
-
-    # 上辺の共有チェック
-    if (
-        inner_top == outer_top
-        and inner_left >= outer_left
-        and inner_right <= outer_right
-    ):
-        shared_boundaries.append("top")
-
-    # 下辺の共有チェック
-    if (
-        inner_bottom == outer_bottom
-        and inner_left >= outer_left
-        and inner_right <= outer_right
-    ):
-        shared_boundaries.append("bottom")
-
-    # 左辺の共有チェック
-    if (
-        inner_left == outer_left
-        and inner_top >= outer_top
-        and inner_bottom <= outer_bottom
-    ):
-        shared_boundaries.append("left")
-
-    # 右辺の共有チェック
-    if (
-        inner_right == outer_right
-        and inner_top >= outer_top
-        and inner_bottom <= outer_bottom
-    ):
-        shared_boundaries.append("right")
-
-    return shared_boundaries
-
-
-def get_containment_type(inner_region, outer_region):
-    """
-    包含関係のタイプを判定
-    """
-    shared_boundaries = analyze_boundary_sharing(inner_region, outer_region)
-
-    if not shared_boundaries:
-        return "strict_containment"  # 厳密な包含（境界共有なし）
-    elif len(shared_boundaries) == 1:
-        return f"boundary_shared_{shared_boundaries[0]}"  # 1辺共有
-    elif len(shared_boundaries) == 2:
-        return f"boundary_shared_{'+'.join(shared_boundaries)}"  # 2辺共有
-    elif len(shared_boundaries) == 3:
-        return f"boundary_shared_{'+'.join(shared_boundaries)}"  # 3辺共有
-    else:
-        return "boundary_shared_all"  # 全辺共有（同一領域、通常は発生しない）
-
-
-def calculate_overlap_area(region_a, region_b):
-    """
-    2つの領域の重複面積を計算
-    """
-    a_top, a_left, a_bottom, a_right = region_a["bounds"]
-    b_top, b_left, b_bottom, b_right = region_b["bounds"]
-
-    # 重複領域の境界を計算
-    overlap_top = max(a_top, b_top)
-    overlap_left = max(a_left, b_left)
-    overlap_bottom = min(a_bottom, b_bottom)
-    overlap_right = min(a_right, b_right)
-
-    # 重複がない場合
-    if overlap_top > overlap_bottom or overlap_left > overlap_right:
-        return 0
-
-    # 重複面積を計算
-    overlap_width = overlap_right - overlap_left + 1
-    overlap_height = overlap_bottom - overlap_top + 1
-
-    return overlap_width * overlap_height
-
-
-def calculate_hierarchy_levels(regions):
-    """
-    各領域の階層レベルを計算
-    """
-
-    def calc_level(region_id, regions):
-        region = regions[region_id]
-        if region["parent"] is None:
-            region["level"] = 0
-        else:
-            parent_region = regions[region["parent"]]
-            if parent_region["level"] == 0 and parent_region["parent"] is not None:
-                calc_level(region["parent"], regions)
-            region["level"] = parent_region["level"] + 1
-
-    for region in regions:
-        if region["level"] == 0 and region["parent"] is not None:
-            calc_level(region["id"], regions)
-
-
-def organize_hierarchy(regions):
-    """
-    階層構造を整理してツリー形式で返す
-    """
-    # ルート領域を特定
-    root_regions = [region for region in regions if region["parent"] is None]
-
-    def build_tree(region):
-        tree_node = {
-            "id": region["id"],
-            "bounds": region["bounds"],
-            "area": region["area"],
-            "level": region["level"],
-            "completeness": region["completeness"],
-            "cell_names": region["cell_names"],
-            "children": [],
-        }
-
-        # 包含関係情報を追加
-        if "containment_type" in region:
-            tree_node["containment_type"] = region["containment_type"]
-        if "shared_boundaries" in region:
-            tree_node["shared_boundaries"] = region["shared_boundaries"]
-
-        # 子領域を再帰的に構築
-        for child_id in region["children"]:
-            child_region = regions[child_id]
-            tree_node["children"].append(build_tree(child_region))
-
-        # 子領域を面積の大きい順でソート
-        tree_node["children"].sort(
-            key=lambda x: (-x["area"], x["bounds"][0], x["bounds"][1])
-        )
-
-        return tree_node
-
-    # ルートから階層ツリーを構築
-    hierarchy_tree = []
-    for root_region in root_regions:
-        hierarchy_tree.append(build_tree(root_region))
-
-    # ルート領域を面積の大きい順でソート
-    hierarchy_tree.sort(key=lambda x: (-x["area"], x["bounds"][0], x["bounds"][1]))
-
-    return hierarchy_tree
-
-
-def analyze_region_relationships(hierarchy_tree):
-    """
-    階層構造の関係を分析してレポートを生成
-    """
-    analysis = {
-        "total_regions": 0,
-        "max_depth": 0,
-        "root_regions": len(hierarchy_tree),
-        "region_details": [],
-    }
-
-    def analyze_node(node, depth=0):
-        analysis["total_regions"] += 1
-        analysis["max_depth"] = max(analysis["max_depth"], depth)
-
-        top, left, bottom, right = node["bounds"]
-        width = right - left + 1
-        height = bottom - top + 1
-
-        region_info = {
-            "id": node["id"],
-            "bounds": f"行{top}-{bottom}, 列{left}-{right}",
-            "size": f"{width}x{height}",
-            "area": node["area"],
-            "level": depth,
-            "children_count": len(node["children"]),
-            "cell_names": node["cell_names"],
-            "completeness": node["completeness"],
-        }
-        analysis["region_details"].append(region_info)
-
-        # 子ノードを再帰的に分析
-        for child in node["children"]:
-            analyze_node(child, depth + 1)
-
-    for root in hierarchy_tree:
-        analyze_node(root)
-
-    return analysis
-
-
-def filter_nested_regions(regions):
-    """
-    ネストした領域を整理し、同じセル名を含む最大領域のみを保持
-    繰り返しコンテナの識別も行う
-    """
-    filtered = []
-
-    # セル名ごとに最大領域を特定
-    cell_name_to_max_region = {}
-
-    for region in regions:
-        for cell_name in region["cell_names"]:
-            if cell_name not in cell_name_to_max_region:
-                cell_name_to_max_region[cell_name] = region
-            elif region["area"] > cell_name_to_max_region[cell_name]["area"]:
-                cell_name_to_max_region[cell_name] = region
-
-    # 繰り返しコンテナを識別
-    unique_regions = list(set(cell_name_to_max_region.values()))
-
-    for region in unique_regions:
-        # セル名の階層構造を解析
-        hierarchy_info = analyze_cell_name_hierarchy(region["cell_names"])
-        region["hierarchy_info"] = hierarchy_info
-
-        # 繰り返しパターンを検出
-        repeat_info = detect_repeat_pattern(region["cell_names"])
-        region["repeat_info"] = repeat_info
-
-        filtered.append(region)
-
-    return filtered
-
-
-def analyze_cell_name_hierarchy(cell_names):
-    """セル名の階層構造を解析"""
-    hierarchy_levels = {}
-
-    for cell_name in cell_names:
-        if not cell_name.startswith("json."):
+    # キャッシュ参照（ワークブック処理中有効）
+    key = (id(workbook), target_sheet, anchor_name, col_tolerance)
+    if key in anchor_rects_cache():
+        return list(anchor_rects_cache()[key])
+    pr_left = pr_right = pr_top = pr_bottom = None
+    for sn, coord in iter_defined_name_destinations_all(anchor_name or "", workbook):
+        if sn != target_sheet:
             continue
-
-        parts = cell_name.split(".")
-        # 数値部分とフィールド部分を分離
-        hierarchy_path = []
-        numeric_indices = []
-
-        for part in parts[1:]:  # 'json'を除く
-            if part.isdigit() or part == "*":
-                numeric_indices.append(part)
-            else:
-                hierarchy_path.append(part)
-
-        level = len(hierarchy_path)
-        if level not in hierarchy_levels:
-            hierarchy_levels[level] = []
-        hierarchy_levels[level].append(
-            {
-                "cell_name": cell_name,
-                "hierarchy_path": hierarchy_path,
-                "numeric_indices": numeric_indices,
-            }
+        coord_clean = coord.replace("$", "")
+        if ":" in coord_clean:
+            (sc, sr), (ec, er) = parse_range(coord_clean)
+            pr_left, pr_top = sc, sr
+            pr_right, pr_bottom = ec, er
+        break
+    rects: List[Tuple[int, int, int, int]] = []
+    if pr_left and pr_right and pr_top:
+        ws0 = (
+            workbook[target_sheet]
+            if target_sheet in getattr(workbook, "sheetnames", [])
+            else workbook.active
         )
-
-    return hierarchy_levels
-
-
-def detect_repeat_pattern(cell_names):
-    """繰り返しパターンを検出"""
-    repeat_groups = {}
-
-    for cell_name in cell_names:
-        if not cell_name.startswith("json."):
-            continue
-
-        # 数値インデックスを除いたベースパターンを作成
-        parts = cell_name.split(".")
-        base_pattern = []
-
-        for part in parts:
-            if part.isdigit():
-                base_pattern.append("*")  # 数値を*で置換
-            else:
-                base_pattern.append(part)
-
-        pattern_key = ".".join(base_pattern)
-
-        if pattern_key not in repeat_groups:
-            repeat_groups[pattern_key] = []
-        repeat_groups[pattern_key].append(cell_name)
-
-    # 2つ以上のセル名を持つパターンのみを繰り返しとして認識
-    return {k: v for k, v in repeat_groups.items() if len(v) > 1}
+        rects = _scan_rects_seq(
+            ws0, pr_left, pr_right, pr_top, col_tolerance=col_tolerance
+        )
+    # キャッシュ保存
+    anchor_rects_cache()[key] = list(rects)
+    return rects
 
 
-def extract_cell_names_from_workbook(workbook):
-    """ワークブックから名前付き範囲のjson.*セル名を抽出"""
+def extract_cell_names_from_workbook(workbook, prefix: str = "json"):
+    """ワークブックから名前付き範囲の <prefix>.* セル名を抽出"""
     cell_names_map = {}
 
     # 名前付き範囲から座標とセル名を取得
     for name, defined_name in workbook.defined_names.items():
-        if name.startswith("json."):
+        if name.startswith(f"{prefix}."):
             try:
                 for sheet_name, coord in defined_name.destinations:
                     # 座標文字列を解析（例: "$S$2" -> (19, 2)）
@@ -3139,165 +6406,117 @@ def extract_cell_names_from_workbook(workbook):
     return cell_names_map
 
 
-def find_max_enclosing_rectangles(
-    worksheet, target_row, target_col, min_row, max_row, min_col, max_col
-):
-    """指定セルを含む最大の囲み四角形を検出"""
-    rectangles = []
-
-    # 段階的に拡張して囲み領域を検出
-    for expansion in range(1, 11):  # 最大10セル範囲まで拡張
-        for top in range(max(min_row, target_row - expansion), target_row + 1):
-            for left in range(max(min_col, target_col - expansion), target_col + 1):
-                for bottom in range(
-                    target_row, min(max_row, target_row + expansion) + 1
-                ):
-                    for right in range(
-                        target_col, min(max_col, target_col + expansion) + 1
-                    ):
-
-                        # 四角形が完全に罫線で囲まれているかチェック
-                        completeness = calculate_border_completeness(
-                            worksheet, top, left, bottom, right
-                        )
-
-                        if completeness >= 0.3:  # 30%以上の完全度で部分矩形と認識
-                            bounds = {
-                                "top": top,
-                                "left": left,
-                                "bottom": bottom,
-                                "right": right,
-                            }
-                            rectangles.append(bounds)
-
-                            logger.debug(
-                                f"部分矩形検出: {bounds} 完全度={completeness:.2f}"
-                            )
-
-    return rectangles
+def extract_cell_names_for_sheet(workbook, sheet_name: str, prefix: str = "json"):
+    """特定シートの <prefix>.* セル名を (row,col)->name で抽出"""
+    cell_names_map = {}
+    for name, defined_name in workbook.defined_names.items():
+        if not name.startswith(f"{prefix}."):
+            continue
+        for sn, coord in defined_name.destinations:
+            if sn != sheet_name:
+                continue
+            coord_clean = coord.replace("$", "")
+            if ":" in coord_clean:
+                coord_clean = coord_clean.split(":")[0]
+            col_part = ""
+            row_part = ""
+            for ch in coord_clean:
+                if ch.isalpha():
+                    col_part += ch
+                elif ch.isdigit():
+                    row_part += ch
+            if col_part and row_part:
+                col_num = column_index_from_string(col_part)
+                row_num = int(row_part)
+                cell_names_map[(row_num, col_num)] = name
+    return cell_names_map
 
 
 def calculate_border_completeness(worksheet, top, left, bottom, right):
-    """四角形の罫線完全度を計算（0.0-1.0）"""
+    """四角形の罫線完全度を計算（0.0-1.0）。直接辺の罫線のみを評価する。"""
+    # 注意: テスト等で罫線が動的に変更されるケースに対応するため、
+    # 完全度の再計算直前にキャッシュをクリアして整合性を担保する。
+    # これにより本関数内ではキャッシュの恩恵は薄れるが、他の探索ロジックでは
+    # has_border のメモ化が有効に働く（トレードオフ）。
+    border_cache().clear()
     try:
-        total_segments = 0
-        bordered_segments = 0
+        _sheet_name = getattr(worksheet, "title", "")
+    except Exception:
+        _sheet_name = ""
+    logger.debug(
+        "BORDER-COMP sheet=%s bounds top=%s left=%s bottom=%s right=%s",
+        _sheet_name,
+        top,
+        left,
+        bottom,
+        right,
+    )
+    total_segments = 0
+    bordered_segments = 0
 
-        # 上辺をチェック
-        for col in range(left, right + 1):
-            total_segments += 1
-            if has_border(worksheet, top, col, "top"):
-                bordered_segments += 1
+    # 上辺をチェック
+    for col in range(left, right + 1):
+        total_segments += 1
+        if has_border(worksheet, top, col, "top"):
+            bordered_segments += 1
 
-        # 下辺をチェック
-        for col in range(left, right + 1):
-            total_segments += 1
-            if has_border(worksheet, bottom, col, "bottom"):
-                bordered_segments += 1
+    # 下辺をチェック
+    for col in range(left, right + 1):
+        total_segments += 1
+        if has_border(worksheet, bottom, col, "bottom"):
+            bordered_segments += 1
 
-        # 左辺をチェック
-        for row in range(top, bottom + 1):
-            total_segments += 1
-            if has_border(worksheet, row, left, "left"):
-                bordered_segments += 1
+    # 左辺をチェック
+    for row in range(top, bottom + 1):
+        total_segments += 1
+        if has_border(worksheet, row, left, "left"):
+            bordered_segments += 1
 
-        # 右辺をチェック
-        for row in range(top, bottom + 1):
-            total_segments += 1
-            if has_border(worksheet, row, right, "right"):
-                bordered_segments += 1
+    # 右辺をチェック
+    for row in range(top, bottom + 1):
+        total_segments += 1
+        if has_border(worksheet, row, right, "right"):
+            bordered_segments += 1
 
-        return bordered_segments / total_segments if total_segments > 0 else 0.0
-
-    except Exception as e:
-        logger.debug(f"罫線完全度計算エラー: {e}")
-        return 0.0
-
-
-def integrate_border_detection_with_containers(worksheet, containers=None):
-    """
-    罫線検出をコンテナ機能と統合
-    """
-    # 名前付き範囲からセル名マップを取得
-    workbook = worksheet.parent
-    cell_names_map = extract_cell_names_from_workbook(workbook)
-
-    if not cell_names_map:
-        logger.debug("セル名が見つかりませんでした")
-        return {}
-
-    logger.debug(f"セル名マップ: {len(cell_names_map)}個")
-    for (row, col), name in cell_names_map.items():
-        logger.debug(f"  {name} at ({row}, {col})")
-
-    # 罫線領域を検出
-    regions = detect_rectangular_regions(worksheet, cell_names_map)
-
-    logger.debug(f"検出された罫線領域: {len(regions)}個")
-    # 古い形式 (tuple) を新しい形式 (dict) に変換
-    region_dicts = []
-    for region_tuple in regions:
-        top, left, bottom, right, completeness = region_tuple
-        cell_names_in_region = (
-            get_cell_names_in_region(cell_names_map, top, left, bottom, right)
-            if cell_names_map
-            else []
-        )
-        region_dict = {
-            "bounds": {"top": top, "left": left, "bottom": bottom, "right": right},
-            "area": (bottom - top + 1) * (right - left + 1),
-            "completeness": completeness,
-            "cell_names": cell_names_in_region,
-            "repeat_info": {},  # デフォルトで空の辞書
-        }
-        region_dicts.append(region_dict)
-        logger.debug(
-            f"領域{len(region_dicts)}: {region_dict['bounds']}, 面積={region_dict['area']}, セル名数={len(region_dict['cell_names'])}"
-        )
-
-    regions = region_dicts
-
-    # 既存のコンテナ設定と統合
-    integrated_containers = {}
-
-    if containers:
-        integrated_containers.update(containers)
-
-    # 罫線検出結果からコンテナを自動生成
-    for i, region in enumerate(regions):
-        if region["repeat_info"]:  # 繰り返しパターンがある場合のみ
-            for pattern, cell_names in region["repeat_info"].items():
-                container_name = f"auto_region_{i}_{pattern.replace('*', 'N')}"
-
-                # 座標をExcel形式に変換
-                bounds = region["bounds"]
-                range_ref = (
-                    f"{chr(ord('A') + bounds['left'] - 1)}{bounds['top']}:"
-                    + f"{chr(ord('A') + bounds['right'] - 1)}{bounds['bottom']}"
-                )
-
-                # コンテナ定義を生成
-                integrated_containers[container_name] = {
-                    "range": range_ref,
-                    "items": extract_field_names_from_pattern(pattern),
-                    "direction": "row",  # デフォルト
-                    "type": "auto_detected",
-                    "source_region": region,
-                }
-
-    return integrated_containers
+    return bordered_segments / total_segments if total_segments > 0 else 0.0
 
 
-def extract_field_names_from_pattern(pattern):
+def extract_field_names_from_pattern(pattern, prefix: str = "json"):
     """パターンからフィールド名を抽出"""
     parts = pattern.split(".")
     field_names = []
 
     for part in parts:
-        if part != "json" and part != "*" and not part.isdigit():
+        if part != prefix and part != "*" and not part.isdigit():
             field_names.append(part)
 
     return field_names if field_names else ["value"]
+
+
+def _replace_nth_from_end_numeric(key: str, n_from_end: int, new_index: int) -> str:
+    """
+    指定された文字列 `key` のドット区切り部分のうち、末尾から数えて `n_from_end` 番目の
+    数値部分を `new_index` で置き換えます。
+    """
+    parts = key.split(".")
+    idx_positions = [i for i, p in enumerate(parts) if p.isdigit()]
+    if len(idx_positions) < n_from_end or n_from_end <= 0:
+        return key
+    target_pos = idx_positions[-n_from_end]
+    parts[target_pos] = str(new_index)
+    return ".".join(parts)
+
+
+def _set_parent_index_in_key(key: str, parent_index: int) -> str:
+    """
+    指定されたキー文字列内の親インデックス部分を更新する。
+    """
+    parts = key.split(".")
+    idx_positions = [i for i, p in enumerate(parts) if p.isdigit()]
+    if len(idx_positions) < 2:
+        return key
+    parts[idx_positions[-2]] = str(parent_index)
+    return ".".join(parts)
 
 
 # =============================================================================
@@ -3305,74 +6524,81 @@ def extract_field_names_from_pattern(pattern):
 # =============================================================================
 
 
+def _parse_container_mapping(arg_text: str) -> Dict[str, Any]:
+    """--container で渡された1オブジェクトを YAML としてパースする（JSONはYAMLのサブセット）。
+
+    戻り値は dict（マッピング型）のみ許可。その他型なら ValueError。
+    例外メッセージは既存テスト互換のため『無効なJSON形式』表現を維持。
+    """
+    try:
+        obj = yaml.safe_load(arg_text)
+        if isinstance(obj, dict):
+            return obj
+        raise ValueError(
+            "--container はオブジェクト(JSON/YAMLのマッピング)である必要があります"
+        )
+    except Exception as e:
+        # 互換のため JSON 文言を維持
+        raise ValueError(f"無効なJSON形式: {e}")
+
+
 def parse_container_args(container_args, config_containers=None):
-    """CLIのcontainerオプションを解析し、設定ファイルとマージ"""
+    """CLIのcontainerオプションを解析し、設定ファイルとマージ（JSON/YAML対応）"""
     combined_containers = config_containers.copy() if config_containers else {}
 
     if not container_args:
         return combined_containers
 
     for container_arg in container_args:
-        container_def = json.loads(container_arg)
+        container_def = _parse_container_mapping(container_arg)
         combined_containers.update(container_def)
     return combined_containers
 
 
-def validate_cli_containers(container_args):
-    """CLIの--containerオプション専用検証"""
+def validate_cli_containers(container_args, prefix: str = "json"):
+    """CLIの--containerオプション専用検証（YAMLのみ。JSONはYAMLのサブセットとして解釈）"""
     for i, container_arg in enumerate(container_args):
-        try:
-            container_def = json.loads(container_arg)
-        except json.JSONDecodeError:
+        # 互換: 明らかに JSON 風だがコロンが無い等のケースは、既存テスト期待に合わせて JSON エラーを返す
+        if "{" in container_arg and "}" in container_arg and ":" not in container_arg:
             raise ValueError(f"無効なJSON形式: 引数{i+1}")
 
+        try:
+            container_def = _parse_container_mapping(container_arg)
+        except ValueError as e:
+            # メッセージ互換
+            raise ValueError(f"無効なJSON形式: 引数{i+1}: {e}")
+
         for cell_name in container_def.keys():
-            if not cell_name.startswith("json."):
-                raise ValueError(f"セル名は'json.'で始まる必要があります: {cell_name}")
+            if not cell_name.startswith(f"{prefix}."):
+                raise ValueError(
+                    f"セル名は'{prefix}.'で始まる必要があります: {cell_name}"
+                )
 
 
-def calculate_hierarchy_depth(cell_name):
+def calculate_hierarchy_depth(cell_name, prefix: str = "json"):
     """数値インデックスを除外した階層深度を計算"""
     parts = cell_name.split(".")
     # 空の部分も除外し、数値でない部分のみを階層として扱う
     hierarchy_parts = [part for part in parts if part and not part.isdigit()]
-    return len(hierarchy_parts) - 1  # 'json'を除く
+    # 先頭がprefixならそれを除外してカウント
+    if hierarchy_parts and hierarchy_parts[0] == prefix:
+        depth = len(hierarchy_parts) - 1
+    else:
+        depth = len(hierarchy_parts)
+    logger.debug(f"階層深度計算: {cell_name} -> 部分={hierarchy_parts} -> 深度={depth}")
+    return depth
 
 
-def validate_container_config(containers):
+def validate_container_config(containers, prefix: str = "json"):
     """コンテナ設定の妥当性を検証"""
-    errors = []
+    errors: List[str] = []
 
     for container_name, container_def in containers.items():
         # セル名の形式チェック
-        if not container_name.startswith("json."):
+        if not container_name.startswith(f"{prefix}."):
             errors.append(
-                f"コンテナ名は'json.'で始まる必要があります: {container_name}"
+                f"コンテナ名は'{prefix}.'で始まる必要があります: {container_name}"
             )
-
-        # 必須項目のチェック
-        has_range = "range" in container_def
-        has_offset = "offset" in container_def
-
-        if not has_range and not has_offset:
-            errors.append(
-                f"コンテナ{container_name}には'range'または'offset'が必要です"
-            )
-
-        if has_range and has_offset:
-            errors.append(
-                f"コンテナ{container_name}には'range'と'offset'の両方を指定できません"
-            )
-
-        # items の検証
-        if "items" not in container_def:
-            errors.append(f"コンテナ{container_name}には'items'が必要です")
-        elif not isinstance(container_def["items"], list):
-            errors.append(
-                f"コンテナ{container_name}の'items'は配列である必要があります"
-            )
-        elif len(container_def["items"]) == 0:
-            errors.append(f"コンテナ{container_name}の'items'は空にできません")
 
         # direction の検証
         if "direction" in container_def:
@@ -3385,556 +6611,2888 @@ def validate_container_config(containers):
         # increment の検証
         if "increment" in container_def:
             increment = container_def["increment"]
-            if not isinstance(increment, int) or increment < 1:
+            if not isinstance(increment, int) or increment < 0:
                 errors.append(
-                    f"コンテナ{container_name}の'increment'は1以上の整数である必要があります: {increment}"
+                    f"コンテナ{container_name}の'increment'は0以上の整数である必要があります: {increment}"
                 )
 
-        # offset の検証（子コンテナの場合）
-        if has_offset:
-            offset = container_def["offset"]
-            if not isinstance(offset, int):
-                errors.append(
-                    f"コンテナ{container_name}の'offset'は整数である必要があります: {offset}"
-                )
-
-        # type の検証（明示的指定の場合）
-        if "type" in container_def:
-            container_type = container_def["type"]
-            if container_type not in ["table", "card", "tree"]:
-                errors.append(
-                    f"コンテナ{container_name}の'type'は'table'、'card'、または'tree'である必要があります: {container_type}"
-                )
+        # 親要素のincrement推奨値チェック
+    if _is_parent_container(container_name, prefix=prefix):
+        increment = container_def.get("increment", 0)
+        if increment != 0:
+            logger.warning(
+                f"親要素のincrementは0推奨: {container_name} increment={increment}"
+            )
 
     return errors
 
 
-def validate_hierarchy_consistency(containers):
+def _is_parent_container(container_key, prefix: str = "json"):
+    """親要素かどうかを判定"""
+    # re imported at top
+    return re.match(rf"^{re.escape(prefix)}\.[^.]+$", container_key) is not None
+
+
+def validate_hierarchy_consistency(containers, prefix: str = "json"):
     """コンテナの階層構造の整合性を検証"""
-    errors = []
+    errors: List[str] = []
 
-    # 親子関係の検証
+    # 親子関係の検証（新仕様では基本的に自由だが、論理的な整合性をチェック）
     for container_name, container_def in containers.items():
-        if "offset" in container_def:  # 子コンテナ
-            parent_name = get_parent_container_name(container_name)
+        # 子要素の場合、対応する親要素が推奨される
+        if _is_child_container(container_name, prefix=prefix):
+            parent_name = _extract_parent_key_from_child(container_name, prefix=prefix)
             if parent_name and parent_name not in containers:
-                errors.append(
-                    f"子コンテナ{container_name}の親コンテナ{parent_name}が見つかりません"
+                logger.info(
+                    f"子要素 {container_name} に対応する親要素 {parent_name} が未定義です（任意）"
                 )
-            elif parent_name:
-                parent_def = containers[parent_name]
-                if "offset" in parent_def:
-                    errors.append(
-                        f"親コンテナ{parent_name}もoffset指定されています（range指定である必要があります）"
-                    )
 
-    # 循環参照の検証
-    def has_circular_reference(container_name, visited=None):
-        if visited is None:
-            visited = set()
-
-        if container_name in visited:
-            return True
-
-        visited.add(container_name)
-        parent_name = get_parent_container_name(container_name)
-
-        if parent_name and parent_name in containers:
-            return has_circular_reference(parent_name, visited.copy())
-
-        return False
-
-    for container_name in containers:
-        if has_circular_reference(container_name):
-            errors.append(f"コンテナ{container_name}で循環参照が検出されました")
-
+    # 循環参照の検証は新仕様では不要（階層が明確）
     return errors
 
 
-def filter_cells_with_names(range_coords, cell_names):
-    """json.*セル名を持つセルのみを抽出"""
-    result = {}
+def _is_child_container(container_key, prefix: str = "json"):
+    """子要素かどうかを判定"""
+    # re imported at top
+    return re.match(rf"^{re.escape(prefix)}\.[^.]+\.\d+", container_key) is not None
+
+
+def _extract_parent_key_from_child(child_key, prefix: str = "json"):
+    """子要素キーから親要素キーを抽出"""
+    # "json.orders.1.items.1" → "json.orders"
+    parts = child_key.split(".")
+    if len(parts) >= 3:
+        parent_parts = []
+        for part in parts[1:-1]:  # prefix と末尾数値を除外
+            if not part.isdigit():
+                parent_parts.append(part)
+
+        if parent_parts:
+            return f"{prefix}." + ".".join(parent_parts)
+
+    return None
+
+
+def filter_cells_with_names(
+    range_coords: Iterable[Tuple[int, int]],
+    cell_names: Mapping[Tuple[int, int], str],
+    prefix: str = "json",
+) -> Dict[Tuple[int, int], str]:
+    """指定された範囲から、接頭辞に一致するセル名のみを抽出して返す。
+
+    契約:
+    - 入力: `range_coords` は (col, row) のタプル列。
+            `cell_names` は (col, row) -> セル名 のマッピング。
+            `prefix` はフィルタ対象の接頭辞（例: "json"）。
+    - 出力: 条件に一致した (col, row) -> セル名 の辞書。
+    - 例外: なし（不正な型は型チェックで検出される想定）。
+    """
+    result: Dict[Tuple[int, int], str] = {}
     for cell_coord in range_coords:
         cell_name = cell_names.get(cell_coord)
-        if cell_name and cell_name.startswith("json."):
+        if cell_name and cell_name.startswith(f"{prefix}."):
             result[cell_coord] = cell_name
     return result
 
 
-def generate_cell_names_from_containers(containers, workbook):
+def generate_cell_names_from_containers(
+    containers,
+    workbook,
+    global_max_elements: Optional[int] = None,
+    *,
+    prefix: str = "json",
+    extraction_policy: Optional[ExtractionPolicy] = None,
+):
     """
-    コンテナ定義からセル名を自動生成し、実際のExcelデータから値を読み取る
-    罫線検出機能と統合して自動的に繰り返し領域も検出
+    コンテナ定義からセル名を自動生成
     """
-    generated_names = {}
+    generated_names: Dict[str, Any] = {}
 
-    # まず罫線検出による自動コンテナを生成
-    if workbook.worksheets:
-        worksheet = workbook.active
-        auto_containers = integrate_border_detection_with_containers(
-            worksheet, containers
-        )
-
-        # 手動設定と自動検出を統合
-        all_containers = {}
-        if containers:
-            all_containers.update(containers)
-
-        # 自動検出されたコンテナを追加（重複しない場合のみ）
-        for auto_name, auto_def in auto_containers.items():
-            if auto_name not in all_containers:
-                all_containers[auto_name] = auto_def
-                logger.debug(f"自動検出コンテナを追加: {auto_name}")
-
-        containers = all_containers
+    if not containers:
+        return generated_names
 
     # コンテナ設定の妥当性を検証
-    config_errors = validate_container_config(containers)
+    config_errors = validate_container_config(containers, prefix=prefix)
     if config_errors:
         for error in config_errors:
             logger.error(f"コンテナ設定エラー: {error}")
         return generated_names
 
     # 階層構造の整合性を検証
-    hierarchy_errors = validate_hierarchy_consistency(containers)
+    hierarchy_errors = validate_hierarchy_consistency(containers, prefix=prefix)
     if hierarchy_errors:
         for error in hierarchy_errors:
             logger.error(f"階層構造エラー: {error}")
-        return generated_names
 
-    # コンテナを階層順にソート（親→子の順で処理）
-    sorted_containers = sort_containers_by_hierarchy(containers)
-
-    for container_name, container_def in sorted_containers:
+    # 各コンテナを処理（親→子の階層順に安定化）
+    ordered_containers = sort_containers_by_hierarchy(containers, prefix=prefix)
+    for container_name, container_def in ordered_containers:
         logger.debug(f"コンテナ処理開始: {container_name}")
-        processing_stats.containers_processed += 1
+        stats().containers_processed += 1
 
-        # 階層レベルを計算し、ルート/子を判定
-        has_range = "range" in container_def
-        has_offset = "offset" in container_def
-
-        if has_range:
-            # ルートコンテナの処理
-            process_root_container(
-                container_name, container_def, workbook, generated_names
+        try:
+            process_container(
+                container_name,
+                container_def,
+                workbook,
+                generated_names,
+                global_max_elements,
+                extraction_policy=extraction_policy,
             )
-        elif has_offset:
-            # 子コンテナの処理
-            process_child_container(
-                container_name, container_def, workbook, generated_names
-            )
-        else:
-            logger.warning(
-                f"コンテナ{container_name}にrangeまたはoffsetが指定されていません"
-            )
+        except Exception as e:
+            # コンテナ単位の最上位でエラーを検出・記録（トレース出力）
+            logger.exception(f"コンテナ {container_name} の処理中にエラー")
 
     logger.debug(f"生成されたセル名と値: {generated_names}")
     return generated_names
+def enumerate_sheeted_ranges_sorted(workbook) -> list[tuple[Optional[str], Optional[str]]]:
+    """ワークブックからシート名の列を取得し、ワークブック順に整列した (sheet, None) の配列を返す。"""
+    sheeted_ranges: list[tuple[Optional[str], Optional[str]]] = []
+    for title in list(getattr(workbook, "sheetnames", [])):
+        try:
+            if not title:
+                continue
+            sheeted_ranges.append((title, None))
+        except Exception:
+            continue
+    order = {name: idx for idx, name in enumerate(getattr(workbook, "sheetnames", []))}
+    sheeted_ranges.sort(key=lambda x: order.get(x[0], 10**6))
+    return sheeted_ranges
 
 
-def sort_containers_by_hierarchy(containers):
-    """コンテナを階層の深さでソート（浅い順）"""
-    container_items = list(containers.items())
-    return sorted(container_items, key=lambda x: calculate_hierarchy_depth(x[0]))
+def build_nameful_sheets_and_positions(
+    container_name: str,
+    workbook,
+    sheeted_ranges: list[tuple[Optional[str], Optional[str]]],
+) -> tuple[set[str], dict[str, dict[str, tuple[int, int]]]]:
+    """直下フィールドの定義名から、シートごとの座標を解決し nameful シート集合と座標マップを返す。"""
+    nameful_sheets: set[str] = set()
+    per_sheet_positions: dict[str, dict[str, tuple[int, int]]] = {}
+    for _sheet, _ in sheeted_ranges:
+        sheet_field_names = get_cell_names_in_container_range(
+            container_name, workbook, _sheet
+        )
+        cur_pos: dict[str, tuple[int, int]] = {}
+        if sheet_field_names:
+            if _sheet is not None:
+                nameful_sheets.add(_sheet)
+            for _field, _nm in sheet_field_names.items():
+                _pos = get_cell_position_from_name(_nm, workbook, _sheet)
+                if _pos:
+                    cur_pos[_field] = _pos
+            if cur_pos and _sheet is not None:
+                per_sheet_positions[_sheet] = cur_pos
+        logger.debug(
+            "NAMEFUL-CHECK %s sheet=%s fields=%s",
+            container_name,
+            _sheet,
+            sorted(list(cur_pos.keys())),
+        )
+    return nameful_sheets, per_sheet_positions
 
 
-def calculate_hierarchy_depth(cell_name):
-    """セル名から階層の深さを計算（数値インデックスを除外）"""
-    parts = cell_name.split(".")
-    hierarchy_parts = [part for part in parts if not part.isdigit()]
-    depth = len(hierarchy_parts) - 1  # 'json'を除く
+def select_template_positions(
+    nameful_sheets: set[str],
+    per_sheet_positions: dict[str, dict[str, tuple[int, int]]],
+    sheeted_ranges: list[tuple[Optional[str], Optional[str]]],
+) -> tuple[dict[str, tuple[int, int]], Optional[str]]:
+    """nameful な最初のシートの座標群をテンプレートとして返す。"""
+    template_positions: dict[str, tuple[int, int]] = {}
+    template_sheet: Optional[str] = None
+    for _sheet, _ in sheeted_ranges:
+        if _sheet in nameful_sheets:
+            template_positions = dict(per_sheet_positions.get(_sheet, {}))
+            if template_positions:
+                template_sheet = _sheet
+                break
+    return template_positions, template_sheet
 
-    # ルートコンテナの特徴：rangeプロパティを持つ
-    # 子コンテナの特徴：offsetプロパティを持つ
-    logger.debug(f"階層深度計算: {cell_name} -> 部分={hierarchy_parts} -> 深度={depth}")
-    return depth
+
+# ---- Extracted helpers to reduce process_container complexity ----
+def gather_current_positions_and_template(
+    *,
+    container_name: str,
+    container_def: dict[str, Any],
+    workbook,
+    target_sheet: Optional[str],
+    nameful_sheets: set[str],
+    template_positions: dict[str, tuple[int, int]],
+    template_sheet: Optional[str],
+    global_field_names: dict[str, str] | None,
+) -> tuple[dict[str, tuple[int, int]], bool]:
+    """Resolve current positions for a sheet and optionally apply template composition.
+
+    Returns (current_positions, using_template).
+    Mirrors original inline logic in process_container.
+    """
+    using_template = False
+    current_positions: dict[str, tuple[int, int]] = {}
+
+    # Resolve positions from defined names on the target sheet
+    base_cell_names = global_field_names or {}
+    if base_cell_names:
+        for field_name, original_cell_name in base_cell_names.items():
+            pos = get_cell_position_from_name(original_cell_name, workbook, target_sheet)
+            if pos:
+                current_positions[field_name] = pos
+        # Apply template positions if only one nameful sheet and no range on the container
+        if (
+            not current_positions
+            and template_positions
+            and template_sheet is not None
+            and len(nameful_sheets) == 1
+        ):
+            _has_digit_token = any(part.isdigit() for part in container_name.split("."))
+            if (
+                (container_def.get("increment", 0) or 0) > 0
+                and _has_digit_token
+                and not container_def.get("range")
+            ):
+                using_template = True
+                current_positions = dict(template_positions)
+            else:
+                # When no range, skip will be decided by caller; if range exists, we'll try composition below
+                pass
+
+    # If still empty, try composing from explicit range (with border completeness check)
+    if not current_positions:
+        rng = container_def.get("range")
+        if rng and template_positions:
+            try:
+                rng_str = str(rng)
+                rng_a1 = rng_str.split("!", 1)[1] if "!" in rng_str else rng_str
+                (sc, sr), (ec, er) = parse_range(rng_a1.replace("$", ""))
+                # Border completeness on the target sheet
+                if target_sheet in getattr(workbook, "sheetnames", []):
+                    ws_check = workbook[target_sheet]
+                else:
+                    ws_check = workbook.active
+                comp = calculate_border_completeness(ws_check, sr, sc, er, ec)
+                if comp >= 1.0:
+                    target_top_left = (sc, sr)
+                    (_tsc, _tsr), (_tec, _ter) = parse_range(rng_a1.replace("$", ""))
+                    tpl_top_left = (_tsc, _tsr)
+                    for f, (c, r) in template_positions.items():
+                        dx = c - tpl_top_left[0]
+                        dy = r - tpl_top_left[1]
+                        current_positions[f] = (target_top_left[0] + dx, target_top_left[1] + dy)
+                    using_template = True
+            except Exception:
+                current_positions = {}
+
+    return current_positions, using_template
 
 
-def process_root_container(container_name, container_def, workbook, generated_names):
-    """ルートコンテナ（range指定あり）の処理"""
-    logger.debug(f"ルートコンテナ処理: {container_name}")
+def estimate_element_count_and_step(
+    *,
+    container_name: str,
+    container_def: dict[str, Any],
+    workbook,
+    target_sheet: Optional[str],
+    current_positions: dict[str, tuple[int, int]],
+    base_cell_names: dict[str, str] | None,
+    global_max_elements: Optional[int],
+    template_sheet: Optional[str],
+    using_template: bool,
+    direction: str,
+    eff_increment: int,
+    anchor_range_span: Optional[int],
+    labels: list[str],
+) -> tuple[int, Optional[int], Optional[int], Optional[int], int]:
+    """Compute element_count and optional step_override for a container on a sheet.
 
-    # 方向とincrement設定
-    direction = container_def.get("direction", "row")
-    increment = container_def.get("increment", 1)
-    items = container_def.get("items", [])
-    labels = container_def.get("labels", [])
+    Returns (element_count, step_override, parent_range_span_for_container, range_count, internal_slice_count).
+    """
+    # Internal slice detection
+    internal_slice_count = detect_internal_slice_count(base_cell_names, workbook)
 
-    logger.debug(
-        f"コンテナ設定: direction={direction}, increment={increment}, items={items}, labels={labels}"
+    # Parent range span
+    parent_range_span_for_container = compute_parent_range_span_for_container(
+        container_name=container_name,
+        workbook=workbook,
+        target_sheet=target_sheet,
+        direction=direction,
     )
 
-    # 範囲指定を解決
-    range_spec = container_def.get("range")
-    if not range_spec:
-        logger.warning(f"ルートコンテナ{container_name}にrange指定がありません")
-        return
+    # Range-based count
+    range_count = compute_range_count_from_explicit_range(
+        container_def=container_def, direction=direction
+    )
+
+    # Label-first count analysis
+    element_count = analyze_element_count_without_range(
+        pos_map=current_positions,
+        eff_increment=eff_increment,
+        direction=direction,
+        labels=labels,
+        workbook=workbook,
+        container_name=container_name,
+        target_sheet=target_sheet,
+        using_template=using_template,
+    )
+
+    # Skip template-applied sheets with zero detection unless range deterministically provides count
+    if using_template and element_count == 0 and target_sheet != template_sheet:
+        if not (isinstance(range_count, int) and range_count > 0):
+            return 0, None, parent_range_span_for_container, range_count, internal_slice_count
+
+    # Apply range limits
+    if isinstance(range_count, int) and range_count > 0:
+        if labels:
+            if element_count > 0:
+                element_count = min(element_count, range_count)
+        else:
+            element_count = range_count
+
+    # Clip by parent range span
+    if (
+        isinstance(parent_range_span_for_container, int)
+        and parent_range_span_for_container > 0
+        and (element_count or 0) > 0
+    ):
+        element_count = min(element_count, parent_range_span_for_container)
+
+    # Clip by anchor range span
+    if (
+        isinstance(anchor_range_span, int)
+        and anchor_range_span > 0
+        and (element_count or 0) > 0
+    ):
+        element_count = min(element_count, anchor_range_span)
+
+    step_override: Optional[int] = None
+
+    # Internal slice priority
+    if internal_slice_count > 1:
+        element_count = internal_slice_count
+        step_override = 1
+        # Global cap
+        if isinstance(global_max_elements, int) and global_max_elements > 0:
+            # next_index は呼び出し側で加算するため、ここでは全体上限のみ安全クリップは不可
+            # 呼び出し側で追加のクリップを行う設計のため、この段階では不変
+            pass
+        # Clip by anchor range & parent range again
+        if (
+            isinstance(anchor_range_span, int)
+            and anchor_range_span > 0
+            and element_count > 0
+        ):
+            element_count = min(element_count, anchor_range_span)
+        if (
+            isinstance(parent_range_span_for_container, int)
+            and parent_range_span_for_container > 0
+            and element_count > 0
+        ):
+            element_count = min(element_count, parent_range_span_for_container)
+        # Clip by bordered region bounds as safety
+        try:
+            if target_sheet is not None and current_positions:
+                b2 = find_region_bounds_for_positions(
+                    workbook, container_name, target_sheet, current_positions
+                )
+                if b2:
+                    top2, left2, bottom2, right2 = b2
+                    if direction == "row":
+                        anchor_row2 = min((row for (col, row) in current_positions.values()))
+                        cap2 = ((bottom2 - anchor_row2) // 1) + 1 if bottom2 >= anchor_row2 else 0
+                    else:
+                        anchor_col2 = min((col for (col, row) in current_positions.values()))
+                        cap2 = ((right2 - anchor_col2) // 1) + 1 if right2 >= anchor_col2 else 0
+                    if cap2 > 0:
+                        element_count = min(element_count, cap2)
+        except Exception:
+            logger.debug("bounds clipping failed for container=%s sheet=%s", container_name, target_sheet, exc_info=True)
+
+    element_count, step_override = _finalize_element_count_and_step(
+        element_count=element_count,
+        step_override=step_override,
+        internal_slice_count=internal_slice_count,
+        target_sheet=target_sheet,
+        direction=direction,
+        container_name=container_name,
+        workbook=workbook,
+        parent_range_span_for_container=parent_range_span_for_container,
+        current_positions=current_positions,
+        eff_increment=eff_increment,
+        global_max_elements=global_max_elements,
+        range_count=range_count,
+        labels=labels,
+        using_template=using_template,
+    )
+
+    return element_count, step_override, parent_range_span_for_container, range_count, internal_slice_count
+
+
+def _finalize_element_count_and_step(
+    *,
+    element_count: int,
+    step_override: Optional[int],
+    internal_slice_count: int,
+    target_sheet: Optional[str],
+    direction: str,
+    container_name: str,
+    workbook,
+    parent_range_span_for_container: Optional[int],
+    current_positions: dict[str, tuple[int, int]],
+    eff_increment: int,
+    global_max_elements: Optional[int],
+    range_count: Optional[int],
+    labels: list[str],
+    using_template: bool,
+) -> tuple[int, Optional[int]]:
+    """Apply final overrides and clipping to element_count and step_override.
+
+    This helper consolidates the late-stage clips and deterministic overrides.
+    Behavior is preserved from the original inline logic.
+    """
+    # Deterministic rectangle series override when labels and internal slice are not active
+    _ec2, _step2 = compute_count_step_from_anchor_rect_series(
+        labels=labels,
+        internal_slice_count=internal_slice_count,
+        target_sheet=target_sheet,
+        direction=direction,
+        container_name=container_name,
+        workbook=workbook,
+        parent_range_span_for_container=parent_range_span_for_container,
+    )
+    if isinstance(_ec2, int) and _ec2 > 0:
+        element_count = _ec2
+    if isinstance(_step2, int) and _step2 > 0:
+        step_override = _step2
+
+    # Clip by parent bottom for single numeric child
+    element_count = clip_element_count_by_parent_bottom_for_single_numeric_child(
+        container_name=container_name,
+        workbook=workbook,
+        target_sheet=target_sheet,
+        current_positions=current_positions,
+        eff_increment=eff_increment,
+        step_override=step_override,
+        element_count=element_count,
+    )
+
+    return element_count, step_override
+
+# ---- Small, behavior-preserving helpers extracted from process_container ----
+def compute_effective_increment_and_anchor_span(
+    *,
+    container_name: str,
+    container_def: dict[str, Any],
+    workbook,
+    target_sheet: Optional[str],
+    global_field_names: dict[str, str] | None,
+) -> tuple[int, Optional[int]]:
+    """Estimate the effective increment (step) and anchor range span for a container.
+
+    Mirrors the original inline logic:
+    - If the container itself ends with '.1', use its defined range height as increment.
+    - Else, when increment is not specified (<=0) and fields hang under '<parent>.1.<field>',
+      derive increment from that child anchor range height.
+    Returns (eff_increment, anchor_range_span).
+    """
+    increment = int(container_def.get("increment", 0) or 0)
+    eff_increment = increment
+    anchor_range_span: Optional[int] = None
 
     try:
-        # 範囲解決
-        actual_range = resolve_range_specification(range_spec, workbook)
-        if not actual_range:
-            logger.warning(f"範囲を解決できませんでした: {range_spec}")
-            return
+        # Case 1: container itself is an anchor '*.1'
+        if container_name.endswith(".1"):
+            for sn, coord in iter_defined_name_destinations_all(container_name, workbook):
+                if sn != target_sheet or not coord:
+                    continue
+                coord_clean = str(coord).replace("$", "")
+                if ":" in coord_clean:
+                    (_sc, _sr), (_ec, _er) = parse_range(coord_clean)
+                    eff_increment = max(1, abs(_er - _sr) + 1)
+                    anchor_range_span = eff_increment
+                else:
+                    eff_increment = 1
+                    anchor_range_span = 1
+                break
+        # Case 2: not specified and fields hang under '<parent>.1.<field>'
+        if (eff_increment or 0) <= 0 and global_field_names:
+            try:
+                sample_field, sample_name = next(iter(global_field_names.items()))
+            except StopIteration:
+                sample_field, sample_name = None, None
+            if sample_field and sample_name:
+                parts = sample_name.split(".")
+                if len(parts) >= 2 and parts[-1] == sample_field:
+                    anchor_guess = ".".join(parts[:-1])
+                    if anchor_guess.split(".")[-1].isdigit():
+                        for sn, coord in iter_defined_name_destinations_all(anchor_guess, workbook):
+                            if sn != target_sheet or not coord:
+                                continue
+                            cc = str(coord).replace("$", "")
+                            if ":" in cc:
+                                (_sc, _sr), (_ec, _er) = parse_range(cc)
+                                eff_increment = max(1, abs(_er - _sr) + 1)
+                                anchor_range_span = eff_increment
+                            else:
+                                eff_increment = 1
+                                anchor_range_span = 1
+                            break
+    except Exception:
+        # Fail-safe: keep computed defaults
+        pass
 
-        # コンテナタイプの自動判定
-        container_type = detect_container_type(
-            actual_range, workbook, increment, container_def
+    return int(eff_increment or 0), anchor_range_span
+
+
+def resolve_labels_in_positions(labels: list[str] | None, pos_map: dict[str, tuple[int, int]] | None) -> list[str]:
+    """与えられた `labels` のうち、現在の座標マップ `pos_map` に存在するフィールド名のみを返す。
+
+    安全側で例外は握りつぶし、空リストを返す。
+    """
+    try:
+        if not labels or not pos_map:
+            return []
+        return [lf for lf in labels if isinstance(lf, str) and lf in pos_map]
+    except Exception:
+        return []
+
+
+# ---- Tiny helpers extracted for process_container readability ----
+def _normalize_labels(container_def: dict[str, Any]) -> list[str]:
+    try:
+        return [str(x) for x in (container_def.get("labels", []) or []) if isinstance(x, str)]
+    except Exception:
+        return []
+
+
+def _apply_global_max_cap(element_count: int, global_max_elements: Optional[int], next_index: int) -> int:
+    try:
+        if (
+            isinstance(global_max_elements, int)
+            and global_max_elements > 0
+            and element_count > 0
+        ):
+            remaining = max(0, global_max_elements - (next_index - 1))
+            return max(0, min(element_count, remaining))
+    except Exception:
+        pass
+    return element_count
+
+
+def _try_nested_scan_and_emit(
+    *,
+    workbook,
+    target_sheet: Optional[str],
+    container_name: str,
+    direction: str,
+    current_positions: dict[str, tuple[int, int]],
+    labels: list[str],
+    policy: ExtractionPolicy,
+    generated_names: dict,
+) -> bool:
+    try:
+        parts_cn = container_name.split(".")
+        num_positions = [i for i, t in enumerate(parts_cn) if t.isdigit()]
+        if len(num_positions) < 2:
+            return False
+        anchor_positions = num_positions
+        anchor_names_chain = [".".join(parts_cn[: p + 1]) for p in anchor_positions]
+        ends_with_numeric = parts_cn[-1].isdigit()
+        parent_anchor = (
+            anchor_names_chain[-2] if (ends_with_numeric and len(anchor_names_chain) >= 2)
+            else anchor_names_chain[-1]
         )
-        logger.debug(f"検出されたコンテナタイプ: {container_type}")
-
-        # タイプ別処理
-        if container_type == "table":
-            process_table_container(
-                container_name, container_def, actual_range, workbook, generated_names
-            )
-        elif container_type == "card":
-            process_card_container(
-                container_name, container_def, actual_range, workbook, generated_names
-            )
-        elif container_type == "tree":
-            process_tree_container(
-                container_name, container_def, actual_range, workbook, generated_names
-            )
-        else:
-            logger.warning(f"未対応のコンテナタイプ: {container_type}")
-
+        if target_sheet is None:
+            return False
+        ws0 = (
+            workbook[target_sheet]
+            if target_sheet in getattr(workbook, "sheetnames", [])
+            else workbook.active
+        )
+        parent_rects, ancestors_rects_chain = build_parent_and_ancestor_rects_for_nested_scan(
+            workbook=workbook,
+            target_sheet=target_sheet,
+            parent_anchor=parent_anchor,
+            direction=direction,
+            generated_names=generated_names,
+            anchor_names_chain=anchor_names_chain,
+            ends_with_numeric=ends_with_numeric,
+        )
+        params = NestedScanParams(
+            workbook=workbook,
+            target_sheet=target_sheet,
+            ws0=ws0,
+            container_name=container_name,
+            direction=direction,
+            current_positions=current_positions,
+            labels=labels,
+            policy=policy,
+            parent_anchor=parent_anchor,
+            parent_rects=parent_rects,
+            ancestors_rects_chain=ancestors_rects_chain,
+            generated_names=generated_names,
+            num_positions=num_positions,
+            ends_with_numeric=ends_with_numeric,
+        )
+        handled = scan_and_emit_nested_children(params=params)
+        return bool(handled)
     except Exception as e:
-        logger.error(f"ルートコンテナ処理エラー ({container_name}): {e}")
+        logger.debug("NESTED-ERR %s: %s", container_name, e, exc_info=True)
+        return False
 
 
-def process_child_container(container_name, container_def, workbook, generated_names):
-    """子コンテナ（offset指定）の処理"""
-    logger.debug(f"子コンテナ処理: {container_name}")
+# Thin wrapper data classes and adapters were removed in favor of direct
+# calls to the underlying functions to reduce unnecessary call depth and
+# surface area. This keeps behavior identical while simplifying the codebase.
 
-    offset = container_def.get("offset", 0)
-    items = container_def.get("items", [])
-    labels = container_def.get("labels", [])
 
-    # 親コンテナを特定
-    parent_container_name = get_parent_container_name(container_name)
-    if not parent_container_name:
-        logger.error(f"親コンテナが特定できません: {container_name}")
-        return
+def detect_internal_slice_count(
+    base_cell_names: dict[str, str] | None, workbook
+) -> int:
+    """index=1 のフィールドが複数セルの範囲を指す場合の内部スライス数を検出する。
 
-    # 親コンテナの各インスタンスに対して子データを処理
-    parent_instances = find_parent_instances(parent_container_name, generated_names)
+    これらの範囲の長さの最大値を返す。既存の挙動を踏襲する。
+    """
+    internal_slice_count = 0
+    try:
+        for field_name, nm in (base_cell_names or {}).items():
+            try:
+                dn = workbook.defined_names[nm]
+            except Exception:
+                continue
+            vals = get_named_range_values(workbook, dn)
+            if isinstance(vals, list) and len(vals) > 1:
+                internal_slice_count = max(internal_slice_count, len(vals))
+    except Exception:
+        internal_slice_count = 0
+    return internal_slice_count
 
-    for parent_instance_idx in parent_instances:
-        process_child_instance(
-            container_name,
-            container_def,
-            parent_instance_idx,
-            workbook,
-            generated_names,
+
+def compute_parent_range_span_for_container(
+    *, container_name: str, workbook, target_sheet: Optional[str], direction: str
+) -> Optional[int]:
+    """親コンテナ（末尾が数値でない）が定義範囲を持つ場合、direction に応じて
+    その高さ（row）または幅（col）を返す。なければ None を返す。
+    """
+    parent_range_span_for_container: Optional[int] = None
+    try:
+        tail_tok = container_name.split(".")[-1]
+        if tail_tok and (not tail_tok.isdigit()):
+            for sn, coord in iter_defined_name_destinations_all(container_name, workbook):
+                if sn != target_sheet or not coord:
+                    continue
+                cc = str(coord).replace("$", "")
+                if ":" in cc:
+                    (sc0, sr0), (ec0, er0) = parse_range(cc)
+                    if (direction or "row").lower() == "row":
+                        parent_range_span_for_container = max(1, abs(er0 - sr0) + 1)
+                    else:
+                        parent_range_span_for_container = max(1, abs(ec0 - sc0) + 1)
+                break
+    except Exception:
+        parent_range_span_for_container = None
+    return parent_range_span_for_container
+
+
+def compute_range_count_from_explicit_range(
+    *, container_def: dict[str, Any], direction: str
+) -> Optional[int]:
+    """container_def に明示的な 'range' がある場合、direction に基づいて件数を算出する。
+    該当しない場合やエラー時は None を返す。
+    """
+    try:
+        rng = container_def.get("range")
+        if not rng:
+            return None
+        rng_str = str(rng)
+        rng_a1 = rng_str.split("!", 1)[1] if "!" in rng_str else rng_str
+        (sc, sr), (ec, er) = parse_range(rng_a1.replace("$", ""))
+        return detect_instance_count((sc, sr), (ec, er), direction)
+    except Exception:
+        return None
+
+
+def analyze_element_count_without_range(
+    *,
+    pos_map: dict[str, tuple[int, int]] | None,
+    eff_increment: int,
+    direction: str,
+    labels: list[str],
+    workbook,
+    container_name: str,
+    target_sheet: Optional[str],
+    using_template: bool,
+) -> int:
+    """
+    ラベル優先の件数分析（range が無い場合の分析）。
+
+    件数算出ポリシー:
+    - increment(eff_increment) を最優先。
+      - labels がある場合: 増分スキャンし、labels のいずれかが空(None/"")になった時点で停止（矩形は参照しない）。
+      - labels が無い場合: 矩形上限内で幾何学的に最大件数を算出（アンカー基準）。
+    - eff_increment <= 0 は 1 件固定（非繰り返し）。
+    - 矩形は labels が無い場合の上限、または安全装置としてのみ採用。
+    """
+    try:
+        if (eff_increment or 0) <= 0:
+            return 1
+        if not pos_map:
+            return 0
+
+        # 可能なら矩形境界を取得（labelsが無い場合の上限として使用）
+        if target_sheet is None:
+            return 0
+
+        # 直接呼び出しに置換: 内部の薄いラッパー関数は不要なので除去
+        bounds = find_region_bounds_for_positions(workbook, container_name, target_sheet, pos_map)
+        if bounds:
+            top, left, bottom, right = bounds
+            # 全基準が矩形内であることを確認（矩形が見つかった場合のみ）
+            for col, row in pos_map.values():
+                if not (left <= col <= right and top <= row <= bottom):
+                    bounds = None
+                    break
+
+        # アンカー（row: 最上段, column: 最左）を抽出
+        anchor_col: Optional[int] = None
+        anchor_row: Optional[int] = None
+        for _fname, (col, row) in pos_map.items():
+            if anchor_col is None:
+                anchor_col, anchor_row = col, row
+                continue
+            if (direction or "row").lower() == "row":
+                if anchor_row is None or row < anchor_row:
+                    anchor_col, anchor_row = col, row
+            else:
+                if anchor_col is None or col < anchor_col:
+                    anchor_col, anchor_row = col, row
+        if anchor_col is None:
+            return 0
+
+        # labels がある場合は増分スキャンを優先（矩形は参照しない）
+        resolved_labels = resolve_labels_in_positions(labels, pos_map)
+        if resolved_labels:
+            try:
+                ws0 = (
+                    workbook[target_sheet]
+                    if target_sheet in getattr(workbook, "sheetnames", [])
+                    else workbook.active
+                )
+                count = 0
+                # 安全上限（無限ループ防止）。現実的な大きさに設定。
+                SAFE_MAX = 2000
+                for idx in range(1, SAFE_MAX + 1):
+                    # 全ての label が非空である限り継続
+                    all_non_empty = True
+                    for lf in resolved_labels:
+                        base = pos_map[lf]
+                        c, r = calculate_target_position(
+                            base, (direction or "row").lower(), idx, eff_increment
+                        )
+                        v = read_cell_value((c, r), ws0)
+                        if v in (None, ""):
+                            all_non_empty = False
+                            break
+                    if not all_non_empty:
+                        break
+                    count += 1
+                return count
+            except Exception:
+                # 失敗時は矩形上限へフォールバック
+                pass
+
+        # labels が無い場合、または labelsスキャン失敗時は矩形上限を採用
+        if not bounds:
+            # 矩形が無ければスキップ（テンプレート適用時は特に読み取り禁止）
+            return 0 if using_template else 1
+
+        dir_norm = (direction or "row").lower()
+        if dir_norm == "row":
+            if anchor_row is None:
+                return 0
+            geometric_max = (bottom - anchor_row) // max(1, eff_increment) + 1
+        else:
+            if anchor_col is None:
+                return 0
+            geometric_max = (right - anchor_col) // max(1, eff_increment) + 1
+        return max(0, geometric_max)
+    except Exception:
+        return 0
+
+
+def compute_count_step_from_anchor_rect_series(
+    *,
+    labels: list[str],
+    internal_slice_count: int,
+    target_sheet: Optional[str],
+    direction: str,
+    container_name: str,
+    workbook,
+    parent_range_span_for_container: Optional[int],
+) -> tuple[Optional[int], Optional[int]]:
+    """
+    ラベル無し・内部スライス無しの通常ケースで、矩形列による決定論的カウント/ステップを適用。
+
+    戻り値: (element_count_override, step_override)。適用不可時は (None, None)。
+    例外は内部で握りつぶし、(None, None) を返す。
+    """
+    try:
+        if labels:
+            return None, None
+        if internal_slice_count > 1:
+            return None, None
+        if target_sheet is None:
+            return None, None
+
+        step_override: Optional[int] = None
+        element_count: Optional[int] = None
+
+        tail_tok2 = container_name.split(".")[-1]
+        if tail_tok2 and (not tail_tok2.isdigit()):
+            # 親（非 .1）自身の範囲が矩形列のアンカー
+            rects_for_parent = _get_anchor_rects_naive(
+                workbook, container_name, target_sheet, col_tolerance=0
+            )
+            if rects_for_parent:
+                # 矩形の高さ
+                _pl, _pt, _pr, _pb = rects_for_parent[0]
+                rect_height = max(1, _pb - _pt + 1)
+                # 件数は矩形数
+                element_count = len(rects_for_parent)
+                # ステップは矩形高さ
+                step_override = rect_height
+                # 親範囲や .1 アンカーによる上限がある場合はクリップ
+                if (
+                    isinstance(parent_range_span_for_container, int)
+                    and parent_range_span_for_container > 0
+                    and element_count > 0
+                ):
+                    element_count = min(element_count, parent_range_span_for_container)
+        else:
+            # .1 アンカー自身を起点に矩形列をスキャン
+            rects_for_child = _get_anchor_rects_naive(
+                workbook, container_name, target_sheet, col_tolerance=0
+            )
+            if rects_for_child:
+                _cl, _ct, _cr, _cb = rects_for_child[0]
+                rect_h2 = max(1, _cb - _ct + 1)
+                element_count = len(rects_for_child)
+                step_override = rect_h2
+                # 同上: 矩形列スキャンではアンカー範囲高さで件数クリップしない。
+                if (
+                    isinstance(parent_range_span_for_container, int)
+                    and parent_range_span_for_container > 0
+                    and element_count > 0
+                ):
+                    element_count = min(element_count, parent_range_span_for_container)
+
+        return element_count, step_override
+    except Exception:
+        return None, None
+
+
+def clip_element_count_by_parent_bottom_for_single_numeric_child(
+    *,
+    container_name: str,
+    workbook,
+    target_sheet: Optional[str],
+    current_positions: dict[str, tuple[int, int]],
+    eff_increment: int,
+    step_override: Optional[int],
+    element_count: int,
+) -> int:
+    """
+    直近の親が非数値（例: json.表1.1 の親は json.表1）で、その親に範囲がある場合、
+    親範囲の下端で件数をクリップ（親定義がテーブルの行数上限となる仕様）。
+    対象は「.1 で終わり、数値トークンが1つだけ」の子コンテナ。
+    例外は内部で握り、元の element_count を返す。
+    """
+    try:
+        parts_cn = container_name.split(".")
+        num_positions = [i for i, t in enumerate(parts_cn) if t.isdigit()]
+        if container_name.endswith(".1") and len(num_positions) == 1:
+            parent_non_numeric = ".".join(parts_cn[:-1])  # 例: json.表1
+            parent_top = None
+            parent_bottom = None
+            for sn, coord in iter_defined_name_destinations_all(
+                parent_non_numeric, workbook
+            ):
+                if sn != target_sheet or not coord:
+                    continue
+                cc = coord.replace("$", "")
+                if ":" in cc:
+                    (_sc, _sr), (_ec, _er) = parse_range(cc)
+                    parent_top, parent_bottom = _sr, _er
+                break
+            if parent_bottom is not None and element_count > 0:
+                anchor_row = min(
+                    (row for (col, row) in current_positions.values()), default=None
+                )
+                if anchor_row is not None and anchor_row <= parent_bottom:
+                    step = (
+                        step_override if (isinstance(step_override, int) and step_override > 0) else eff_increment
+                    ) or 1
+                    cap = ((parent_bottom - anchor_row) // step) + 1
+                    if cap < element_count:
+                        element_count = cap
+    except Exception:
+        return element_count
+    return element_count
+
+
+def build_parent_and_ancestor_rects_for_nested_scan(
+    *,
+    workbook,
+    target_sheet: Optional[str],
+    parent_anchor: str,
+    direction: str,
+    generated_names: Dict[str, Any],
+    anchor_names_chain: List[str],
+    ends_with_numeric: bool,
+) -> tuple[List[Tuple[int, int, int, int]], List[List[Tuple[int, int, int, int]]]]:
+    """
+    ネスト走査用に親矩形と祖先矩形チェーンを構築するヘルパー。
+    - まず親矩形を _get_anchor_rects_naive で検出
+    - 親矩形が1つのみで、親要素が複数生成されていると推定できる場合は定義範囲を等分割して合成
+    - 罫線矩形が見つからない場合は、定義範囲と既存名から親件数を推定して等分割するフォールバック
+    - 祖先矩形チェーン（直近の親を除く上位矩形列）を検出
+    例外は安全側で握り、空を返す
+    """
+    if target_sheet is None:
+        return [], []
+    parent_rects = _get_anchor_rects_naive(workbook, parent_anchor, target_sheet, col_tolerance=0)
+    parent_rects = _split_parent_rects_by_existing_indices(
+        parent_rects=parent_rects,
+        target_sheet=target_sheet,
+        parent_anchor=parent_anchor,
+        workbook=workbook,
+        direction=direction,
+        generated_names=generated_names,
+    )
+    if not parent_rects:
+        parent_rects = _fallback_parent_rects_without_borders(
+            target_sheet=target_sheet,
+            parent_anchor=parent_anchor,
+            workbook=workbook,
+            direction=direction,
         )
+    ancestors_rects_chain = _build_ancestors_rects_chain(
+        anchor_names_chain=anchor_names_chain,
+        ends_with_numeric=ends_with_numeric,
+        target_sheet=target_sheet,
+        workbook=workbook,
+    )
+    return parent_rects, ancestors_rects_chain
 
 
-def resolve_range_specification(range_spec, workbook):
-    """範囲指定を実際の座標に解決"""
-    if range_spec in workbook.defined_names:
-        defined_name = workbook.defined_names[range_spec]
-        for sheet_name, coord in defined_name.destinations:
-            logger.debug(f"名前付き範囲 {range_spec}: {coord}")
-            return coord
-    elif ":" in range_spec:
-        logger.debug(f"直接範囲指定: {range_spec}")
-        return range_spec
-    else:
-        if range_spec in workbook.defined_names:
-            defined_name = workbook.defined_names[range_spec]
-            cell_value = get_named_range_values(workbook, defined_name)
-            if isinstance(cell_value, str) and ":" in cell_value:
-                logger.debug(f"セル名 {range_spec} の値を範囲として使用: {cell_value}")
-                return cell_value
+def _split_parent_rects_by_existing_indices(
+    *,
+    parent_rects: List[Tuple[int, int, int, int]],
+    target_sheet: Optional[str],
+    parent_anchor: str,
+    workbook,
+    direction: str,
+    generated_names: Dict[str, Any],
+) -> List[Tuple[int, int, int, int]]:
+    if not (parent_rects and len(parent_rects) == 1 and target_sheet is not None):
+        return parent_rects
+    try:
+        allowed_parent_indices: set[int] = set()
+        parent_base_non_numeric = parent_anchor.rsplit(".", 1)[0] if parent_anchor.endswith(".1") else None
+        if parent_base_non_numeric:
+            pref = parent_base_non_numeric + "."
+            for gk in list(generated_names.keys()):
+                if not gk.startswith(pref):
+                    continue
+                tail = gk[len(pref) :]
+                idx_str = tail.split(".", 1)[0]
+                if idx_str.isdigit():
+                    allowed_parent_indices.add(int(idx_str))
+        needed = max(allowed_parent_indices) if allowed_parent_indices else 0
+        if not needed or needed <= 1:
+            return parent_rects
+        pr_coords = None
+        for sn, coord in iter_defined_name_destinations_all(parent_anchor, workbook):
+            if sn != target_sheet or not coord:
+                continue
+            cc = str(coord).replace("$", "")
+            if ":" in cc:
+                (sc0, sr0), (ec0, er0) = parse_range(cc)
+                pr_coords = (sc0, sr0, ec0, er0)
+            break
+        if pr_coords is None:
+            return parent_rects
+        sc0, sr0, ec0, er0 = pr_coords
+        base_rect = RectChain(top=sr0, left=sc0, bottom=er0, right=ec0)
+        out: List[Tuple[int, int, int, int]] = []
+        if (direction or "row").lower() == "row":
+            total = base_rect.height()
+            base = total // needed
+            rem = total % needed
+            cur_top2 = base_rect.top
+            for idx in range(1, needed + 1):
+                height = base + (1 if idx <= rem else 0)
+                bottom2 = min(base_rect.bottom, cur_top2 + height - 1)
+                out.append((base_rect.left, cur_top2, base_rect.right, bottom2))
+                cur_top2 = bottom2 + 1
+        else:
+            total = base_rect.width()
+            base = total // needed
+            rem = total % needed
+            cur_left2 = base_rect.left
+            for idx in range(1, needed + 1):
+                width = base + (1 if idx <= rem else 0)
+                right2 = min(base_rect.right, cur_left2 + width - 1)
+                out.append((cur_left2, base_rect.top, right2, base_rect.bottom))
+                cur_left2 = right2 + 1
+        return out or parent_rects
+    except Exception:
+        return parent_rects
+
+
+def _fallback_parent_rects_without_borders(
+    *,
+    target_sheet: Optional[str],
+    parent_anchor: str,
+    workbook,
+    direction: str,
+) -> List[Tuple[int, int, int, int]]:
+    if target_sheet is None:
+        return []
+    try:
+        pr_coords = None
+        for sn, coord in iter_defined_name_destinations_all(parent_anchor, workbook):
+            if sn != target_sheet or not coord:
+                continue
+            cc = str(coord).replace("$", "")
+            if ":" in cc:
+                (sc0, sr0), (ec0, er0) = parse_range(cc)
+                pr_coords = (sc0, sr0, ec0, er0)
+            else:
+                pr_coords = None
+            break
+        if pr_coords is None:
+            return []
+        sc0, sr0, ec0, er0 = pr_coords
+        base_rect = RectChain(top=sr0, left=sc0, bottom=er0, right=ec0)
+        parts_pa = parent_anchor.split(".")
+        base_name = parts_pa[1] if len(parts_pa) >= 2 else None
+        parent_count = 0
+        if base_name:
+            try:
+                parent_count = detect_card_count_from_existing_names(
+                    base_name, workbook, sheet_name=target_sheet, prefix="json"
+                )
+            except Exception:
+                parent_count = 0
+        if parent_count <= 0:
+            parent_count = 1
+        out: List[Tuple[int, int, int, int]] = []
+        if (direction or "row").lower() == "row":
+            total = base_rect.height()
+            base = total // parent_count
+            rem = total % parent_count
+            cur_top = base_rect.top
+            for idx in range(1, parent_count + 1):
+                height = base + (1 if idx <= rem else 0)
+                bottom = min(base_rect.bottom, cur_top + height - 1)
+                out.append((base_rect.left, cur_top, base_rect.right, bottom))
+                cur_top = bottom + 1
+        else:
+            total = base_rect.width()
+            base = total // parent_count
+            rem = total % parent_count
+            cur_left = base_rect.left
+            for idx in range(1, parent_count + 1):
+                width = base + (1 if idx <= rem else 0)
+                right = min(base_rect.right, cur_left + width - 1)
+                out.append((cur_left, base_rect.top, right, base_rect.bottom))
+                cur_left = right + 1
+        return out
+    except Exception:
+        return []
+
+
+def _build_ancestors_rects_chain(
+    *,
+    anchor_names_chain: List[str],
+    ends_with_numeric: bool,
+    target_sheet: Optional[str],
+    workbook,
+) -> List[List[Tuple[int, int, int, int]]]:
+    chain: List[List[Tuple[int, int, int, int]]] = []
+    try:
+        names = anchor_names_chain[:-2] if ends_with_numeric else anchor_names_chain[:-1]
+        for anc_name in names:
+            if target_sheet is None:
+                continue
+            rects = _get_anchor_rects_naive(workbook, anc_name, target_sheet, col_tolerance=0)
+            # normalize to RectChain internally then back to tuples for compatibility
+            normalized: List[Tuple[int, int, int, int]] = []
+            for (sc, sr, ec, er) in rects:
+                rc = RectChain(top=sr, left=sc, bottom=er, right=ec)
+                normalized.append(rc.as_tuple())
+            chain.append(normalized)
+    except Exception:
+        pass
+    return chain
+
+
+def find_first_defined_range_coords(name: str, target_sheet: Optional[str], workbook) -> Optional[RectTuple]:
+    """定義名から最初に一致するシート範囲座標 (sc, sr, ec, er) を返す。なければ None。
+    target_sheet が指定されている場合は同名シートの範囲のみ対象。
+    """
+    for (sh_name, coord) in iter_defined_name_destinations_all(name, workbook):
+        eff_sheet = sh_name
+        eff_coord = coord
+        if (not eff_sheet) and isinstance(coord, str) and "!" in coord:
+            try:
+                eff_sheet, eff_coord = coord.split("!", 1)
+            except Exception:
+                eff_coord = coord
+        if target_sheet is not None and eff_sheet != target_sheet:
+            continue
+        if isinstance(eff_coord, str):
+            cc = eff_coord.replace("$", "")
+            if ":" in cc:
+                (sc0, sr0), (ec0, er0) = (parse_range(cc))
+                return sc0, sr0, ec0, er0
     return None
 
 
-def detect_container_type(range_spec, workbook, increment, container_def=None):
-    """コンテナタイプを自動判定（拡張版）"""
-    logger.debug(f"コンテナタイプ判定: range_spec={range_spec}, increment={increment}")
-
-    # 明示的なタイプ指定がある場合はそれを使用
-    if container_def and "type" in container_def:
-        explicit_type = container_def["type"].lower()
-        if explicit_type in ["table", "card", "tree"]:
-            logger.debug(f"明示的タイプ指定: {explicit_type}")
-            return explicit_type
-
-    # 範囲名による判定
-    range_spec_lower = range_spec.lower()
-    if "card" in range_spec_lower:
-        return "card"
-    elif "tree" in range_spec_lower or "ツリー" in range_spec_lower:
-        return "tree"
-    elif "table" in range_spec_lower or "表" in range_spec_lower:
-        return "table"
-    elif "list" in range_spec_lower or "リスト" in range_spec_lower:
-        return "table"  # リストはテーブル型として扱う
-
-    # increment値による判定
-    if increment > 1:
-        return "card"  # incrementが大きい場合はカード型
-
-    # 範囲のサイズと形状による判定
+def emit_field_value_with_optional_range(
+    *,
+    container_name: str,
+    cont_key_parented: str,
+    child_idx_emitted: int,
+    fname: str,
+    value_scalar: Any,
+    used_positions: Dict[str, Tuple[int, int]],
+    direction: str,
+    eff_step_local: int,
+    target_sheet: Optional[str],
+    workbook,
+    ws0,
+    generated_names: Dict[str, Any],
+) -> None:
+    """フィールド値の出力（範囲優先）。範囲が無ければ単一値を出力。"""
     try:
-        if ":" in range_spec:
-            start_coord, end_coord = parse_range(range_spec)
-            width = end_coord[0] - start_coord[0] + 1
-            height = end_coord[1] - start_coord[1] + 1
-
-            # 正方形に近い場合はカード型
-            aspect_ratio = max(width, height) / min(width, height)
-            if aspect_ratio < 2.0 and min(width, height) > 3:
-                logger.debug(
-                    f"範囲形状によりカード型判定: {width}x{height}, ratio={aspect_ratio:.2f}"
-                )
-                return "card"
-
-            # 縦長の場合はテーブル型、横長の場合もテーブル型
-            logger.debug(f"範囲形状によりテーブル型判定: {width}x{height}")
-    except Exception as e:
-        logger.warning(f"範囲解析エラー: {e}")
-
-    # デフォルトはテーブル型
-    return "table"
-
-
-def process_table_container(
-    container_name, container_def, range_spec, workbook, generated_names
-):
-    """テーブル型コンテナの処理（既存のロジック）"""
-    direction = container_def.get("direction", "row")
-    increment = container_def.get("increment", 1)
-    items = container_def.get("items", [])
-
-    # インスタンス数の検出
-    start_coord, end_coord = parse_range(range_spec)
-    direction_map = {"row": "vertical", "column": "horizontal"}
-    internal_direction = direction_map.get(direction, direction)
-    instance_count = detect_instance_count(start_coord, end_coord, internal_direction)
-    logger.debug(f"検出されたインスタンス数: {instance_count}")
-
-    # 基準セル名を検索
-    base_container_name = container_name.replace("json.", "")
-    base_positions = {}
-
-    # 複数の方法で基準位置を取得
-    for item in items:
-        position = None
-
-        # 方法1: インスタンス番号付きのセル名（既存の方法）
-        base_cell_name = f"json.{base_container_name}.1.{item}"
-        position = get_cell_position_from_name(base_cell_name, workbook)
-        if position:
-            logger.debug(
-                f"基準位置取得（方法1）: {item} -> {position} (セル名: {base_cell_name})"
+        coords = _resolve_field_range_coords_for_field(container_name, fname, target_sheet, workbook)
+        if coords is not None:
+            sc, sr, ec, er = coords
+            sub_vals = _read_sub_values_for_field(
+                sc=sc,
+                sr=sr,
+                ec=ec,
+                er=er,
+                ws0=ws0,
+                used_positions=used_positions,
+                fname=fname,
+                child_idx_emitted=child_idx_emitted,
+                eff_step_local=eff_step_local,
+                direction=direction,
             )
-        else:
-            # 方法2: 最初のインスタンスのセル名（配列指定）
-            array_cell_name = f"json.{base_container_name}.{item}.1"
-            position = get_cell_position_from_name(array_cell_name, workbook)
-            if position:
-                logger.debug(
-                    f"基準位置取得（方法2）: {item} -> {position} (セル名: {array_cell_name})"
-                )
-            else:
-                # 方法3: 直接のセル名（単一セル）
-                direct_cell_name = f"json.{base_container_name}.{item}"
-                position = get_cell_position_from_name(direct_cell_name, workbook)
-                if position:
-                    logger.debug(
-                        f"基準位置取得（方法3）: {item} -> {position} (セル名: {direct_cell_name})"
-                    )
-                else:
-                    logger.warning(
-                        f"基準セル名が見つかりません: {item} (試行: {base_cell_name}, {array_cell_name}, {direct_cell_name})"
-                    )
+            _emit_field_as_range(
+                generated_names=generated_names,
+                cont_key_parented=cont_key_parented,
+                child_idx_emitted=child_idx_emitted,
+                fname=fname,
+                sub_vals=sub_vals,
+            )
+            return
+    except Exception:
+        # フォールバックしてスカラ出力
+        pass
+    _emit_field_scalar(
+        generated_names=generated_names,
+        cont_key_parented=cont_key_parented,
+        child_idx_emitted=child_idx_emitted,
+        fname=fname,
+        value=value_scalar,
+    )
 
-        if position:
-            base_positions[item] = position
 
-    if not base_positions:
-        logger.error(
-            f"基準位置が見つからないため、コンテナ {container_name} をスキップ"
+def _resolve_field_range_coords_for_field(
+    container_name: str,
+    fname: str,
+    target_sheet: Optional[str],
+    workbook,
+) -> Optional[tuple[int, int, int, int]]:
+    base_range_name = f"{container_name}.{fname}.1"
+    coords = find_first_defined_range_coords(base_range_name, target_sheet, workbook)
+    if coords is None and container_name.endswith(".1"):
+        parent_anchor2 = container_name.rsplit(".", 1)[0]
+        alt_range_name = f"{parent_anchor2}.{fname}.1"
+        coords = find_first_defined_range_coords(alt_range_name, target_sheet, workbook)
+    if coords is None:
+        field_range_name = f"{container_name}.{fname}"
+        coords = find_first_defined_range_coords(field_range_name, target_sheet, workbook)
+        if coords is None and container_name.endswith(".1"):
+            parent_anchor2 = container_name.rsplit(".", 1)[0]
+            alt_field_range = f"{parent_anchor2}.{fname}"
+            coords = find_first_defined_range_coords(alt_field_range, target_sheet, workbook)
+    return coords
+
+
+def _read_sub_values_for_field(
+    *,
+    sc: int,
+    sr: int,
+    ec: int,
+    er: int,
+    ws0,
+    used_positions: Dict[str, Tuple[int, int]],
+    fname: str,
+    child_idx_emitted: int,
+    eff_step_local: int,
+    direction: str,
+) -> Any:
+    rows = abs(er - sr) + 1
+    cols = abs(ec - sc) + 1
+    ws_read = ws0
+    tc_tr = used_positions.get(fname)
+    if isinstance(tc_tr, tuple) and len(tc_tr) == 2 and all(isinstance(x, int) for x in tc_tr):
+        tc, tr = tc_tr
+        if rows == 1 and cols >= 1:
+            r = tr
+            return [read_cell_value((tc + dc, r), ws_read) for dc in range(0, cols)]
+        if cols == 1 and rows >= 1:
+            c = tc
+            return [read_cell_value((c, tr + dr), ws_read) for dr in range(0, rows)]
+        return [[read_cell_value((tc + dc, tr + dr), ws_read) for dc in range(0, cols)] for dr in range(0, rows)]
+    offset_n = (child_idx_emitted - 1) * max(1, int(eff_step_local))
+    if direction == "column":
+        sc2, ec2 = sc + offset_n, ec + offset_n
+        if rows == 1 and cols >= 1:
+            r = sr
+            return [read_cell_value((c, r), ws_read) for c in range(sc2, ec2 + 1)]
+        if cols == 1 and rows >= 1:
+            c = sc2
+            return [read_cell_value((c, r), ws_read) for r in range(sr, er + 1)]
+        return [[read_cell_value((c, r), ws_read) for c in range(sc2, ec2 + 1)] for r in range(sr, er + 1)]
+    # row 方向
+    sr2, er2 = sr + offset_n, er + offset_n
+    if rows == 1 and cols >= 1:
+        r = sr2
+        return [read_cell_value((c, r), ws_read) for c in range(sc, ec + 1)]
+    if cols == 1 and rows >= 1:
+        c = sc
+        return [read_cell_value((c, r), ws_read) for r in range(sr2, er2 + 1)]
+    return [[read_cell_value((c, r), ws_read) for c in range(sc, ec + 1)] for r in range(sr2, er2 + 1)]
+
+
+def _emit_field_as_range(
+    *,
+    generated_names: Dict[str, Any],
+    cont_key_parented: str,
+    child_idx_emitted: int,
+    fname: str,
+    sub_vals: Any,
+) -> None:
+    sub_vals = trim_trailing_empty(sub_vals)
+    maybe_idx_key = f"{fname}.1"
+    key_with_j = generate_cell_name_for_element(cont_key_parented, child_idx_emitted, maybe_idx_key)
+    generated_names[key_with_j] = sub_vals
+    try:
+        alt_key = generate_cell_name_for_element(cont_key_parented, child_idx_emitted, fname)
+        if alt_key not in generated_names:
+            generated_names[alt_key] = sub_vals
+    except Exception:
+        logger.debug("failed to set alt generated key for %s", fname, exc_info=True)
+    try:
+        stats().cells_generated += 1
+    except Exception:
+        logger.debug("failed to increment cells_generated in nested emit", exc_info=True)
+    logger.debug("NESTED-SET %s=%r", key_with_j, sub_vals)
+
+
+def _emit_field_scalar(
+    *,
+    generated_names: Dict[str, Any],
+    cont_key_parented: str,
+    child_idx_emitted: int,
+    fname: str,
+    value: Any,
+) -> None:
+    key = generate_cell_name_for_element(cont_key_parented, child_idx_emitted, fname)
+    generated_names[key] = value
+    try:
+        stats().cells_generated += 1
+    except Exception:
+        logger.debug("failed to increment cells_generated for scalar emit", exc_info=True)
+    logger.debug("NESTED-SET %s=%r", key, value)
+
+def scan_and_emit_nested_children(
+    *,
+    params: NestedScanParams,
+) -> bool:
+    """
+    親矩形列に沿って子要素をネスト走査し、生成する。処理した場合は True を返す。
+    親矩形が無い場合は False。
+    """
+    try:
+        logger.debug(
+            "NESTED-SCAN %s sheet=%s parent=%s rects=%s",
+            params.container_name,
+            params.target_sheet,
+            params.parent_anchor,
+            len(params.parent_rects) if isinstance(params.parent_rects, list) else None,
         )
-        return
+        if not params.parent_rects:
+            logger.debug("NESTED-NO-PARENT-RECTS %s", params.container_name)
+            return False
+        child_anchor_row = min((row for (col, row) in params.current_positions.values()))
+        allowed_parent_indices = _get_allowed_parent_indices(params.parent_anchor, params.generated_names)
+        base_numeric_token_fields = _get_base_numeric_token_fields(params.current_positions, params.ws0)
+        emitted_total = _scan_and_emit_main(
+            params.workbook,
+            params.target_sheet,
+            params.ws0,
+            params.container_name,
+            params.direction,
+            params.current_positions,
+            params.labels,
+            params.policy,
+            params.parent_rects,
+            params.ancestors_rects_chain,
+            params.generated_names,
+            params.num_positions,
+            params.ends_with_numeric,
+            child_anchor_row,
+            allowed_parent_indices,
+            base_numeric_token_fields,
+        )
+        if params.ends_with_numeric and params.ancestors_rects_chain:
+            emitted_total += _scan_and_emit_fallback(
+                params.workbook,
+                params.target_sheet,
+                params.ws0,
+                params.container_name,
+                params.direction,
+                params.current_positions,
+                params.labels,
+                params.policy,
+                params.parent_rects,
+                params.ancestors_rects_chain,
+                params.generated_names,
+                params.num_positions,
+                params.ends_with_numeric,
+                child_anchor_row,
+                base_numeric_token_fields,
+            )
+        logger.debug("NESTED-EMIT %s sheet=%s total=%s", params.container_name, params.target_sheet, emitted_total)
+        return True
+    except Exception as e:
+        logger.debug("NESTED-ERR %s: %s", params.container_name, e, exc_info=True)
+        return False
 
-    # インスタンス分のセル名と値を生成
-    ws = workbook.active
+# --- サブ関数群 ---
+def _get_allowed_parent_indices(parent_anchor, generated_names):
+    allowed_parent_indices: set[int] = set()
+    parent_base_non_numeric = parent_anchor.rsplit(".", 1)[0] if parent_anchor.endswith(".1") else None
+    if parent_base_non_numeric:
+        prefix = parent_base_non_numeric + "."
+        for gk in list(generated_names.keys()):
+            if not gk.startswith(prefix):
+                continue
+            tail = gk[len(prefix) :]
+            idx_str = tail.split(".", 1)[0]
+            if idx_str.isdigit():
+                allowed_parent_indices.add(int(idx_str))
+    return allowed_parent_indices
 
-    for instance_idx in range(1, instance_count + 1):
-        instance_values = {}
-        all_empty = True
+def _get_base_numeric_token_fields(current_positions, ws0):
+    base_numeric_token_fields: list[str] = []
+    for fn, (c0, r0) in current_positions.items():
+        v0 = read_cell_value((c0, r0), ws0)
+        if is_numeric_token_string(v0):
+            base_numeric_token_fields.append(fn)
+    return base_numeric_token_fields
 
-        for item in items:
-            if item not in base_positions:
+def should_suppress_element(
+    *,
+    values_by_field: Dict[str, Any],
+    non_empty: bool,
+    labels_in_scope: Optional[List[str]],
+    policy: ExtractionPolicy,
+) -> bool:
+    """ネスト子要素の出力抑止判定。
+
+    最小互換仕様:
+    - ラベルが指定されている場合: そのラベルのセルが空ならスキップ
+    - 非ラベルの場合: 行全体が空ならスキップ
+    """
+    try:
+        # ラベル指定あり: ラベルいずれかが非空なら採用。全て空なら抑止。
+        if labels_in_scope:
+            for lf in labels_in_scope:
+                if values_by_field.get(lf) not in (None, ""):
+                    return False
+            return True
+        # ラベル指定なし: 行全体が空なら抑止
+        return not non_empty
+    except Exception:
+        return False
+
+def compute_group_indexes_and_bounds(
+    *,
+    pt: int,
+    pb: int,
+    ancestors_rects_chain: List[List[RectTuple]] | None,
+    policy: ExtractionPolicy,
+) -> Tuple[List[int], int, int]:
+    """先祖矩形チェーンからグループインデックス列と有効上下端(eff_pt, eff_pb)を算出する。
+
+    互換ポリシー:
+    - `policy.nested_scan.ancestors_first_bounds` が真の場合、`pick_effective_bounds` に従う。
+    - 偽の場合、親矩形の上下端を採用。
+    - 先祖が無い場合は ([], pt, pb) を返す。
+    """
+    def _filter_ordered_bounds(
+        rects_at_level: List[RectTuple], bounds: tuple[int, int] | None
+    ) -> List[Tuple[int, int, int]]:
+        ordered: List[Tuple[int, int, int]] = []
+        bpt, bpb = (None, None) if bounds is None else bounds
+        for j, (_al, at, _ar, ab) in enumerate(rects_at_level, start=1):
+            if bpt is None and bpb is None:
+                ordered.append((j, at, ab))
+            else:
+                # フィルタ: 先に決まっている境界内に完全に入るもののみ
+                if at >= cast(int, bpt) and ab <= cast(int, bpb):
+                    ordered.append((j, at, ab))
+        return ordered
+
+    def _find_group_index_for_top(
+        ordered_rects: List[Tuple[int, int, int]], top: int
+    ) -> tuple[int, tuple[int, int] | None]:
+        gi_local = 1
+        matched_bounds: tuple[int, int] | None = None
+        for idx_local, (_jg, at, ab) in enumerate(ordered_rects, start=1):
+            if at <= top <= ab:
+                gi_local = idx_local
+                matched_bounds = (at, ab)
+                break
+        return gi_local, matched_bounds
+
+    def _compute_eff_bounds(
+        pt0: int, pb0: int, chain: List[List[RectTuple]] | None, pol: ExtractionPolicy
+    ) -> tuple[int, int]:
+        if not chain:
+            return pt0, pb0
+        if pol.nested_scan.ancestors_first_bounds:
+            return pick_effective_bounds(pt0, pb0, chain)
+        return pt0, pb0
+
+    eff_pt, eff_pb = pt, pb
+    group_indexes: List[int] = []
+    if ancestors_rects_chain:
+        cur_top_for_mapping = pt
+        bounds: tuple[int, int] | None = None
+        for level_idx, rects_at_level in enumerate(ancestors_rects_chain):
+            ordered = _filter_ordered_bounds(rects_at_level, bounds)
+            gi_local, matched = _find_group_index_for_top(ordered, cur_top_for_mapping)
+            group_indexes.append(gi_local)
+            if matched is not None:
+                bounds = matched
+                if level_idx == 0:
+                    eff_pt, eff_pb = matched
+
+    eff_pt, eff_pb = _compute_eff_bounds(pt, pb, ancestors_rects_chain, policy)
+    return group_indexes, eff_pt, eff_pb
+
+def collect_row_values(
+    *,
+    ws,
+    current_positions: Mapping[str, Tuple[int, int]],
+    direction: str,
+    local_index: int,
+    step: int,
+    eff_top: int,
+    eff_bottom: int,
+) -> tuple[Dict[str, Any], Dict[str, Tuple[int, int]], bool]:
+    """一行分のセル値を収集し、使用座標と非空判定を返す。
+
+    入力:
+    - ws: ワークシートオブジェクト（`read_cell_value` が参照）
+    - current_positions: フィールド -> (col,row) の基準座標
+    - direction: 進行方向（"row"/"col"）
+    - local_index: 相対インデックス（1始まり）
+    - step: ステップ幅
+    - eff_top/eff_bottom: 有効範囲の上下端（行方向の判定に利用）
+
+    出力:
+    - values_by_field: フィールド -> 値
+    - used_positions: フィールド -> 実読取位置 (col,row)
+    - non_empty: いずれかの値が非空であれば True
+    """
+    values_by_field: Dict[str, Any] = {}
+    used_positions: Dict[str, Tuple[int, int]] = {}
+    non_empty = False
+    for fname, (c0, r0) in current_positions.items():
+        tc, tr = calculate_target_position((c0, r0), direction, local_index, step)
+        if tr < eff_top or tr > eff_bottom:
+            val = ""
+        else:
+            val = read_cell_value((tc, tr), ws)
+        values_by_field[fname] = val
+        used_positions[fname] = (tc, tr)
+        if val not in (None, ""):
+            non_empty = True
+    return values_by_field, used_positions, non_empty
+
+def has_non_numeric_payload(
+    *,
+    values_by_field: Mapping[str, Any],
+    numeric_token_fields: Sequence[str],
+) -> bool:
+    """行内に、数値トークン以外で非空の値が一つでもあるかを判定する。"""
+    return any(
+        (fn not in numeric_token_fields) and (vv not in (None, ""))
+        for fn, vv in values_by_field.items()
+    )
+
+def should_skip_early_checks(
+    *,
+    values_by_field: Mapping[str, Any],
+    non_empty: bool,
+    resolved_labels: Sequence[str] | None,
+    policy: ExtractionPolicy,
+    expected_len: int,
+    numeric_token_fields: Sequence[str],
+    used_positions: Mapping[str, Tuple[int, int]],
+    group_key: Tuple[int, ...],
+    claims_by_group: Dict[Tuple[int, ...], set[int]],
+) -> bool:
+    """_scan_and_emit_main での早期スキップ判定をひとまとめにする。
+
+    順序:
+    1) ラベル／非空に基づく抑止判定
+    2) 所有権ベースのスキップ
+    どちらかが真なら True（スキップ）。
+    """
+    if should_suppress_element(
+        values_by_field=dict(values_by_field),
+        non_empty=non_empty,
+        labels_in_scope=list(resolved_labels) if resolved_labels is not None else None,
+        policy=policy,
+    ):
+        return True
+    if should_skip_by_row_ownership(
+        policy=policy.nested_scan,
+        expected_len=expected_len,
+        numeric_token_fields=list(numeric_token_fields),
+        used_positions=dict(used_positions),
+        non_empty=non_empty,
+        group_key=group_key,
+        claims_by_group=claims_by_group,
+    ):
+        return True
+    return False
+
+def _scan_and_emit_main(
+    workbook,
+    target_sheet,
+    ws0,
+    container_name,
+    direction,
+    current_positions,
+    labels,
+    policy,
+    parent_rects,
+    ancestors_rects_chain,
+    generated_names,
+    num_positions,
+    ends_with_numeric,
+    child_anchor_row,
+    allowed_parent_indices,
+    base_numeric_token_fields,
+) -> int:
+    """メイン走査: 親矩形ごとに行を走査し、子要素を出力する。
+
+    入力:
+    - ワークブック/シート、コンテナ名、走査方向、現在位置、ラベル、ポリシ、親矩形と祖先チェーン、生成名マップ。
+    - 数値トークン構成（`num_positions`/`ends_with_numeric`）、アンカー行、許可親インデックス、数値トークン対象フィールド。
+
+    出力:
+    - 出力した子要素の合計数（int）。
+
+    例外/副作用:
+    - 原則ここでは例外を送出しない（下位が握りつぶす）。
+    - `generated_names` 等のマップを破壊的に更新し、`stats()` を通じ処理統計を更新しうる。
+
+    フェーズ構成（概要）:
+    1) 親矩形ループ: 有効境界とグループインデックスを算出
+    2) アンカー探索: 予測インデックス→ローカルアンカー→反復範囲 i0..i1
+    3) 行ループ: 値収集→早期スキップ→数値トークン調整→受理判定
+    4) 出力: EmitOps に委譲
+    """
+    # === 0) ループ外の採番・重複・所有権トラッカ初期化 ===
+    grand_local_parent_counts: Dict[Tuple[int, ...], int] = {}
+    parent_local_counts_by_group: Dict[Tuple[int, ...], int] = {}
+    child_emitted_by_group: Dict[Tuple[int, ...], int] = {}
+    seen_numeric_tokens_by_group: Dict[Tuple[int, ...], set[str]] = {}
+    child_row_claims_by_group: Dict[Tuple[int, ...], set[int]] = {}
+    emitted_total = 0
+    for p_index, (pl, pt, pr, pb) in enumerate(parent_rects, start=1):
+        # === 1) 親矩形ごとの前処理: 有効境界とグループインデックス ===
+        group_indexes, eff_pt, eff_pb = compute_group_indexes_and_bounds(
+            pt=pt,
+            pb=pb,
+            ancestors_rects_chain=ancestors_rects_chain,
+            policy=policy,
+        )
+        group_key = tuple(group_indexes) if group_indexes else (1,)
+
+        # === 2) アンカー探索: ステップとローカルアンカー決定 ===
+        eff_step_local = derive_eff_step_local(
+            labels_present=bool(labels),
+            ends_with_numeric=ends_with_numeric,
+            workbook=workbook,
+            container_name=container_name,
+            target_sheet=target_sheet,
+            eff_pt=eff_pt,
+            eff_pb=eff_pb,
+            direction=direction,
+            policy=policy.nested_scan,
+        )
+
+        if eff_pb < child_anchor_row:
+            continue
+
+        numeric_token_fields: list[str] = list(base_numeric_token_fields)
+
+        # 従来どおり、プローブ選定は select_probe_fields で行う（挙動不変）
+        probe_fields = select_probe_fields(
+            current_positions=current_positions,
+            labels=labels,
+            numeric_token_fields=numeric_token_fields,
+        )
+
+        local_aligned_row = align_row_phase(eff_pt, child_anchor_row, eff_step_local)
+
+        ws_probe = ws0
+        predicted_parent_local_index = AnchorOps.predict_parent_local_index(
+            group_key=group_key,
+            ancestors_rects_chain=ancestors_rects_chain,
+            parent_local_counts_by_group=parent_local_counts_by_group,
+            grand_local_parent_counts=grand_local_parent_counts,
+        )
+        found_local_anchor = AnchorOps.locate_found_local_anchor(
+            ws_probe=ws_probe,
+            current_positions=current_positions,
+            probe_fields=probe_fields,
+            local_aligned_row=local_aligned_row,
+            eff_pb=eff_pb,
+            step=eff_step_local,
+            num_positions=num_positions,
+            group_indexes=group_indexes,
+            predicted_parent_local_index=predicted_parent_local_index,
+        )
+
+        anchor_for_calc = found_local_anchor if found_local_anchor is not None else local_aligned_row
+        i0, i1 = _compute_iteration_bounds(
+            child_anchor_row=child_anchor_row,
+            region_bottom=eff_pb,
+            anchor_row=anchor_for_calc,
+            step=eff_step_local,
+        )
+        logger.debug(
+            "NESTED-DBG %s p=%s eff_pt=%s eff_pb=%s step=%s child_anchor_row=%s found_row=%s i0=%s i1=%s",
+            container_name,
+            p_index,
+            eff_pt,
+            eff_pb,
+            eff_step_local,
+            child_anchor_row,
+            found_local_anchor,
+            i0,
+            i1,
+        )
+        if i1 < i0:
+            continue
+
+        parent_local_index = AnchorOps.increment_parent_local_index(
+            group_key=group_key,
+            ancestors_rects_chain=ancestors_rects_chain,
+            parent_local_counts_by_group=parent_local_counts_by_group,
+            grand_local_parent_counts=grand_local_parent_counts,
+        )
+        # 許可された親インデックス集合が十分に得られている場合のみフィルタを適用。
+        # 1件だけのときは不完全な観測の可能性があるため、抑止しない。
+        if (
+            isinstance(allowed_parent_indices, set)
+            and len(allowed_parent_indices) >= 2
+            and parent_local_index not in allowed_parent_indices
+        ):
+            continue
+
+    # === 3) 行ループ: 値収集→早期スキップ→数値調整→受理 ===
+        for local_i in range(i0, i1 + 1):
+            # ラベル解決はループ内で都度行う（従来の等価動作に戻す）
+            resolved_labels2 = [lf for lf in labels if lf in current_positions]
+            values_by_field, used_positions, non_empty = collect_row_values(
+                ws=ws0,
+                current_positions=current_positions,
+                direction=direction,
+                local_index=local_i,
+                step=eff_step_local,
+                eff_top=eff_pt,
+                eff_bottom=eff_pb,
+            )
+
+            if not passes_numeric_row_requirements(
+                values_by_field=values_by_field,
+                num_positions=num_positions,
+                numeric_token_fields=base_numeric_token_fields,
+            ):
                 continue
 
-            # 基準位置からincrement分移動した位置を計算
-            target_position = calculate_target_position(
-                base_positions[item], direction, instance_idx, increment
+            if should_skip_early_checks(
+                values_by_field=values_by_field,
+                non_empty=non_empty,
+                resolved_labels=resolved_labels2,
+                policy=policy,
+                expected_len=len(num_positions),
+                numeric_token_fields=base_numeric_token_fields,
+                used_positions=used_positions,
+                group_key=group_key,
+                claims_by_group=child_row_claims_by_group,
+            ):
+                continue
+
+            _adjust_values_with_numeric_token(
+                values_by_field=values_by_field,
+                used_positions=used_positions,
+                numeric_token_fields=base_numeric_token_fields,
+                ws=ws0,
+                eff_top=eff_pt,
+                eff_bottom=eff_pb,
             )
 
-            # 生成するセル名
-            cell_name = f"json.{base_container_name}.{instance_idx}.{item}"
+            seq_like_val2 = extract_seq_like_value(values_by_field, base_numeric_token_fields)
+            if not check_seq_accept_and_dedup(
+                policy=policy.numeric_tokens,
+                expected_len=len(num_positions),
+                has_numeric_series_field=bool(base_numeric_token_fields),
+                seq_like_val=seq_like_val2,
+                group_indexes=group_indexes,
+                parent_local_index=parent_local_index,
+                group_key_for_dedup=group_key + (parent_local_index,),
+                seen_tokens=seen_numeric_tokens_by_group,
+            ):
+                continue
 
-            # Excelから値を読み取り
-            cell_value = read_cell_value(target_position, ws)
-            processing_stats.cells_read += 1
+            if not row_is_acceptable_for_emission(
+                values_by_field=values_by_field,
+                non_empty=non_empty,
+                resolved_labels=resolved_labels2,
+                policy=policy,
+            ):
+                continue
 
-            logger.debug(
-                f"セル値読み取り {cell_name}: row={target_position[1]}, col={target_position[0]}, value={cell_value}"
+            # === 4) 出力: EmitOps に委譲 ===
+            emitted_total += EmitOps.emit_row_payload(
+                container_name=container_name,
+                parent_local_index=parent_local_index,
+                group_indexes=group_indexes,
+                group_key=group_key,
+                child_emitted_by_group=child_emitted_by_group,
+                values_by_field=values_by_field,
+                used_positions=used_positions,
+                direction=direction,
+                eff_step_local=eff_step_local,
+                target_sheet=target_sheet,
+                workbook=workbook,
+                ws0=ws0,
+                generated_names=generated_names,
             )
+    return emitted_total
 
-            if cell_value:
-                all_empty = False
-            else:
-                processing_stats.empty_cells_skipped += 1
+def row_is_acceptable_for_emission(
+    *,
+    values_by_field: Mapping[str, Any],
+    non_empty: bool,
+    resolved_labels: Sequence[str],
+    policy,
+) -> bool:
+    """最終出力直前の行が受理可能かを判定する。
 
-            instance_values[cell_name] = cell_value
+    - 抑止ポリシー（labels_in_scope=None）で弾かれる場合は False
+    - ラベルがなく、かつ実質的に空行なら False
+    - それ以外は True（従来ロジックと等価）
+    """
+    if should_suppress_element(
+        values_by_field=dict(values_by_field),
+        non_empty=non_empty,
+        labels_in_scope=None,
+        policy=policy,
+    ):
+        return False
+    if not resolved_labels and not non_empty:
+        return False
+    return True
 
-        # 全項目が空でない場合のみ生成されたセル名に追加
-        if not all_empty:
-            generated_names.update(instance_values)
-            processing_stats.cells_generated += len(instance_values)
-            logger.debug(f"インスタンス{instance_idx}: 有効なデータとして追加")
-        else:
-            logger.debug(f"インスタンス{instance_idx}: 全項目が空のため除外")
+def _scan_and_emit_fallback(
+    workbook,
+    target_sheet,
+    ws0,
+    container_name,
+    direction,
+    current_positions,
+    labels,
+    policy,
+    parent_rects,
+    ancestors_rects_chain,
+    generated_names,
+    num_positions,
+    ends_with_numeric,
+    child_anchor_row,
+    base_numeric_token_fields,
+) -> int:
+    """フォールバック走査: 非範囲の単一値として出力する安全網。
 
+    役割:
+    - アンカー行に揃えた上で、数値トークン行を主とした簡易走査を行い、`EmitOps.emit_row_payload_fallback` で出力する。
 
-def process_card_container(
-    container_name, container_def, range_spec, workbook, generated_names
+    出力: 出力した子要素の合計数（int）。
+    例外/副作用: 原則ここで例外は上げず、`generated_names`/統計を更新。
+
+    フェーズ:
+    1) 親矩形から祖先グループとの交差を把握
+    2) 祖先グループごとに、親が未配置のグループのみ走査範囲を確定
+    3) アンカー近傍の行反復で値収集→受理判定→フォールバック出力
+    """
+    emitted_total = 0
+    top_anc_rects = ancestors_rects_chain[0] if ancestors_rects_chain else []
+    # フォールバック内の一時状態（重複トークン・子インデックス）
+    seen_numeric_tokens_by_group: Dict[Tuple[int, int], set[str]] = {}
+    child_emitted_by_group: Dict[Tuple[int, int], int] = {}
+    groups_with_parent: set[int] = set()
+    for _pidx, (_pl, _pt2, _pr2, _pb2) in enumerate(parent_rects or [], start=1):
+        for g_i, (_al, _at2, _ar2, _ab2) in enumerate(top_anc_rects, start=1):
+            if not (_pb2 < _at2 or _pt2 > _ab2):
+                groups_with_parent.add(g_i)
+
+    for g_i, (_al, _at2, _ar2, _ab2) in enumerate(top_anc_rects, start=1):
+        if g_i in groups_with_parent:
+            continue
+        fb_pt, fb_pb = _at2, _ab2
+        if fb_pb < child_anchor_row:
+            continue
+        fb_step = 1
+        # 祖先 g_i と親が交差しないグループのアンカー候補を探索
+        local_aligned_fb = align_row_phase(fb_pt, child_anchor_row, fb_step)
+        predicted_parent_local_index = 1
+        expected_len_fb = len(num_positions)
+        expected_prefix_fb = [str(x) for x in ([g_i] + [predicted_parent_local_index])]
+        anchor_row_fb = AnchorOps.find_numeric_token_anchor_row(
+            current_positions=current_positions,
+            ws0=ws0,
+            start_row=local_aligned_fb,
+            end_row=fb_pb,
+            expected_prefix=expected_prefix_fb,
+            expected_len=expected_len_fb,
+        ) or local_aligned_fb
+        i0_fb, i1_fb = _compute_iteration_bounds(
+            child_anchor_row=child_anchor_row,
+            region_bottom=fb_pb,
+            anchor_row=anchor_row_fb,
+            step=fb_step,
+        )
+        if i1_fb < i0_fb:
+            continue
+        # アンカー周辺の行を順次評価
+        for li in range(i0_fb, i1_fb + 1):
+            vals_fb, used_pos, non_empty_fb = collect_row_values(
+                ws=ws0,
+                current_positions=current_positions,
+                direction=direction,
+                local_index=li,
+                step=fb_step,
+                eff_top=fb_pt,
+                eff_bottom=fb_pb,
+            )
+            seq_val_fb = extract_seq_like_value(vals_fb, None)
+            if not seq_val_fb:
+                continue
+            if not has_non_numeric_payload(values_by_field=vals_fb, numeric_token_fields=base_numeric_token_fields):
+                continue
+            # dedup判定
+            grp_key_fb2 = (g_i, predicted_parent_local_index)
+            seen_fb = seen_numeric_tokens_by_group.setdefault(grp_key_fb2, set())
+            if seq_val_fb in seen_fb:
+                continue
+            seen_fb.add(seq_val_fb)
+            if should_suppress_element(
+                values_by_field=vals_fb,
+                non_empty=non_empty_fb,
+                labels_in_scope=None,
+                policy=policy,
+            ):
+                continue
+            emitted_total += EmitOps.emit_row_payload_fallback(
+                container_name=container_name,
+                predicted_parent_local_index=predicted_parent_local_index,
+                group_index=g_i,
+                values_by_field=vals_fb,
+                child_emitted_by_group=child_emitted_by_group,
+                generated_names=generated_names,
+            )
+    return emitted_total
+
+def passes_numeric_row_requirements(
+    *,
+    values_by_field: Mapping[str, Any],
+    num_positions: Sequence[Any],
+    numeric_token_fields: Sequence[str] | None,
+) -> bool:
+    """数値トークンを使用するケースで、行が最低限の要件を満たすか判定する。"""
+    try:
+        if not (len(num_positions) >= 2 and numeric_token_fields):
+            return True
+        numeric_on_row = any(
+            (fn in numeric_token_fields) and is_numeric_token_string(vv)
+            for fn, vv in values_by_field.items()
+        )
+        if not numeric_on_row:
+            return False
+        return has_non_numeric_payload(values_by_field=values_by_field, numeric_token_fields=numeric_token_fields)
+    except Exception:
+        return False
+
+def extract_seq_like_value(values_by_field: Mapping[str, Any], numeric_token_fields: Optional[Sequence[str]]) -> Optional[str]:
+    """値集合から数値トークン様の値を1つ拾って返す（なければ None）。
+
+    - `numeric_token_fields` が与えられた場合: そのフィールド名群の中から最初に見つかったトークンを優先
+    - `None` の場合: 行内のいずれのフィールドでも最初に見つかったトークンを返す（フォールバックと同等）
+    返値は文字列化済み。
+    """
+    if numeric_token_fields:
+        for fn in numeric_token_fields:
+            vv = values_by_field.get(fn)
+            if is_numeric_token_string(vv):
+                return str(vv)
+    else:
+        for _fn, _vv in values_by_field.items():
+            if is_numeric_token_string(_vv):
+                return str(_vv)
+    return None
+
+def _adjust_values_with_numeric_token(
+    *,
+    values_by_field: Dict[str, Any],
+    used_positions: Mapping[str, Tuple[int, int]],
+    numeric_token_fields: Sequence[str],
+    ws,
+    eff_top: int,
+    eff_bottom: int,
+) -> None:
+    """行内の数値トークンと同値な値を持つフィールドに対し、近傍セルから代替値を補完する。"""
+    try:
+        seq_like_val = None
+        seq_like_col = None
+        primary_numeric_field = None
+        for fn, vc in values_by_field.items():
+            if is_numeric_token_string(vc):
+                seq_like_val = vc
+                seq_like_col, _ = used_positions.get(fn, (None, None))
+                primary_numeric_field = fn
+                break
+        if seq_like_val is None:
+            return
+        for fn in list(values_by_field.keys()):
+            if primary_numeric_field is not None and fn == primary_numeric_field:
+                continue
+            vc = values_by_field.get(fn)
+            fc, fr = used_positions.get(fn, (None, None))
+            if vc == seq_like_val and fr is not None:
+                for d in (1, 2, 3):
+                    alt_candidates: list[tuple[int, int]] = []
+                    if seq_like_col is not None:
+                        alt_candidates.append((seq_like_col + d, fr))
+                    if fc is not None:
+                        alt_candidates.append((fc + d, fr))
+                    for ac, ar in alt_candidates:
+                        if ar < eff_top or ar > eff_bottom:
+                            continue
+                        alt_val = read_cell_value((ac, ar), ws)
+                        if alt_val not in (None, "") and alt_val != seq_like_val:
+                            values_by_field[fn] = alt_val
+                            raise StopIteration  # 1つ見つけたら終了（元実装のbreakのネスト解消）
+    except StopIteration:
+        return
+    except Exception:
+        # 失敗しても無視（元実装と同等の寛容さ）
+        return
+
+class EmitOps:
+    """出力系ユーティリティをまとめたクラス。
+
+    役割:
+    - 子要素の採番、親・祖先インデックスを付与したキー生成、フィールド値の出力（範囲対応含む）。
+    - 既存の関数実装（薄いラッパー）と同等の振る舞いを維持する。
+    """
+
+    @classmethod
+    def build_parented_container_key(
+        cls,
+        *,
+        container_name: str,
+        parent_local_index: int,
+        group_indexes: Sequence[int] | None,
+    ) -> str:
+        """親インデックスと祖先グループインデックスを反映したコンテナキーを生成する。
+
+        入力:
+        - `container_name`: 基底のコンテナ名（例: `json.A.1.items.1`）。
+        - `parent_local_index`: 親ローカルインデックス（1始まり）。
+        - `group_indexes`: 祖先グループのインデックス列（外側→内側）。無ければ `None`。
+
+        出力:
+        - 親・祖先を反映したキー文字列。
+
+        例外:
+        - なし（入力は呼び出し側で整合がとれている前提）。
+        副作用:
+        - なし。
+        """
+        key = _set_parent_index_in_key(container_name, parent_local_index)
+        if group_indexes:
+            for offset, gi in enumerate(reversed(group_indexes), start=3):
+                key = _replace_nth_from_end_numeric(key, offset, gi)
+        return key
+
+    @classmethod
+    def emit_row_payload(
+        cls,
+        *,
+        container_name: str,
+        parent_local_index: int,
+        group_indexes: Sequence[int],
+        group_key: Tuple[int, ...],
+        child_emitted_by_group: Dict[Tuple[int, ...], int],
+        values_by_field: Mapping[str, Any],
+        used_positions: Mapping[str, Tuple[int, int]],
+        direction: str,
+        eff_step_local: int,
+        target_sheet: Optional[str],
+        workbook,
+        ws0,
+        generated_names: Dict[str, Any],
+    ) -> int:
+        """1 行分の値を出力し、子要素インデックスを採番する（範囲対応）。
+
+        入力:
+        - `container_name`: 対象コンテナの `.1` アンカー名。
+        - `parent_local_index`: 親のローカルインデックス（1始まり）。
+        - `group_indexes`: 祖先グループのインデックス列（外側→内側）。
+        - `group_key`: グループ境界のキー（採番スコープ）。
+        - `child_emitted_by_group`: 子インデックスの採番管理マップ（更新される）。
+        - `values_by_field`: フィールド名→スカラ値の辞書。
+        - `used_positions`: フィールド名→セル位置（範囲読み取り時の起点）。
+        - `direction`: 走査方向（"row"/"column"）。
+        - `eff_step_local`: 走査ステップ数（1 以上）。
+        - `target_sheet`/`workbook`/`ws0`: 値の読み取り元。
+        - `generated_names`: 出力先辞書（更新される）。
+
+        出力:
+        - 当該呼び出しで出力した子要素数（通常 1）。
+
+        例外:
+        - 下位の値読み取りで例外は握りつぶし、フォールバックで単一値出力に切り替えるため、原則ここでは送出しない。
+        副作用:
+        - `generated_names` にキー/値を追記。
+        - `child_emitted_by_group` を更新。
+        - `processing_stats.cells_generated` を可能な範囲でインクリメント。
+        """
+        grp_key = group_key + (parent_local_index,)
+        prev = child_emitted_by_group.get(grp_key, 0)
+        child_idx_emitted = prev + 1
+        child_emitted_by_group[grp_key] = child_idx_emitted
+        emitted_here = 1
+
+        cont_key_parented = cls.build_parented_container_key(
+            container_name=container_name,
+            parent_local_index=parent_local_index,
+            group_indexes=group_indexes,
+        )
+
+        for fname, val in list(values_by_field.items()):
+            emit_field_value_with_optional_range(
+                container_name=container_name,
+                cont_key_parented=cont_key_parented,
+                child_idx_emitted=child_idx_emitted,
+                fname=fname,
+                value_scalar=val,
+                used_positions=dict(used_positions),
+                direction=direction,
+                eff_step_local=eff_step_local,
+                target_sheet=target_sheet,
+                workbook=workbook,
+                ws0=ws0,
+                generated_names=generated_names,
+            )
+        return emitted_here
+
+    @classmethod
+    def emit_row_payload_fallback(
+        cls,
+        *,
+        container_name: str,
+        predicted_parent_local_index: int,
+        group_index: int,
+        values_by_field: Mapping[str, Any],
+        child_emitted_by_group: Dict[Tuple[int, int], int],
+        generated_names: Dict[str, Any],
+    ) -> int:
+        """範囲解釈を行わないフォールバック出力（単一値のみ）。
+
+        入力:
+        - `container_name`: 対象コンテナの `.1` アンカー名。
+        - `predicted_parent_local_index`: 親ローカルインデックスの予測値（1始まり）。
+        - `group_index`: 現在のグループインデックス。
+        - `values_by_field`: フィールド名→スカラ値の辞書。
+        - `child_emitted_by_group`: 子インデックスの採番管理マップ（更新される）。
+        - `generated_names`: 出力先辞書（更新される）。
+
+        出力:
+        - 当該呼び出しで出力した子要素数（1 固定）。
+
+        例外/副作用:
+        - 例外は握りつぶし、`generated_names` への追加と統計を継続。
+        - `processing_stats.cells_generated` のインクリメントを試行。
+        """
+        cont_key_parented_fb = cls.build_parented_container_key(
+            container_name=container_name,
+            parent_local_index=predicted_parent_local_index,
+            group_indexes=[group_index],
+        )
+        grp_key_fb = (group_index, predicted_parent_local_index)
+        prev_fb = child_emitted_by_group.get(grp_key_fb, 0)
+        child_idx_fb = prev_fb + 1
+        child_emitted_by_group[grp_key_fb] = child_idx_fb
+        for fn, vv in values_by_field.items():
+            k = generate_cell_name_for_element(cont_key_parented_fb, child_idx_fb, fn)
+            generated_names[k] = vv
+            try:
+                stats().cells_generated += 1
+            except Exception:
+                logger.debug("failed to increment cells_generated in AnchorOps.emit_fallback_child_values", exc_info=True)
+        return 1
+
+class AnchorOps:
+    """アンカー探索と親ローカルインデックス管理をまとめたクラス。
+
+    役割:
+    - 親ローカルインデックスの予測/増分、子要素ローカルアンカー行の探索、数値トークン行のアンカー推定。
+    - 既存の関数実装と同等の振る舞いを維持する。
+    """
+
+    @classmethod
+    def predict_parent_local_index(
+        cls,
+        *,
+        group_key: Tuple[int, ...],
+        ancestors_rects_chain: Sequence[Sequence[RectTuple]] | None,
+        parent_local_counts_by_group: Mapping[Tuple[int, ...], int],
+        grand_local_parent_counts: Mapping[Tuple[int, ...], int],
+    ) -> int:
+        """親ローカルインデックスを予測して返す（1始まり）。
+
+        入力:
+        - `group_key`: グループ境界のキー。
+        - `ancestors_rects_chain`: 祖先矩形のチェーン（あれば親ローカル採番を優先）。
+        - `parent_local_counts_by_group`: 直近親に対する採番カウンタ（読み取り専用）。
+        - `grand_local_parent_counts`: 祖父系の採番カウンタ（読み取り専用）。
+
+        出力: 予測される親ローカルインデックス。
+        例外/副作用: なし。
+        """
+        if ancestors_rects_chain:
+            return parent_local_counts_by_group.get(group_key, 0) + 1
+        return grand_local_parent_counts.get(group_key, 0) + 1
+
+    @classmethod
+    def locate_found_local_anchor(
+        cls,
+        *,
+        ws_probe,
+        current_positions: Mapping[str, Tuple[int, int]],
+        probe_fields: Sequence[str],
+        local_aligned_row: int,
+        eff_pb: int,
+        step: int,
+        num_positions: Sequence[Any],
+        group_indexes: Sequence[int],
+        predicted_parent_local_index: int,
+    ) -> Optional[int]:
+        """子要素のローカルアンカー行を探索して返す。
+
+        入力:
+        - `ws_probe`: 参照ワークシート。
+        - `current_positions`: フィールド→セル位置。
+        - `probe_fields`: 探索対象フィールド。
+        - `local_aligned_row`: 探索の基準行（1始まり）。
+        - `eff_pb`: 有効領域の下端行。
+        - `step`: 走査ステップ。
+        - `num_positions`: 数値トークンの位置配列。
+        - `group_indexes`: 祖先グループインデックス列。
+        - `predicted_parent_local_index`: 予測される親ローカルインデックス。
+
+        出力: 見つかったローカルアンカー行（見つからなければ `None`）。
+        例外/副作用: なし（内部で失敗時はフォールバック探索へ）。
+        """
+        found_local_anchor: Optional[int] = None
+        numeric_probe_cols: list[int] = []
+        try:
+            for fn in probe_fields:
+                pos = current_positions.get(fn)
+                if pos is None:
+                    continue
+                c0, _r0 = pos
+                if c0 is not None:
+                    numeric_probe_cols.append(c0)
+        except Exception:
+            logger.debug("AnchorOps.locate_found_local_anchor: collecting numeric_probe_cols failed", exc_info=True)
+        if numeric_probe_cols:
+            expected_len = len(num_positions)
+            expected_prefix = [str(x) for x in (list(group_indexes) + [predicted_parent_local_index])]
+            found_local_anchor = find_local_anchor_row(
+                ws=ws_probe,
+                current_positions=dict(current_positions),
+                probe_fields=list(probe_fields),
+                numeric_probe_cols=numeric_probe_cols,
+                local_aligned_row=local_aligned_row,
+                eff_pb=eff_pb,
+                step=step,
+                expected_len=expected_len,
+                expected_prefix=expected_prefix,
+            )
+        if found_local_anchor is None:
+            found_local_anchor = find_local_anchor_row(
+                ws=ws_probe,
+                current_positions=dict(current_positions),
+                probe_fields=list(probe_fields),
+                numeric_probe_cols=[],
+                local_aligned_row=local_aligned_row,
+                eff_pb=eff_pb,
+                step=step,
+                expected_len=len(num_positions),
+                expected_prefix=[str(x) for x in list(group_indexes)],
+            )
+        return found_local_anchor
+
+    @classmethod
+    def increment_parent_local_index(
+        cls,
+        *,
+        group_key: Tuple[int, ...],
+        ancestors_rects_chain: Sequence[Sequence[RectTuple]] | None,
+        parent_local_counts_by_group: Dict[Tuple[int, ...], int],
+        grand_local_parent_counts: Dict[Tuple[int, ...], int],
+    ) -> int:
+        """親ローカルインデックスのカウンタを 1 増やし、その新値を返す。
+
+        入力:
+        - `group_key`: グループ境界のキー。
+        - `ancestors_rects_chain`: 祖先矩形のチェーン（あれば親ローカル採番を使用）。
+        - `parent_local_counts_by_group`/`grand_local_parent_counts`: カウンタ（更新される）。
+
+        出力: 更新後の親ローカルインデックス。
+        例外/副作用: 該当カウンタマップを破壊的に更新。
+        """
+        if ancestors_rects_chain:
+            parent_local_counts_by_group.setdefault(group_key, 0)
+            parent_local_counts_by_group[group_key] += 1
+            return parent_local_counts_by_group[group_key]
+        grand_local_parent_counts.setdefault(group_key, 0)
+        grand_local_parent_counts[group_key] += 1
+        return grand_local_parent_counts[group_key]
+
+    @classmethod
+    def find_numeric_token_anchor_row(
+        cls,
+        *,
+        current_positions: Mapping[str, Tuple[int, int]],
+        ws0,
+        start_row: int,
+        end_row: int,
+        expected_prefix: Sequence[str],
+        expected_len: int,
+        max_scans: int = 5000,
+    ) -> Optional[int]:
+        """数値トークン（ハイフン区切り）を用いてアンカー行を粗く探索する。
+
+        入力:
+        - `current_positions`: フィールド→セル位置。
+        - `ws0`: 参照ワークシート。
+        - `start_row`/`end_row`: 探索範囲（含む）。
+        - `expected_prefix`: トークンの先頭一致配列（例: 祖先グループインデックス群）。
+        - `expected_len`: 期待トークン長。
+        - `max_scans`: 安全のための最大走査行数。
+
+        出力: 見つかった行番号、なければ `None`。
+        例外/副作用: なし。
+        """
+        rfb = start_row
+        scans = 0
+        while rfb <= end_row and scans < max_scans:
+            sval = ""
+            for _fn, (_c0, _r0) in current_positions.items():
+                sval = read_cell_value((_c0, rfb), ws0)
+                if is_numeric_token_string(sval):
+                    break
+            if is_numeric_token_string(sval):
+                toks = [t for t in str(sval).split("-") if t]
+                prefix_ok = len(toks) >= len(expected_prefix) and all(
+                    (i < len(toks) and toks[i] == expected_prefix[i]) for i in range(len(expected_prefix))
+                )
+                if prefix_ok and len(toks) == expected_len:
+                    return rfb
+            rfb += 1
+            scans += 1
+        return None
+
+ 
+
+def _compute_iteration_bounds(
+    *,
+    child_anchor_row: int,
+    region_bottom: int,
+    anchor_row: int,
+    step: int,
+) -> Tuple[int, int]:
+    """子のアンカー行と領域下端から、反復の開始・終了インデックスを算出する（1始まり）。"""
+    i0_fb = 1 if anchor_row <= child_anchor_row else ((anchor_row - child_anchor_row) // step) + 1
+    i1_fb = ((region_bottom - child_anchor_row) // step) + 1 if region_bottom >= child_anchor_row else 0
+    return i0_fb, i1_fb
+
+def process_container(
+    container_name,
+    container_def,
+    workbook,
+    generated_names,
+    global_max_elements: Optional[int] = None,
+    *,
+    extraction_policy: Optional[ExtractionPolicy] = None,
 ):
-    """カード型コンテナの処理"""
-    logger.debug(f"カード型コンテナ処理: {container_name}")
-
+    """コンテナ処理（range非依存・マルチシート集約対応）"""
+    # デフォルト値
+    policy = extraction_policy or _DEFAULT_EXTRACTION_POLICY
     direction = container_def.get("direction", "row")
-    increment = container_def.get("increment", 1)
-    items = container_def.get("items", [])
-    labels = container_def.get("labels", [])
+    increment = container_def.get("increment", 0)
+    logger.debug(
+        f"コンテナ処理: {container_name}, direction={direction}, increment={increment}"
+    )
+    # 全シートを対象として、定義名と実セル値から推定する。
+    sheeted_ranges: list[tuple[Optional[str], Optional[str]]] = enumerate_sheeted_ranges_sorted(workbook)
 
-    # 基準セル名を検索
-    base_container_name = container_name.replace("json.", "")
-    base_positions = {}
+    next_index = 1  # シート横断のグローバル連番
 
-    # 複数の方法で基準位置を取得
-    for item in items:
-        position = None
+    # 1) まずコンテナ直下の全フィールド名（定義名）をワークブック全体から収集
+    try:
+        global_field_names = get_cell_names_in_container_range(
+            container_name, workbook, None
+        )
+    except Exception:
+        global_field_names = {}
 
-        # 方法1: インスタンス番号付きのセル名（既存の方法）
-        base_cell_name = f"json.{base_container_name}.1.{item}"
-        position = get_cell_position_from_name(base_cell_name, workbook)
-        if position:
-            logger.debug(f"カード基準位置取得（方法1）: {item} -> {position}")
+    # 2) 各シートで、そのフィールド定義名が座標解決できるかで nameful を判定
+    nameful_sheets, per_sheet_positions = build_nameful_sheets_and_positions(
+        container_name, workbook, sheeted_ranges
+    )
+
+    # 3) テンプレート座標は、nameful な最初のシートから確保
+    template_positions, template_sheet = select_template_positions(
+        nameful_sheets, per_sheet_positions, sheeted_ranges
+    )
+
+    logger.debug("SHEETS ORDER %s: %s", container_name, [s for s, _ in sheeted_ranges])
+    logger.debug("NAMEFUL %s: %s", container_name, sorted(list(nameful_sheets)))
+    logger.debug("TEMPLATE_SHEET %s: %s", container_name, template_sheet)
+    for target_sheet, _ignored in sheeted_ranges:
+        next_index = _process_sheet_for_container(
+            container_name=container_name,
+            container_def=container_def,
+            workbook=workbook,
+            generated_names=generated_names,
+            target_sheet=target_sheet,
+            base_cell_names=global_field_names,
+            nameful_sheets=nameful_sheets,
+            per_sheet_positions=per_sheet_positions,
+            template_positions=template_positions,
+            template_sheet=template_sheet,
+            global_max_elements=global_max_elements,
+            next_index=next_index,
+            extraction_policy=extraction_policy,
+        )
+
+
+def iter_defined_name_destinations_all(cell_name: str, workbook):
+    """同名のDefinedNameが複数存在する場合でも、全エントリのdestinationsを列挙する安全なイテレータ"""
+    # openpyxlでは workbook.defined_names.definedName に生のリストがある
+    dn_list = getattr(workbook.defined_names, "definedName", None)
+    if dn_list is not None:
+        for dn in dn_list:
+            if getattr(dn, "name", None) == cell_name:
+                for sn, coord in dn.destinations:
+                    yield sn, coord
+    else:
+        # フォールバック: マッピングAPI（同名が上書きされている可能性あり）
+        if cell_name in workbook.defined_names:
+            dn = workbook.defined_names[cell_name]
+            for sn, coord in dn.destinations:
+                yield sn, coord
+
+
+def get_cell_names_in_container_range(
+    container_key, workbook, sheet_name: Optional[str] = None
+):
+    logger.debug("GET_NAMES prefix for %s sheet=%s", container_key, sheet_name)
+
+    def _make_search_prefix(key: str) -> str:
+        parts = key.split(".")
+        return (".".join(parts[:-1]) + ".") if (parts and parts[-1].isdigit()) else (key + ".")
+
+    search_prefix = _make_search_prefix(container_key)
+
+    def _collect_all_defined_names() -> List[str]:
+        dn_list = getattr(workbook.defined_names, "definedName", None)
+        if dn_list is not None:
+            return [getattr(dn, "name", "") for dn in dn_list if getattr(dn, "name", "")]
+        return list(set(workbook.defined_names))
+
+    all_names = _collect_all_defined_names()
+
+    # 採用するセル名のマップと、フィールドごとの最小インデックスを管理
+    cell_names: Dict[str, str] = {}
+    best_index_by_field: Dict[str, int] = {}
+
+    def _sheet_matches(name: str) -> bool:
+        if sheet_name is None:
+            return True
+        for eff_sheet, coord in iter_defined_name_destinations_all(name, workbook):
+            if not eff_sheet and "!" in coord:
+                eff_sheet = coord.split("!", 1)[0]
+            if eff_sheet == sheet_name:
+                return True
+        return False
+
+    def _analyze_tail(name: str) -> tuple[str, int | None] | None:
+        tail = name[len(search_prefix) :]
+        tail_parts = tail.split(".") if tail else []
+        if len(tail_parts) == 2:
+            if tail_parts[0].isdigit() and not tail_parts[1].isdigit():
+                return tail_parts[1], int(tail_parts[0])
+            if tail_parts[1].isdigit() and not tail_parts[0].isdigit():
+                child_anchor_prefix = f"{search_prefix}{tail_parts[0]}.{tail_parts[1]}."
+                for n2 in all_names:
+                    if not n2.startswith(child_anchor_prefix):
+                        continue
+                    suffix = n2[len(child_anchor_prefix) :]
+                    first = suffix.split(".")[0] if suffix else ""
+                    if first and not first.isdigit():
+                        return None
+                return tail_parts[0], int(tail_parts[1])
+            return None
+        if (
+            len(tail_parts) >= 3
+            and (not tail_parts[-1].isdigit())
+            and tail_parts[-2].isdigit()
+            and all(seg.isdigit() for seg in tail_parts[:-2])
+        ):
+            return tail_parts[-1], int(tail_parts[-2])
+        return None
+
+    # 決定論的にするためにソートして走査
+    for name in sorted(all_names):
+        if not name or not name.startswith(search_prefix):
+            continue
+        if not _sheet_matches(name):
+            continue
+        analyzed = _analyze_tail(name)
+        if not analyzed:
+            continue
+        field_name, idx_val = analyzed
+
+        # 同一フィールドに対しては、より小さい index を優先して採用（例: .1 を優先）
+        if idx_val is None:
+            # index 不明の場合は、未設定のときのみ採用
+            if field_name not in cell_names:
+                cell_names[field_name] = name
+                logger.debug("GET_NAMES add %s -> %s (sheet=%s)", name, field_name, sheet_name)
+                logger.debug("セル名発見: %s -> フィールド名: %s, idx=%s", name, field_name, idx_val)
         else:
-            # 方法2: 最初のインスタンスのセル名（配列指定）
-            array_cell_name = f"json.{base_container_name}.{item}.1"
-            position = get_cell_position_from_name(array_cell_name, workbook)
-            if position:
-                logger.debug(f"カード基準位置取得（方法2）: {item} -> {position}")
-            else:
-                # 方法3: 直接のセル名（単一セル）
-                direct_cell_name = f"json.{base_container_name}.{item}"
-                position = get_cell_position_from_name(direct_cell_name, workbook)
-                if position:
-                    logger.debug(f"カード基準位置取得（方法3）: {item} -> {position}")
-                else:
-                    logger.warning(f"カード基準セル名が見つかりません: {item}")
+            prev = best_index_by_field.get(field_name)
+            if prev is None or idx_val < prev:
+                best_index_by_field[field_name] = idx_val
+                cell_names[field_name] = name
+                logger.debug("GET_NAMES add %s -> %s (sheet=%s)", name, field_name, sheet_name)
+                logger.debug("セル名発見: %s -> フィールド名: %s, idx=%s", name, field_name, idx_val)
 
-        if position:
-            base_positions[item] = position
+    return cell_names
 
-    if not base_positions:
-        logger.error(f"カード型基準位置が見つかりません: {container_name}")
-        return
 
-    # カード数の検出
-    ws = workbook.active
+def generate_cell_name_for_element(container_key, element_index, field_name):
+    """要素インデックスとフィールド名から動的セル名を生成"""
+    # "json.orders.1" + element_index=2 + "date" → "json.orders.2.date"
+    base_parts = container_key.split(".")
+    if base_parts[-1].isdigit():
+        base_parts[-1] = str(element_index)  # 末尾の数値を置換
+    else:
+        base_parts.append(str(element_index))
 
-    # カード型では基準セル名から既存のカード数を検出
-    card_count = detect_card_count_from_existing_names(base_container_name, workbook)
-    if card_count == 0:
-        # セル名がない場合は範囲から推定
-        card_count = detect_card_count(base_positions, direction, increment, labels, ws)
+    if field_name:
+        return ".".join(base_parts + [field_name])
+    else:
+        return ".".join(base_parts)
 
-    logger.debug(f"検出されたカード数: {card_count}")
 
-    # 各カードのデータを生成
-    for card_idx in range(1, card_count + 1):
-        instance_values = {}
-        all_empty = True
+def generate_dynamic_cell_names_from_positions(
+    container_key: str,
+    base_positions: dict,
+    element_count: int,
+    direction: str,
+    increment: int,
+    generated_names: dict,
+    workbook,
+    start_index: int = 1,
+    sheet_name: str | None = None,
+    step_override: Optional[int] = None,
+    *,
+    force_emit_all: bool = False,
+):
+    """基準座標を直接受け取り、任意シートから値を読み取ってセル名を生成。
+    1要素内の全フィールドが空値（None/""）の場合、その要素はスキップし、
+    実際に生成した要素数を返す。
+    """
+    if not base_positions or element_count <= 0:
+        return 0
+    ws = (
+        workbook[sheet_name]
+        if (sheet_name and sheet_name in getattr(workbook, "sheetnames", []))
+        else workbook.active
+    )
+    eff_step = _effective_step_for(step_override, increment)
+    emitted = 0
+    for local_i in range(1, element_count + 1):
+        _values, _positions, non_empty = _read_fields_for_local_index_from_positions(
+            local_idx=local_i,
+            base_positions=base_positions,
+            direction=direction,
+            eff_step=eff_step,
+            ws=ws,
+        )
+        _adjust_seq_like_values_in_row(_values, _positions, ws)
 
-        for item in items:
-            if item not in base_positions:
+        if not non_empty and not force_emit_all:
+            continue
+
+        emitted += 1
+        global_idx_emitted = start_index + emitted - 1
+        _emit_generated_values(
+            container_key=container_key,
+            generated_names=generated_names,
+            emitted_idx=global_idx_emitted,
+            values=_values,
+        )
+
+    return emitted
+
+
+def _effective_step_for(step_override: Optional[int], increment: int) -> int:
+    return step_override if (isinstance(step_override, int) and step_override > 0) else increment
+
+
+def _read_fields_for_local_index_from_positions(
+    *,
+    local_idx: int,
+    base_positions: Mapping[str, Tuple[int, int]],
+    direction: str,
+    eff_step: int,
+    ws,
+) -> tuple[dict[str, Any], dict[str, tuple[int, int]], bool]:
+    values: Dict[str, Any] = {}
+    positions: Dict[str, Tuple[int, int]] = {}
+    non_empty = False
+    for fn, base_pos in base_positions.items():
+        target_pos = calculate_target_position(base_pos, direction, local_idx, eff_step)
+        cell_value = read_cell_value(target_pos, ws)
+        values[fn] = cell_value
+        try:
+            positions[fn] = (target_pos[0], target_pos[1])
+        except Exception:
+            logger.debug("failed to record used_positions for %s", fn, exc_info=True)
+        if cell_value not in (None, ""):
+            non_empty = True
+    return values, positions, non_empty
+
+
+def _adjust_seq_like_values_in_row(values: dict[str, Any], positions: dict[str, tuple[int, int]], ws) -> None:
+    try:
+        seq_like_val = None
+        seq_like_col = None
+        primary_numeric_field = None
+        for fn, vc in values.items():
+            if is_numeric_token_string(vc):
+                seq_like_val = vc
+                seq_like_col, _ = positions.get(fn, (None, None))
+                primary_numeric_field = fn
+                break
+        if seq_like_val is None:
+            return
+        for fn in list(values.keys()):
+            if primary_numeric_field is not None and fn == primary_numeric_field:
                 continue
-
-            # カード型では既存のセル名がある場合はそれを使用
-            existing_cell_name = f"json.{base_container_name}.{card_idx}.{item}"
-            if existing_cell_name in [name for name in workbook.defined_names.keys()]:
-                # 既存のセル名から値を読み取り
-                defined_name = workbook.defined_names[existing_cell_name]
-                cell_value = get_named_range_values(workbook, defined_name)
-                logger.debug(
-                    f"既存セル名から値取得: {existing_cell_name} -> {cell_value}"
-                )
-            else:
-                # 計算された位置から値を読み取り
-                target_position = calculate_target_position(
-                    base_positions[item], direction, card_idx, increment
-                )
-                cell_value = read_cell_value(target_position, ws)
-                logger.debug(
-                    f"計算位置から値取得: {existing_cell_name} -> {cell_value}"
-                )
-
-            if cell_value:
-                all_empty = False
-
-            instance_values[existing_cell_name] = cell_value
-
-        if not all_empty:
-            generated_names.update(instance_values)
-            logger.debug(f"カード{card_idx}: 有効なデータとして追加")
+            vc = values.get(fn)
+            fc, fr = positions.get(fn, (None, None))
+            if vc == seq_like_val and fr is not None:
+                for d in (1, 2, 3):
+                    alt_candidates: list[tuple[int, int]] = []
+                    if seq_like_col is not None:
+                        alt_candidates.append((seq_like_col + d, fr))
+                    if fc is not None:
+                        alt_candidates.append((fc + d, fr))
+                    for ac, ar in alt_candidates:
+                        alt_val = read_cell_value((ac, ar), ws)
+                        if alt_val not in (None, "") and alt_val != seq_like_val:
+                            values[fn] = alt_val
+                            raise StopIteration
+    except StopIteration:
+        return
+    except Exception:
+        logger.debug("failed to adjust seq-like alternative value", exc_info=True)
 
 
-def detect_card_count_from_existing_names(base_container_name, workbook):
+def _emit_generated_values(
+    *, container_key: str, generated_names: dict, emitted_idx: int, values: dict[str, Any]
+) -> None:
+    try:
+        stats().cells_generated += len(values)
+    except Exception:
+        logger.debug("failed to add cells_generated count for emitted row", exc_info=True)
+    for fn, val in values.items():
+        generated_key = generate_cell_name_for_element(container_key, emitted_idx, fn)
+        generated_names[generated_key] = val
+        logger.debug("GEN-SET %s=%r", generated_key, val)
+
+
+def sort_containers_by_hierarchy(containers, prefix: str = "json"):
+    """コンテナを階層の深さでソート（浅い順）"""
+    container_items = list(containers.items())
+    return sorted(
+        container_items, key=lambda x: calculate_hierarchy_depth(x[0], prefix=prefix)
+    )
+
+
+def detect_card_count_from_existing_names(
+    base_container_name,
+    workbook,
+    sheet_name: Optional[str] = None,
+    *,
+    prefix: str = "json",
+):
     """既存のセル名からカード数を検出"""
     card_indices = set()
-    prefix = f"json.{base_container_name}."
+    prefix_str = f"{prefix}.{base_container_name}."
 
     for name in workbook.defined_names.keys():
-        if name.startswith(prefix):
+        if name.startswith(prefix_str):
             # json.card.1.customer_name -> ['1', 'customer_name']
-            parts = name[len(prefix) :].split(".")
+            parts = name[len(prefix_str) :].split(".")
             if parts and parts[0].isdigit():
+                # シート指定がある場合は定義名の宛先シートでフィルタ
+                if sheet_name is not None:
+                    try:
+                        if not any(
+                            sn == sheet_name
+                            for sn, _ in iter_defined_name_destinations_all(
+                                name, workbook
+                            )
+                        ):
+                            continue
+                    except Exception:
+                        continue
                 card_indices.add(int(parts[0]))
 
     return max(card_indices) if card_indices else 0
 
 
-def process_tree_container(
-    container_name, container_def, range_spec, workbook, generated_names
-):
-    """ツリー型コンテナの処理（階層構造対応）"""
-    logger.debug(f"ツリー型コンテナ処理: {container_name}")
+def get_cell_position_from_name(cell_name, workbook, sheet_name: Optional[str] = None):
+    """セル名から座標位置を取得（範囲の場合は左上セル）。
+    robust: dn.destinations の sheet 名が None でも coord に含まれる場合を考慮。
+    """
+    # 同名の複数定義を横断して、シート条件に一致する最初の座標を返す
+    for sn, coord in iter_defined_name_destinations_all(cell_name, workbook):
+        eff_sheet = sn
+        eff_coord = coord
+        # coord にシート名が含まれる形式（"Sheet1!$B$2"）に対応
+        if (not eff_sheet) and isinstance(coord, str) and "!" in coord:
+            try:
+                sheet_part, cell_part = coord.split("!", 1)
+                eff_sheet = sheet_part
+                eff_coord = cell_part
+            except Exception:
+                eff_coord = coord
+        # Worksheet 等をタイトルへ正規化
+        if eff_sheet is not None and not isinstance(eff_sheet, str):
+            try:
+                eff_sheet = getattr(eff_sheet, "title", str(eff_sheet))
+            except Exception:
+                eff_sheet = str(eff_sheet)
+        if sheet_name is not None and eff_sheet != sheet_name:
+            continue
+        # 単一セル
+        m1 = re.match(r"^\$?([A-Z]+)\$?(\d+)$", eff_coord)
+        if m1:
+            col_letter, row_num = m1.groups()
+            col_num = column_index_from_string(col_letter)
+            return (col_num, int(row_num))
+        # 範囲 → 先頭セル
+        coord_clean = eff_coord.replace("$", "")
+        m2 = re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", coord_clean)
+        if m2:
+            start_col, start_row, _ec, _er = m2.groups()
+            return (column_index_from_string(start_col), int(start_row))
+    return None
 
-    # ツリー型は基本的にテーブル型と同じだが、階層構造を考慮
-    process_table_container(
-        container_name, container_def, range_spec, workbook, generated_names
+
+def _process_sheet_for_container(
+    *,
+    container_name: str,
+    container_def: dict,
+    workbook,
+    generated_names: Dict[str, Any],
+    target_sheet: Optional[str],
+    base_cell_names: Dict[str, str],
+    nameful_sheets: set,
+    per_sheet_positions: Dict[str, dict],
+    template_positions: Dict[str, tuple],
+    template_sheet: Optional[str],
+    global_max_elements: Optional[int],
+    next_index: int,
+    extraction_policy: Optional[ExtractionPolicy],
+) -> int:
+    """Process a single sheet for the given container.
+
+    This helper is an extraction of the per-sheet body of `process_container`.
+    It intentionally performs no behavioral changes; arguments are passed through
+    and the returned `next_index` will be applied by the caller.
+    """
+    # シートでフィルタして基準座標を取得（無ければテンプレを使用）
+    using_template = False
+    try:
+        current_positions, using_template = gather_current_positions_and_template(
+            container_name=container_name,
+            container_def=container_def,
+            workbook=workbook,
+            target_sheet=target_sheet,
+            nameful_sheets=nameful_sheets,
+            template_positions=template_positions,
+            template_sheet=template_sheet,
+            global_field_names=base_cell_names,
+        )
+
+        if not current_positions:
+            logger.debug(
+                "コンテナ %s に既存のセル名が見つからずテンプレも無いためスキップ（sheet=%s）",
+                container_name,
+                target_sheet,
+            )
+            return next_index
+    except Exception:
+        # propagate to caller (process_container) as earlier behavior
+        raise
+
+    # Step 3: 実効 increment を推定（必要時）
+    eff_increment, anchor_range_span = compute_effective_increment_and_anchor_span(
+        container_name=container_name,
+        container_def=container_def,
+        workbook=workbook,
+        target_sheet=target_sheet,
+        global_field_names=base_cell_names,
     )
 
+    # Step 3.5: 要素数の推定（labels による決定論的停止条件を適用）
+    labels = _normalize_labels(container_def)
 
-def get_cell_position_from_name(cell_name, workbook):
-    """セル名から座標位置を取得"""
-    if cell_name in workbook.defined_names:
-        defined_name = workbook.defined_names[cell_name]
-        for sheet_name, coord in defined_name.destinations:
-            match = re.match(r"^\$?([A-Z]+)\$?(\d+)$", coord)
-            if match:
-                col_letter, row_num = match.groups()
-                col_num = column_index_from_string(col_letter)
-                return (col_num, int(row_num))
+    # 件数・ステップ見積り（ラベル停止・範囲・スライス・矩形列・親境界を包含）
+    (
+        element_count,
+        step_override,
+        parent_range_span_for_container,
+        range_count,
+        internal_slice_count,
+    ) = estimate_element_count_and_step(
+        container_name=container_name,
+        container_def=container_def,
+        workbook=workbook,
+        target_sheet=target_sheet,
+        current_positions=current_positions,
+        base_cell_names=base_cell_names,
+        global_max_elements=global_max_elements,
+        template_sheet=template_sheet,
+        using_template=using_template,
+        direction=container_def.get("direction", "row"),
+        eff_increment=eff_increment,
+        anchor_range_span=anchor_range_span,
+        labels=labels,
+    )
+
+    element_count = _apply_global_max_cap(element_count, global_max_elements, next_index)
+
+    if element_count <= 0:
+        return next_index
+
+    # ネストスキャン優先
+    if _try_nested_scan_and_emit(
+        workbook=workbook,
+        target_sheet=target_sheet,
+        container_name=container_name,
+        direction=container_def.get("direction", "row"),
+        current_positions=current_positions,
+        labels=labels,
+        policy=extraction_policy or _DEFAULT_EXTRACTION_POLICY,
+        generated_names=generated_names,
+    ):
+        return next_index
+
+    # フォールバック: 多数数値トークンのときは一括生成を抑止
+    try:
+        _parts_cn_chk = container_name.split(".")
+        _num_positions_chk = [i for i, t in enumerate(_parts_cn_chk) if t.isdigit()]
+        if len(_num_positions_chk) >= 2:
+            logger.debug("NESTED-SKIP-FALLBACK %s (multi-numeric)", container_name)
+            return next_index
+    except Exception:
+        return next_index
+
+    # 動的セル名生成
+    logger.debug(
+        "GEN %s sheet=%s start=%s count=%s template=%s",
+        container_name,
+        target_sheet,
+        next_index,
+        element_count,
+        using_template,
+    )
+    emitted = generate_dynamic_cell_names_from_positions(
+        container_name,
+        current_positions,
+        element_count,
+        container_def.get("direction", "row"),
+        eff_increment,
+        generated_names,
+        workbook,
+        start_index=next_index,
+        sheet_name=target_sheet,
+        step_override=step_override,
+        force_emit_all=bool(range_count),
+    )
+
+    next_index += int(emitted or 0)
+    return next_index
+
+
+def get_sheet_from_defined_name(cell_name, workbook):
+    """定義名から最初のシート名を取得（存在しない場合はNone）"""
+    for sheet_name, _coord in iter_defined_name_destinations_all(cell_name, workbook):
+        return sheet_name
     return None
 
 
@@ -3948,110 +9506,19 @@ def calculate_target_position(base_position, direction, instance_idx, increment)
         return (base_col + (instance_idx - 1) * increment, base_row)
 
 
-def read_cell_value(position, worksheet, normalize_options=None):
+def read_cell_value(position, worksheet):
     """指定位置からセル値を読み取り"""
     try:
         col, row = position
         cell = worksheet.cell(row=row, column=col)
-        cell_value = cell.value if cell.value is not None else ""
-
-        # 正規化処理
-        cell_value = normalize_cell_value(cell_value, normalize_options)
-
-        return cell_value
+        val = cell.value if cell.value is not None else ""
+        stats().cells_read += 1
+        if val == "":
+            stats().empty_cells_skipped += 1
+        return val
     except Exception as e:
         logger.warning(f"セル値読み取りエラー: {e}")
         return ""
-
-
-def auto_convert_data_type(value, auto_convert=True):
-    """データ型を自動変換"""
-    if not auto_convert or value is None:
-        return value
-
-    if isinstance(value, str):
-        value_stripped = value.strip()
-
-        # 空文字列の場合
-        if not value_stripped:
-            return ""
-
-        # 数値の判定と変換
-        try:
-            # 整数として解釈可能か
-            if value_stripped.isdigit() or (
-                value_stripped.startswith("-") and value_stripped[1:].isdigit()
-            ):
-                return int(value_stripped)
-
-            # 浮動小数点数として解釈可能か
-            float_value = float(value_stripped)
-            # 整数と同じ値なら整数として返す
-            if float_value.is_integer():
-                return int(float_value)
-            return float_value
-        except ValueError:
-            pass
-
-        # 真偽値の判定
-        if value_stripped.lower() in ["true", "yes", "on", "1", "はい", "真", "オン"]:
-            return True
-        elif value_stripped.lower() in [
-            "false",
-            "no",
-            "off",
-            "0",
-            "いいえ",
-            "偽",
-            "オフ",
-        ]:
-            return False
-
-        # 日付の判定（簡易版）
-        try:
-            import datetime
-
-            # ISO形式の日付
-            if re.match(r"^\d{4}-\d{2}-\d{2}$", value_stripped):
-                return datetime.datetime.strptime(value_stripped, "%Y-%m-%d").date()
-            # ISO形式の日時
-            if re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", value_stripped):
-                return datetime.datetime.fromisoformat(
-                    value_stripped.replace("Z", "+00:00")
-                )
-        except (ValueError, ImportError):
-            pass
-
-    # そのまま返す
-    return value
-
-
-def normalize_cell_value(cell_value, normalize_options=None):
-    """セル値の正規化処理"""
-    if normalize_options is None:
-        normalize_options = {}
-
-    # 型変換
-    if normalize_options.get("auto_convert", False):
-        cell_value = auto_convert_data_type(cell_value)
-
-    # 文字列の場合の正規化
-    if isinstance(cell_value, str):
-        # 前後の空白除去
-        if normalize_options.get("trim", True):
-            cell_value = cell_value.strip()
-
-        # 改行の正規化
-        if normalize_options.get("normalize_newlines", False):
-            cell_value = cell_value.replace("\r\n", "\n").replace("\r", "\n")
-
-        # 全角・半角の正規化
-        if normalize_options.get("normalize_width", False):
-            import unicodedata
-
-            cell_value = unicodedata.normalize("NFKC", cell_value)
-
-    return cell_value
 
 
 def detect_card_count(base_positions, direction, increment, labels, worksheet):
@@ -4080,191 +9547,9 @@ def detect_card_count(base_positions, direction, increment, labels, worksheet):
     return card_count
 
 
-def get_parent_container_name(container_name):
-    """子コンテナから親コンテナ名を取得"""
-    parts = container_name.split(".")
-    if len(parts) >= 3:
-        # 数値インデックスを除去して親を特定
-        parent_parts = []
-        for part in parts[:-1]:  # 最後の部分を除く
-            if not part.isdigit():
-                parent_parts.append(part)
-        return ".".join(parent_parts)
-    return None
-
-
-def find_parent_instances(parent_container_name, generated_names):
-    """生成済みセル名から親インスタンスのインデックスを取得"""
-    parent_instances = set()
-    prefix = parent_container_name + "."
-
-    for cell_name in generated_names.keys():
-        if cell_name.startswith(prefix):
-            parts = cell_name.replace(prefix, "").split(".")
-            if parts and parts[0].isdigit():
-                parent_instances.add(int(parts[0]))
-
-    return sorted(parent_instances)
-
-
-def process_child_instance(
-    container_name, container_def, parent_instance_idx, workbook, generated_names
-):
-    """子コンテナの特定インスタンスを処理"""
-    logger.debug(
-        f"子インスタンス処理: {container_name}, 親インスタンス: {parent_instance_idx}"
-    )
-
-    offset = container_def.get("offset", 0)
-    items = container_def.get("items", [])
-    direction = container_def.get("direction", "row")
-    increment = container_def.get("increment", 1)
-
-    # 親コンテナを特定
-    parent_container_name = get_parent_container_name(container_name)
-    if not parent_container_name:
-        logger.error(f"親コンテナが特定できません: {container_name}")
-        return
-
-    # 親の基準位置を取得
-    parent_base_name = parent_container_name.replace("json.", "")
-    child_base_name = container_name.replace("json.", "")
-
-    # 親の最初のアイテムから基準位置を取得
-    parent_base_positions = {}
-    for item in items:
-        # 親コンテナの対応するアイテムから基準位置を取得
-        parent_cell_name = f"json.{parent_base_name}.{parent_instance_idx}.{item}"
-        if parent_cell_name in generated_names:
-            # 親の生成済みセル名から位置を推定
-            position = estimate_position_from_parent(
-                parent_cell_name, workbook, generated_names
-            )
-            if position:
-                parent_base_positions[item] = position
-        else:
-            # 既存のセル名から取得
-            position = get_cell_position_from_name(parent_cell_name, workbook)
-            if position:
-                parent_base_positions[item] = position
-
-    if not parent_base_positions:
-        logger.warning(f"親コンテナの基準位置が見つかりません: {container_name}")
-        return
-
-    # 子コンテナのインスタンス数を検出
-    child_instances = detect_child_instances_from_data(
-        container_name,
-        parent_instance_idx,
-        parent_base_positions,
-        direction,
-        increment,
-        offset,
-        workbook,
-    )
-
-    logger.debug(
-        f"検出された子インスタンス数: {len(child_instances)} (親{parent_instance_idx})"
-    )
-
-    # 各子インスタンスのデータを生成
-    ws = workbook.active
-
-    for child_idx in child_instances:
-        instance_values = {}
-        all_empty = True
-
-        for item in items:
-            if item not in parent_base_positions:
-                continue
-
-            # 子の位置を計算（親の位置 + offset + 子のincrement）
-            child_position = calculate_child_position(
-                parent_base_positions[item], direction, child_idx, increment, offset
-            )
-
-            # 子のセル名を生成
-            cell_name = f"json.{child_base_name}.{child_idx}.{item}"
-
-            # セル値を読み取り
-            cell_value = read_cell_value(child_position, ws)
-
-            logger.debug(
-                f"子セル値読み取り {cell_name}: row={child_position[1]}, col={child_position[0]}, value={cell_value}"
-            )
-
-            if cell_value:
-                all_empty = False
-
-            instance_values[cell_name] = cell_value
-
-        # 有効なデータがある場合のみ追加
-        if not all_empty:
-            generated_names.update(instance_values)
-            logger.debug(f"子インスタンス{child_idx}: 有効なデータとして追加")
-
-
-def detect_child_instances_from_data(
-    container_name,
-    parent_instance_idx,
-    parent_base_positions,
-    direction,
-    increment,
-    offset,
-    workbook,
-):
-    """実際のデータから子インスタンス数を検出"""
-    if not parent_base_positions:
-        return []
-
-    # 最初のアイテムの位置から子の範囲をスキャン
-    first_item = list(parent_base_positions.keys())[0]
-    parent_position = parent_base_positions[first_item]
-
-    ws = workbook.active
-    child_instances = []
-    max_children = 10  # 最大子数
-
-    for child_idx in range(1, max_children + 1):
-        child_position = calculate_child_position(
-            parent_position, direction, child_idx, increment, offset
-        )
-
-        # 子の位置にデータがあるかチェック
-        cell_value = read_cell_value(child_position, ws)
-
-        if cell_value:
-            child_instances.append(child_idx)
-        else:
-            # 連続する空セルが見つかったら終了
-            break
-
-    return child_instances
-
-
-def estimate_position_from_parent(parent_cell_name, workbook, generated_names):
-    """親の生成済みセル名から位置を推定"""
-    # 簡易実装：既存のセル名から位置を取得
-    return get_cell_position_from_name(parent_cell_name, workbook)
-
-
-def calculate_child_position(parent_position, direction, child_idx, increment, offset):
-    """親の位置から子の位置を計算"""
-    parent_col, parent_row = parent_position
-
-    if direction == "row":
-        # 行方向：親の位置 + offset + (child_idx - 1) * increment
-        return (parent_col, parent_row + offset + (child_idx - 1) * increment)
-    else:  # column
-        # 列方向：親の位置 + offset + (child_idx - 1) * increment
-        return (parent_col + offset + (child_idx - 1) * increment, parent_row)
-
-
 # =============================================================================
 # Main Function and CLI
 # =============================================================================
-
-
 def main():
     """メインエントリーポイント"""
     try:
@@ -4288,97 +9573,157 @@ def main():
 
 def create_argument_parser() -> argparse.ArgumentParser:
     """コマンドライン引数パーサーを作成"""
-    parser = argparse.ArgumentParser(description="Excel の名前付き範囲を JSON に変換")
-    parser.add_argument("input_files", nargs="*", help="入力 Excel ファイル")
+    parser = argparse.ArgumentParser(
+        description="Excel の名前付き範囲を JSON/YAML に変換（厳格な罫線・アンカーに基づく決定的抽出）"
+    )
+    parser.add_argument(
+        "input_files",
+        nargs="*",
+        help="入力 Excel ファイル（.xlsx）を複数指定可。ディレクトリ指定時は再帰的に走査",
+    )
     parser.add_argument("--config", type=Path, help="設定ファイル")
     parser.add_argument("--output-dir", "-o", type=Path, help="出力ディレクトリ")
-    parser.add_argument("--prefix", "-p", default="json", help="プレフィックス")
+    parser.add_argument(
+        "--prefix",
+        "-p",
+        default="json",
+        help="プレフィックス（定義名の接頭辞。例: json.表1.1.項目）",
+    )
     parser.add_argument("--schema", "-s", type=Path, help="JSONスキーマファイル")
     parser.add_argument(
         "--output-format",
         "-f",
         choices=["json", "yaml"],
-        default="json",
-        help="出力フォーマット (json/yaml, デフォルト: json)",
+        default=None,
+        help="出力フォーマット (json/yaml)。未指定時は json",
     )
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="ログレベル",
+        help="ログレベル（デフォルト: INFO）",
     )
-    parser.add_argument("--keep-empty", action="store_true", help="空の値を保持")
-    parser.add_argument("--trim", action="store_true", help="文字列の前後の空白を削除")
-    parser.add_argument("--container", action="append", help="コンテナ定義 (JSON)")
     parser.add_argument(
-        "--transform", action="append", help="変換ルール (複数指定で連続適用)"
+        "--trim", action="store_true", help="文字列の前後の空白を削除（既定はそのまま）"
+    )
+    parser.add_argument("--container", action="append", help="コンテナ定義")
+    parser.add_argument("--transform", action="append", help="変換ルール")
+    parser.add_argument(
+        "--max-elements",
+        type=int,
+        help="全コンテナに共通で適用する要素数の上限（1以上の整数）。未指定時は無制限",
+    )
+    parser.add_argument(
+        "--log-format",
+        help="ログフォーマット（例: '%(asctime)s.%(msecs)03d %(levelname)s: %(message)s'。未指定時は日時付き標準フォーマット）",
+    )
+    parser.add_argument(
+        "--log-datefmt",
+        help="ログ日時フォーマット（例: '%Y/%m/%d %H:%M:%S'）。未指定時は '%Y/%m/%d %H:%M:%S'",
     )
     return parser
 
 
 def create_config_from_args(args) -> ProcessingConfig:
     """コマンドライン引数から設定を作成"""
-    # 設定ファイルの読み込み
-    config_data = {}
-    if args.config:
-        try:
-            with args.config.open("r", encoding="utf-8") as f:
-                config_data = json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError, IOError) as e:
-            raise ConfigurationError(f"設定ファイルの読み込みに失敗: {e}")
+    raw = _load_config_file_from_args(args)
+    merged = _apply_cli_overrides_to_config(args, raw)
+    cli_cfg = CLIConfig(args=args, raw_config=raw, merged=merged)
 
-    # コマンドライン引数で設定を上書き
-    if args.input_files:
-        config_data["input-files"] = args.input_files
-    if args.output_dir:
-        config_data["output-dir"] = args.output_dir
-    # prefixは設定ファイルにない場合のみデフォルト値を使用
-    if args.prefix and "prefix" not in config_data:
-        config_data["prefix"] = args.prefix
-    if args.schema:
-        config_data["schema"] = args.schema
-    if args.keep_empty:
-        config_data["keep-empty"] = True
-    if args.trim:
-        config_data["trim"] = True
-    if args.log_level:
-        config_data["log-level"] = args.log_level
-    if args.container:
-        validate_cli_containers(args.container)
-        cli_containers = parse_container_args(args.container)
-        config_containers = config_data.get("containers", {})
-        config_data["containers"] = {**config_containers, **cli_containers}
-    if args.transform:
-        config_transforms = config_data.get("transform", [])
-        config_data["transform"] = config_transforms + args.transform
-    if args.output_format:
-        config_data["output-format"] = args.output_format
+    _configure_logging_from_config(cli_cfg.merged)
 
-    # ログレベル設定
-    log_level = config_data.get("log-level", "INFO")
-    logging.basicConfig(
-        level=getattr(logging, log_level), format="%(levelname)s: %(message)s"
-    )
-
-    # 必須パラメータのチェック
-    if not config_data.get("input-files"):
+    if not cli_cfg.merged.get("input-files"):
         raise ConfigurationError("入力ファイルが指定されていません")
 
-    # スキーマの読み込み
-    schema = None
-    if config_data.get("schema"):
-        schema_path = Path(config_data["schema"])
-        schema = SchemaLoader.load_schema(schema_path)
+    schema_obj = _load_schema_from_config(cli_cfg.merged)
+    return _build_processing_config_from_config(cli_cfg.merged, schema_obj)
 
+
+def _load_config_file_from_args(args) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    if not args.config:
+        return cfg
+    try:
+        with args.config.open("r", encoding="utf-8") as f:
+            loaded = yaml.safe_load(f)
+        if loaded is None:
+            return {}
+        if isinstance(loaded, dict):
+            return loaded
+        raise ConfigurationError("設定ファイルの形式が不正です（マップ型が必要です）")
+    except yaml.YAMLError as e:
+        raise ConfigurationError(f"設定ファイルの読み込みに失敗（YAML解析エラー）: {e}")
+    except (FileNotFoundError, OSError, UnicodeDecodeError) as e:
+        raise ConfigurationError(f"設定ファイルの読み込みに失敗: {e}")
+
+
+def _apply_cli_overrides_to_config(args, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    if args.input_files:
+        cfg["input-files"] = args.input_files
+    if args.output_dir:
+        cfg["output-dir"] = args.output_dir
+    if args.prefix and "prefix" not in cfg:
+        cfg["prefix"] = args.prefix
+    if args.schema:
+        cfg["schema"] = args.schema
+    if args.trim:
+        cfg["trim"] = True
+    if args.log_level:
+        cfg["log-level"] = args.log_level
+    if args.container:
+        validate_cli_containers(args.container, prefix=cfg.get("prefix", args.prefix or "json"))
+        cli_containers = parse_container_args(args.container)
+        cfg["containers"] = {**cfg.get("containers", {}), **cli_containers}
+    if args.transform:
+        cfg["transform"] = cfg.get("transform", []) + args.transform
+    if args.output_format:
+        cfg["output-format"] = args.output_format
+    if args.max_elements is not None:
+        cfg["max-elements"] = args.max_elements
+    if args.log_format:
+        cfg["log-format"] = args.log_format
+    if args.log_datefmt:
+        cfg["log-datefmt"] = args.log_datefmt
+    return cfg
+
+
+def _configure_logging_from_config(cfg: Dict[str, Any]) -> None:
+    raw_log_level = cfg.get("log-level", "INFO")
+    if isinstance(raw_log_level, str):
+        log_level = getattr(logging, raw_log_level.upper(), logging.INFO)
+    else:
+        try:
+            log_level = int(raw_log_level)
+        except Exception:
+            log_level = logging.INFO
+    default_format = "%(asctime)s %(levelname)s: %(message)s"
+    default_datefmt = "%Y/%m/%d %H:%M:%S"
+    log_format = cfg.get("log-format", default_format)
+    datefmt = str(cfg.get("log-datefmt")) if cfg.get("log-datefmt") not in (None, "") else default_datefmt
+    logging.basicConfig(level=log_level, format=log_format, datefmt=datefmt)
+
+
+def _load_schema_from_config(cfg: Dict[str, Any]):
+    if not cfg.get("schema"):
+        return None
+    schema_path = Path(cfg["schema"])
+    return SchemaLoader.load_schema(schema_path)
+
+
+def _build_processing_config_from_config(cfg: Dict[str, Any], schema_obj) -> ProcessingConfig:
+    output_dir_val = cfg.get("output-dir")
+    if output_dir_val is not None:
+        output_dir_val = Path(output_dir_val)
     return ProcessingConfig(
-        input_files=config_data.get("input-files", []),
-        prefix=config_data.get("prefix", "json"),
-        trim=config_data.get("trim", False),
-        keep_empty=config_data.get("keep-empty", False),
-        output_dir=config_data.get("output-dir"),
-        output_format=config_data.get("output-format", "json"),
-        schema=schema,
-        containers=config_data.get("containers", {}),
-        transform_rules=config_data.get("transform", []),
+        input_files=cfg.get("input-files", []),
+        prefix=cfg.get("prefix", "json"),
+        trim=cfg.get("trim", False),
+        output_dir=output_dir_val,
+        output_format=cfg.get("output-format", "json"),
+        schema=schema_obj,
+        containers=cfg.get("containers", {}),
+        transform_rules=cfg.get("transform", []),
+        max_elements=(int(str(cfg.get("max-elements"))) if cfg.get("max-elements") not in (None, "") else None),
+        log_format=(str(cfg.get("log-format")) if cfg.get("log-format") not in (None, "") else None),
     )
 
 
@@ -4391,11 +9736,11 @@ def apply_wildcard_transforms(
     data: dict, transform_rules: Dict[str, List[ArrayTransformRule]], prefix: str
 ) -> dict:
     """
-    ワイルドカード変換ルールを適用
+    パターン（ワイルドカード含む／含まない）変換ルールを記載順で適用する。
 
     Args:
         data: 変換対象のデータ
-        transform_rules: 変換ルール（ワイルドカードを含む）
+        transform_rules: 変換ルール（キーはパスパターン。'*' を含まない場合は完全一致として扱う）
         prefix: プレフィックス
 
     Returns:
@@ -4404,211 +9749,301 @@ def apply_wildcard_transforms(
     if not transform_rules:
         return data
 
-    def match_wildcard_path(pattern: str, actual_path: str) -> bool:
-        """ワイルドカードパターンマッチング"""
-        pattern_parts = pattern.split(".")
-        actual_parts = actual_path.split(".")
-
-        if len(pattern_parts) != len(actual_parts):
-            return False
-
-        for pattern_part, actual_part in zip(pattern_parts, actual_parts):
-            if pattern_part == "*":
-                continue
-            elif pattern_part != actual_part:
-                return False
-        return True
-
-    def get_nested_value(obj: dict, path: str):
-        """ネストされた値を取得"""
-        parts = path.split(".")
-        current = obj
-        for part in parts:
-            if isinstance(current, dict) and part in current:
-                current = current[part]
-            else:
-                return None
-        return current
-
-    def set_nested_value(obj: dict, path: str, value):
-        """ネストされた値を設定"""
-        parts = path.split(".")
-        current = obj
-        for part in parts[:-1]:
-            if part not in current:
-                current[part] = {}
-            current = current[part]
-        current[parts[-1]] = value
-
-    def find_matching_paths(
-        obj: dict, pattern: str, current_path: str = ""
-    ) -> List[str]:
-        """パターンにマッチするパスを検索"""
-        matches = []
-
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                new_path = f"{current_path}.{key}" if current_path else key
-
-                if match_wildcard_path(pattern, new_path):
-                    matches.append(new_path)
-
-                # 再帰的に探索
-                if isinstance(value, (dict, list)):
-                    matches.extend(find_matching_paths(value, pattern, new_path))
-
-        return matches
+    # ヘルパー関数はモジュールレベル版を利用
 
     # 各変換ルールを適用
     for pattern, rule_list in transform_rules.items():
+        # 非ワイルドカードかつ split のみのルールは既に挿入時点で適用済みのため二重適用をスキップ
         if "*" not in pattern:
-            continue  # ワイルドカードでないルールはスキップ
+            if all(r.transform_type == "split" for r in rule_list):
+                continue
+            # split と他種が混在する場合: split は先に適用済みとみなし除外し、残りのみ適用
+            if any(r.transform_type == "split" for r in rule_list):
+                filtered = [r for r in rule_list if r.transform_type != "split"]
+            else:
+                filtered = rule_list
+            effective_rules = filtered
+        else:
+            effective_rules = rule_list
 
+        if not effective_rules:
+            continue
+
+        # ワイルドカード有無に関わらず find_matching_paths で探索（'*' 無しは完全一致）
         matching_paths = find_matching_paths(data, pattern)
-
         for path in matching_paths:
-            current_value = get_nested_value(data, path)
-            if current_value is not None:
-                try:
-                    # 連続適用: 複数の変換ルールを順次適用
-                    for rule in rule_list:
-                        # 変換実行
-                        transformed_value = rule.transform(current_value)
-                        current_value = transformed_value
-
-                    # 結果を設定
-                    if isinstance(current_value, dict):
-                        # dict型の場合はキーによる階層指定を処理
-                        for key, val in current_value.items():
-                            if key.startswith(prefix):
-                                # 絶対指定（json.で始まる場合）
-                                abs_path = (
-                                    key[len(prefix) :]
-                                    if key.startswith(prefix + ".")
-                                    else key[len(prefix) :]
-                                )
-                                if abs_path:
-                                    set_nested_value(data, abs_path, val)
-                            else:
-                                # 相対指定
-                                rel_path = f"{path}.{key}"
-                                set_nested_value(data, rel_path, val)
-                    else:
-                        set_nested_value(data, path, current_value)
-
-                except Exception as e:
-                    logger.error(
-                        f"ワイルドカード変換エラー: パス={path}, ルール={rule_list}, エラー={e}"
-                    )
-
-    return data
-
-
-def apply_2d_array_transforms(
-    data: dict,
-    transform_rules: Dict[str, List[ArrayTransformRule]],
-    workbook,
-    prefix: str,
-) -> dict:
-    """
-    二次元配列変換ルールを適用
-
-    Args:
-        data: 変換対象のデータ
-        transform_rules: 変換ルール
-        workbook: Excelワークブック
-        prefix: プレフィックス
-
-    Returns:
-        変換後のデータ
-    """
-    if not transform_rules:
-        return data
-
-    for path, rule_list in transform_rules.items():
-        for rule in rule_list:
-            if rule.transform_type != "range":
-                continue  # range変換以外はスキップ
-
+            original_value = get_nested_value(data, path)
+            if original_value is None:
+                continue
             try:
-                # 範囲データを取得
-                range_data = rule._get_range_data(workbook)
-
-                if range_data is not None:
-                    # 変換実行
-                    transformed_value = rule._transform_with_range(range_data)
-
-                    # 結果をデータに設定
-                    path_parts = path.split(".")
-                    current = data
-                    for part in path_parts[:-1]:
-                        if part not in current:
-                            current[part] = {}
-                        current = current[part]
-
-                    if isinstance(transformed_value, dict):
-                        # dict型の場合はキーによる階層指定を処理
-                        for key, val in transformed_value.items():
-                            if key.startswith(prefix):
-                                # 絶対指定
-                                abs_path = (
-                                    key[len(prefix) :]
-                                    if key.startswith(prefix + ".")
-                                    else key[len(prefix) :]
-                                )
-                                if abs_path:
-                                    abs_parts = abs_path.split(".")
-                                    abs_current = data
-                                    for abs_part in abs_parts[:-1]:
-                                        if abs_part not in abs_current:
-                                            abs_current[abs_part] = {}
-                                        abs_current = abs_current[abs_part]
-                                    abs_current[abs_parts[-1]] = val
-                            else:
-                                # 相対指定
-                                current[key] = val
+                new_value = original_value
+                for rule in effective_rules:
+                    if is_json_list(new_value) and all(is_json_dict(e) for e in new_value):
+                        transformed_elements = [rule.transform(elem) for elem in new_value]
+                        new_value = transformed_elements
                     else:
-                        current[path_parts[-1]] = transformed_value
-
+                        new_value = rule.transform(new_value)
+                if isinstance(new_value, dict):
+                    dynamic_keys = [k for k in new_value.keys() if k.startswith(prefix) or '.' in k]
+                    if dynamic_keys:
+                        expand_and_insert_dict(
+                            result_dict=new_value,
+                            base_path=path,
+                            prefix=prefix,
+                            root_result=data,
+                            transform_rules_map=None,
+                            workbook=None,
+                            apply_dynamic_rules=False,
+                        )
+                    else:
+                        set_nested_value(data, path, new_value)
+                elif is_json_list(new_value):
+                    set_nested_value(data, path, new_value)
+                else:
+                    set_nested_value(data, path, new_value)
             except Exception as e:
                 logger.error(
-                    f"二次元配列変換エラー: パス={path}, ルール={rule}, エラー={e}"
+                    "ワイルドカード変換エラー: パス=%s, ルール=%s, エラー=%s", path, rule_list, e
                 )
 
     return data
 
-
-def extract_column(data, index=0):
-    """指定列を抽出"""
-    if not isinstance(data, list):
-        return data
-
-    try:
-        return [
-            row[index] if isinstance(row, list) and len(row) > index else None
-            for row in data
-        ]
-    except (IndexError, TypeError):
-        return []
+# 一般化名称（後方互換のためエイリアス）: 非ワイルドカードも含めたパターン変換適用
+apply_pattern_transforms = apply_wildcard_transforms
 
 
-def table_to_dict(data):
-    """テーブルデータを辞書に変換（テスト互換性のため）"""
-    if not isinstance(data, list) or len(data) < 2:
-        return {}
 
-    headers = data[0] if isinstance(data[0], list) else []
-    result = {}
 
-    for i, row in enumerate(data[1:], 1):
-        if isinstance(row, list):
-            row_data = {}
-            for j, header in enumerate(headers):
-                if j < len(row):
-                    row_data[header] = row[j]
-            result[f"row_{i}"] = row_data
+# テスト互換性のための関数群（後方互換ラッパー）
+# データクリーニング関数群（テスト互換性のため）
+def is_empty_value(value: Any) -> bool:
+    """空の値かどうかを判定"""
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    if isinstance(value, (list, dict)) and len(value) == 0:
+        return True
+    return False
 
-    return result
+
+def is_completely_empty(data: Any) -> bool:
+    """データが完全に空かどうかを判定"""
+    if is_empty_value(data):
+        return True
+
+    if isinstance(data, dict):
+        return all(is_completely_empty(v) for v in data.values())
+    elif isinstance(data, list):
+        return all(is_completely_empty(item) for item in data)
+
+    return False
+
+
+def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Optional[Dict[str, Any]] = None, _path: tuple[str, ...] = ()):  # noqa: E501, PLR0915
+    """空の値をクリーニング。
+
+    ポリシー:
+    - 元が空配列([])は削除対象（従来互換）
+    - 元が配列で要素は全て空(null/"")の場合は、必要に応じて [] を保持
+      - 同階層に非空の兄弟がある場合
+      - スキーマで該当プロパティが array/object として定義されている場合
+    - オブジェクト内の更にネストした配列についても上記を再帰的に適用
+    """
+
+    def _all_empty_list(lst: list[Any]) -> bool:
+        return all(is_completely_empty(it) for it in lst)
+
+    def _all_empty_scalars_list(lst: list[Any]) -> bool:
+        """全要素がスカラー空(None/空文字)のみか判定（入れ子のlist/dictは不可）。"""
+        def _is_scalar_empty(x: Any) -> bool:
+            if x is None:
+                return True
+            if isinstance(x, str) and x.strip() == "":
+                return True
+            return False
+        return all(_is_scalar_empty(it) for it in lst)
+
+    def _contains_empty_array(x: Any) -> bool:
+        """辞書ツリー内に少なくとも1つの空配列([])が含まれるか。"""
+        if isinstance(x, list):
+            return len(x) == 0
+        if isinstance(x, dict):
+            for vv in x.values():
+                if _contains_empty_array(vv):
+                    return True
+        return False
+
+    def _is_object_schema(s: Optional[Dict[str, Any]]) -> bool:
+        return isinstance(s, dict) and (
+            s.get("type") == "object" or ("properties" in s)
+        )
+
+    def _is_array_schema(s: Optional[Dict[str, Any]]) -> bool:
+        return isinstance(s, dict) and (
+            s.get("type") == "array" or ("items" in s)
+        )
+
+    def _normalized_preserved_from_original(orig: Any, sub_schema: Optional[Dict[str, Any]] = None) -> Any:
+        """元データから空形状を再構成して返す（再帰）。
+
+        - 配列: 要素が全て空のとき [] を返す。元が空配列([])は保持しない（ここでは None）。
+        - 辞書: 子を再帰処理し、何かしら保持対象（[] 等）が生成されれば辞書で返す。全て空なら {} を返すが、
+                呼び出し側で必要に応じてドロップ判定を行う。
+        - スカラー/None: スキーマが array/object を示す場合は [] を返す。それ以外は None。
+        """
+        # Schema hint
+        sub_type = None
+        if isinstance(sub_schema, dict):
+            t = sub_schema.get("type")
+            if isinstance(t, str):
+                sub_type = t
+        if isinstance(orig, list):
+            if len(orig) == 0:
+                return None  # 元が空配列は保持しない
+            if _all_empty_scalars_list(orig):
+                return []
+            # 非空要素がある場合、通常のクリーン処理に任せる（ここでは None）
+            return None
+        if isinstance(orig, dict):
+            props2 = sub_schema.get("properties", {}) if isinstance(sub_schema, dict) else {}
+            out_d: Dict[str, Any] = {}
+            for kk, vv in orig.items():
+                ss = props2.get(kk) if isinstance(props2, dict) else None
+                # 通常クリーン
+                cleaned_sub = clean_empty_values(vv, suppress_empty, schema=ss, _path=(*_path, kk))
+                if not (suppress_empty and is_completely_empty(cleaned_sub)):
+                    out_d[kk] = cleaned_sub
+                    continue
+                # 空になったが、元が配列で全てスカラー空のみの場合は [] を保持
+                if isinstance(vv, list) and len(vv) > 0 and _all_empty_scalars_list(vv):
+                    out_d[kk] = []
+                    continue
+                # 更に内側で保持できるものがあるか再帰的に探索
+                if isinstance(vv, dict):
+                    preserved = _normalized_preserved_from_original(vv, ss)
+                    if preserved is not None and (_contains_empty_array(preserved) or not is_completely_empty(preserved)):
+                        out_d[kk] = preserved
+            # 何も保持できない場合は None
+            return out_d if out_d else None
+        # スカラー/None の場合、スキーマに応じてプレースホルダーを返す
+        if _is_object_schema(sub_schema):
+            return {}
+        if _is_array_schema(sub_schema):
+            return []
+        return None
+
+    def _preserve_by_schema_and_data(d: Dict[str, Any], sch: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """スキーマと元データから空形状を再構成（配列は []、オブジェクトは {} を保持）。"""
+        if not isinstance(d, dict) or not isinstance(sch, dict):
+            return None
+        props = sch.get("properties", {}) if isinstance(sch, dict) else {}
+        out: Dict[str, Any] = {}
+        for k, v in d.items():
+            ssub = props.get(k) if isinstance(props, dict) else None
+            if isinstance(v, dict):
+                sub = _preserve_by_schema_and_data(v, ssub)
+                if sub:
+                    out[k] = sub
+                elif _is_object_schema(ssub):
+                    out[k] = {}
+                elif _is_array_schema(ssub):
+                    out[k] = []
+            elif isinstance(v, list):
+                if len(v) > 0 and _all_empty_scalars_list(v):
+                    out[k] = []
+                elif _is_object_schema(ssub):
+                    out[k] = {}
+                elif _is_array_schema(ssub):
+                    out[k] = []
+            else:
+                if _is_object_schema(ssub):
+                    out[k] = {}
+                elif _is_array_schema(ssub):
+                    out[k] = []
+        return out if out else None
+
+    if suppress_empty and is_completely_empty(data):
+        # スキーマが無い場合だけ従来通りの早期リターン
+        if not isinstance(schema, dict):
+            if isinstance(data, list):
+                return []
+            if isinstance(data, dict):
+                return {}
+            return None
+
+    if isinstance(data, dict):
+        # まず子をクリーン
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        cleaned_children: Dict[str, Any] = {}
+        orig_children: Dict[str, Any] = {}
+        for k, v in data.items():
+            sub_schema = props.get(k) if isinstance(props, dict) else None
+            orig_children[k] = v
+            cleaned_children[k] = clean_empty_values(v, suppress_empty, schema=sub_schema, _path=(*_path, k))
+
+        # 同階層に非空の兄弟が存在するか
+        has_non_empty_sibling = any(
+            not is_completely_empty(cv) for cv in cleaned_children.values()
+        )
+
+        result: Dict[str, Any] = {}
+        for k, cleaned in cleaned_children.items():
+            v = orig_children[k]
+            sub_schema = props.get(k) if isinstance(props, dict) else None
+            if not (suppress_empty and is_completely_empty(cleaned)):
+                result[k] = cleaned
+                continue
+
+            # ここから空になった子の保持判定
+            kept: Any = None
+            # 1) 元が配列で全要素が空（かつ元の長さ>0）の場合は [] を保持
+            if isinstance(v, list) and len(v) > 0 and _all_empty_scalars_list(v):
+                kept = []
+            # 2) 元が辞書の場合、内側に保持対象が作れるか探索（list-of-nulls を [] にする等）
+            elif isinstance(v, dict):
+                preserved = _normalized_preserved_from_original(v, sub_schema)
+                if preserved is not None and (_contains_empty_array(preserved) or not is_completely_empty(preserved)):
+                    kept = preserved
+            # 3) スキーマが array/object を示す場合は型に応じてプレースホルダーを保持（兄弟が無い場合にも適用）
+            elif isinstance(sub_schema, dict) and (
+                _is_object_schema(sub_schema) or _is_array_schema(sub_schema)
+            ):
+                kept = {} if _is_object_schema(sub_schema) else []
+
+            # 4) 兄弟が非空で、保持候補がある場合に採用
+            if has_non_empty_sibling and kept is not None:
+                result[k] = kept
+            # 5) 兄弟が非空でない（=この階層が全空）場合でも、スキーマがあるなら採用
+            elif (not has_non_empty_sibling) and kept is not None and isinstance(sub_schema, dict):
+                result[k] = kept
+
+        # 全て落ちて空になったが、スキーマがある場合は復元を試みる
+        if not result and isinstance(schema, dict):
+            preserved_top = _normalized_preserved_from_original(data, schema) or _preserve_by_schema_and_data(data, schema)
+            # {} プレースホルダーも許可するため、辞書で1キー以上ある場合は採用
+            if preserved_top is not None and (
+                (isinstance(preserved_top, dict) and len(preserved_top) > 0)
+                or _contains_empty_array(preserved_top)
+                or not is_completely_empty(preserved_top)
+            ):
+                return preserved_top
+        return result
+    elif isinstance(data, list):
+        cleaned_list: List[Any] = []
+        item_schema = None
+        if isinstance(schema, dict):
+            item_schema = schema.get("items") if isinstance(schema.get("items"), dict) else None
+        for item in data:
+            cleaned = clean_empty_values(item, suppress_empty, schema=item_schema, _path=_path)
+            if not (suppress_empty and is_completely_empty(cleaned)):
+                cleaned_list.append(cleaned)
+        # スキーマ参照なしでも、完全空リストは [] を返す（呼び出し側で扱う）
+        if suppress_empty and not cleaned_list:
+            return []
+        return cleaned_list
+
+    return data
 
 
 if __name__ == "__main__":

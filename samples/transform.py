@@ -105,6 +105,26 @@ def clean(data):
     return result
 
 
+def flatten(data):
+    """ネストしたリストを一次元に平坦化して返す（順序保持）"""
+    if not isinstance(data, list):
+        yield data
+        return
+    for datum in data:
+        if isinstance(datum, list):
+            yield from flatten(datum)
+        else:
+            yield datum
+
+
+def join_str(data, sep: str = ""):
+    """文字列（ネスト配列含む）を連結して返す。Noneは無視。"""
+    if isinstance(data, list):
+        flat_iter = flatten(data)
+        return sep.join(str(v) for v in flat_iter if v is not None)
+    # リストでなければそのまま返す（関数合成時の利便性のため）
+    return data
+
 # =============================================================================
 # 数値計算
 # =============================================================================
@@ -191,18 +211,26 @@ def lower(value):
 
 
 # =============================================================================
-# 後方互換性（旧関数名）
+# 顧客情報用カスタム変換
 # =============================================================================
 
-# 従来の関数名のエイリアス
-csv_split = csv
-line_split = lines
-word_split = words
-extract_column = column
-sum_column = sum_col
-transpose_matrix = flip
-filter_non_empty_rows = clean
-matrix_sum = total
-calculate_average = avg
-string_transform = normalize
-json_parse = parse_json
+
+def split_customer_name(node):
+        """nodeのname要素を半角スペースで分割し、last_name, first_name要素を追加し、元のname要素を削除。
+        
+        ・入力例: {"name": "山田 太郎", "address": "..."}
+        ・出力例: {"last_name": "山田", "first_name": "太郎", "address": "..."}
+        """
+        print(r"split_customer_name called with:", node)
+        if not isinstance(node, dict):
+            return node
+        name = node.get("name")
+        if isinstance(name, str) and " " in name:
+            parts = [p for p in name.split(" ") if p]
+            if len(parts) >= 2:
+                new_node = dict(node)
+                new_node["last_name"] = parts[0]
+                new_node["first_name"] = parts[1]
+                new_node.pop("name", None)
+                return new_node
+        return node

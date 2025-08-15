@@ -4,7 +4,7 @@
 
 ## ファイル一覧
 
-- **sample.xlsx**: サンプルのExcelファイル（名前付き範囲を含む）
+- **sample.xlsx**: サンプルのExcelファイル（セル名を含む）
 - **config.json**: 設定ファイルのサンプル
 - **schema.json**: JSON Schemaのサンプル
 - **transform.py**: データ変換関数のサンプル集（ユーザ定義関数の例）
@@ -13,13 +13,13 @@
 
 ```bash
 # 基本的な使用例
-xlsx2json samples/sample.xlsx
+python ../xlsx2json.py samples/sample.xlsx --output-dir output
 
 # スキーマを使用してバリデーション
-xlsx2json samples/sample.xlsx --schema samples/schema.json
+python ../xlsx2json.py samples/sample.xlsx --schema samples/schema.json --output-dir output
 
 # 設定ファイルを使用
-xlsx2json samples/sample.xlsx --config samples/config.json
+python ../xlsx2json.py samples/sample.xlsx --config samples/config.yaml --output-dir output
 ```
 
 ## transform.py の関数一覧
@@ -56,5 +56,3 @@ xlsx2json samples/sample.xlsx --config samples/config.json
   ]
 }
 ```
-
-**後方互換性**: 従来の関数名（`csv_split`, `extract_column`等）も引き続き使用可能です。

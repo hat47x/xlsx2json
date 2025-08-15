@@ -23,6 +23,15 @@
         }
       }
     },
+    "num": { "type": "number" },
+    "datetime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "time": {
+      "type": "string",
+      "format": "time"
+    },
     "customer": {
       "type": "object",
       "description": "顧客",
@@ -51,6 +60,77 @@
           "description": "Excelの「名前の定義」で使用できない記号をパスに含むケース２"
         }
       }
+    },
+    "表1": {
+      "type": "array",
+      "description": "表1（行配列）",
+      "items": {
+        "type": "object",
+        "properties": {
+          "列A": { "type": "string" },
+          "列B": { "type": "string" },
+          "列C": { "type": "string" }
+        },
+        "additionalProperties": true
+      }
+    },
+    "リスト1": {
+      "type": "array",
+      "description": "リスト1（段落ごとの行配列）",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "aaa名称": { "type": "string" },
+            "aaaコード": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    },
+    "ツリー1": {
+      "type": "object",
+      "description": "ツリー構造",
+      "properties": {
+        "lv1": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "seq": { "type": "string" },
+              "A": { "type": "string" },
+              "lv2": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "seq": { "type": "string" },
+                    "B": { "type": "string" },
+                    "lv3": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "seq": { "type": "string" },
+                          "C": { "type": "string" }
+                        },
+                        "additionalProperties": true
+                      }
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            },
+            "additionalProperties": true
+          }
+        }
+      },
+      "additionalProperties": true
     }
   },
   "required": ["customer", "parent"],
