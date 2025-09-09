@@ -12,6 +12,7 @@ transform:
   - json.customer=function:samples/transform.py:split_customer_name
   - json.日本語！.（記／号）～=function:samples/transform.py:normalize
   - json.command_test=command:sort -u
+  - json.リスト1.*.*.aaaコード.*=function:samples/transform.py:upper
 prefix: json
 # コンテナ定義
 containers:

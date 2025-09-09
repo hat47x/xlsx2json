@@ -215,14 +215,52 @@ python xlsx2json.py --config config.yaml \
 
 ## 処理の流れ
 
-1. **ファイル収集**: 入力パスから `.xlsx` ファイルを収集
-2. **データ読み込み**: セル名（`json.*`）を読み込み、ネスト構造の辞書・リストを生成
-3. **変換処理**: `--transform` オプションで指定したルールに従い、値の配列化・関数変換・コマンド変換等を適用。セル名が指し示すデータ形式（値・1次元配列・2次元配列）に応じて自動的に適切な形式で変換関数に渡します。同一セル名に対する複数ルールは順次連続適用（チェーン）されます。
-4. **空要素削除**: 全フィールドが未設定（空値・空リスト・空辞書）の要素を再帰的に除去
-5. **空値処理**: 空の値（空文字/空配列/空オブジェクト）は常に除去されます
-6. **バリデーション**: （オプション）Schema バリデーションとエラーログ出力
-7. **キー整理**: （オプション）Schema の `properties` 順にキーを整理
-8. **ファイル出力**: JSON または YAML ファイルとして書き出し
+実装上の処理は次の順序で行います（Schema/コンテナ/変換ルール有無で一部はスキップされます）。各ステージは明確な入出力契約に従い、副作用を限定します。
+
+1. 入力収集 / 読み込み
+  - 入力パスから `.xlsx` を列挙し、ワークブックを読み込みます。
+2. 名前付き範囲の抽出（Raw 抽出）
+  - `prefix`（既定 `json`）で始まる定義名を収集し、セル/範囲の値を取り出します（単一→スカラ、1×N/N×1→1D、MxN→行優先 1D）。
+3. コンテナ定義の確定
+  - 明示コンテナ（設定）を優先し、自動推論結果をマージします。繰り返し要素の生成セル名は順序決定には使いません。
+4. ルートキー順の安定化
+  - シート→行→列の初出位置に基づいて、出力ルートの順序を確定します（生成名は除外）。
+5. 構造正規化と変換
+  - コンテナあり: 変換（パターン適用）→ リシェイプ（dict-of-lists → list-of-dicts）→ `prefix` 直下の子をルートへ複製（互換用）。
+  - コンテナなし: フォールバック正規化（グループ吸収）→ 変換。
+  - 変換は記載順に適用します。非ワイルドカードは完全一致、ワイルドカードは後述の規則で解決します。
+6. 空要素/空値の除去
+  - 実データを全くもたない要素を再帰的に除去します（None/空文字/空配列/空オブジェクトのみの枝を削除）。
+7. キーのソート順をスキーマにあわせる（任意）
+  - スキーマが指定された場合は `properties` の順を優先し、未定義キーは出現順を維持します。
+8. スキーマバリデーション
+  - JSON Schema Draft-07 で検証し、違反はログに出力します。
+9. 出力
+  - JSON / YAML へシリアライズします（日時は ISO 文字列化）。
+
+### ワイルドカード解決と適用粒度
+- リスト（配列）ノード自体はマッチ対象にしません。配列要素の辞書を対象にします。
+- 要素辞書には 1 始まりの仮想インデックスを用いたパスでマッチします。
+  - 例: `json.root.items.1.name` に対し、パターン `json.root.items.*` は要素辞書（`items.1`）を対象にマッチします。
+- `*` はセグメント全体、`pre*` / `*post` / `a*b*c` は同一セグメント内の部分ワイルドカードを表します。
+- 非ワイルドカードは完全一致で適用します。
+
+### 変換ルールの適用契約
+- 変換は記載順に逐次適用します（チェーン）。
+- 値がリストで「要素が辞書」の場合、各要素に対して関数/コマンドを個別適用します。
+- 戻り値が辞書の場合はそのノードを置換します（キー展開は行いません）。
+- コマンド戻り値は JSON 解釈を優先し、失敗した場合は改行分割（flat 入力時）または文字列のまま扱います。
+- 変換中のエラーはログ出力し、元値を保持して継続します。
+
+### クリーン（空要素/空値）の方針
+- 自動クリーンは 1 回のみ（ステップ 6）。
+- 完全空の配列/辞書ツリーは削除し、以後のステージで再生成しません。
+- トップレベルが完全空になった場合は空オブジェクト `{}` を出力します。
+
+補足:
+- ルートキー順は「Excel で最初に登場した順」を基礎にしつつ、Schema 並べ替えポリシーを適用可能です。
+- 最大要素数制限（`--max-elements`）はコンテナ展開時に適用されます。
+- 生成セル名は順序決定に影響しません（明示定義が優先）。
 
 ---
 
@@ -280,7 +318,7 @@ Excelのセル名から抽出した値に対して、柔軟な変換ルールを
 
 ### 🔗 連続適用（チェーン変換）
 
-同一セル名に対して複数の`--transform`を指定することで、**変換ルールを順次連続適用**できます。これにより、複雑なデータ処理パイプラインを構築可能です。
+同一セル名に対して複数の`--transform`を指定することで、**変換ルールを順次連続適用**できます。これにより、複雑なデータ処理が行えます。
 
 ```bash
 # 基本的な連続適用
@@ -386,70 +424,11 @@ python xlsx2json.py samples/sample.xlsx --transform "json.sorted_list=command:so
 
 # 2次元データはTSV形式で渡される  
 python xlsx2json.py samples/sample.xlsx --transform "json.sorted_table=command:sort -t$'\t' -k2,2n"
-
-#### 辞書戻り値による動的セル名構築
-
-任意の変換関数（function、command、split）が辞書を返すことで、実行時にセル名と値の関係を動的に構築できます：
-
-```python
-# カスタム変換関数の例（mymodule.py）
-def create_dynamic_fields(data):
-    """データから動的にセル名を生成"""
-    result = {}
-    if isinstance(data, list):
-        for i, value in enumerate(data):
-            if value is not None:
-                result[f"field_{i+1}"] = str(value).strip()
-                result[f"field_{i+1}_upper"] = str(value).upper()
-    elif isinstance(data, str):
-        # カンマ区切り文字列をパース
-        parts = data.split(",")
-        for i, part in enumerate(parts):
-            result[f"item_{i+1}"] = part.strip()
-    return result
-
-def parse_key_value_data(data):
-    """キー=値形式のデータを解析"""
-    result = {}
-    if isinstance(data, list):
-        for row in data:
-            if isinstance(row, list) and len(row) >= 2:
-                key = str(row[0]).strip() if row[0] else None
-                value = row[1] if row[1] else None
-                if key and value:
-                    result[key] = value
-    elif isinstance(data, str):
-        # "key1=value1;key2=value2" 形式をパース
-        pairs = data.split(";")
-        for pair in pairs:
-            if "=" in pair:
-                k, v = pair.split("=", 1)
-                result[k.strip()] = v.strip()
-    return result
 ```
 
-**使用例:**
-```bash
-# 変換関数で動的フィールドを生成し、生成されたフィールドにさらに変換を適用
-python xlsx2json.py sample.xlsx \
-  --transform "json.dynamic=function:mymodule:create_dynamic_fields" \
-  --transform "json.dynamic.field_1=function:samples/transform.py:normalize" \
-  --transform "json.dynamic.field_*_upper=split:,"
+#### 変換関数による動的なデータ構造変更
 
-# キー=値ペアを解析して動的セル名を構築
-python xlsx2json.py sample.xlsx \
-  --transform "json.config=function:mymodule:parse_key_value_data" \
-  --transform "json.config.*=function:samples/transform.py:normalize"
-
-# 外部コマンドでJSONを返すことで動的セル名構築
-python xlsx2json.py sample.xlsx \
-  --transform "json.api_data=command:curl -s api.example.com/config | jq -r '.fields'"
-```
-
-**辞書戻り値の仕様:**
-- **絶対指定**: キーが `json.` で始まる場合、JSONルートからの絶対パスとして扱われます
-- **相対指定**: それ以外のキーは、元の変換対象パスからの相対パスとして扱われます
-- **連続適用対応**: 生成されたセル名に対しても、指定された変換ルールが自動的に適用されます
+変換関数（function）が辞書や配列を返すことで、実行時にセル名と値の関係を動的に構築できます。
 
 ### Python関数による変換（function）
 
@@ -463,116 +442,24 @@ python xlsx2json.py samples/sample.xlsx --transform "json.tags=function:/path/to
 
 #### samples/transform.py サンプル関数
 
-`samples/transform.py` には即座に使える便利な変換関数が用意されています。シンプルで覚えやすい関数名で、様々なデータ変換が可能です。
-
-##### 🔤 文字列変換
-```bash
-# CSV文字列を配列に変換
-python xlsx2json.py samples/sample.xlsx --transform "json.data=function:samples/transform.py:csv"
-
-# 改行区切りを配列に変換  
-python xlsx2json.py samples/sample.xlsx --transform "json.lines=function:samples/transform.py:lines"
-
-# 文字列正規化（トリム・全角半角変換・置換）
-python xlsx2json.py samples/sample.xlsx --transform "json.name=function:samples/transform.py:normalize"
-```
-
-##### 📊 配列・行列操作（セル名が複数セルを指している場合）
-```bash
-# 指定列を抽出（セル名 json.names が A1:C10 のような複数セルを指している場合）
-python xlsx2json.py samples/sample.xlsx --transform "json.names=function:samples/transform.py:column"
-
-# 行と列を入れ替え（転置）（セル名 json.matrix が A1:C3 のような複数セルを指している場合）
-python xlsx2json.py samples/sample.xlsx --transform "json.matrix=function:samples/transform.py:flip"
-
-# 空でない行のみを残す（セル名 json.data が A1:D20 のような複数セルを指している場合）
-python xlsx2json.py samples/sample.xlsx --transform "json.data=function:samples/transform.py:clean"
-```
-
-##### 🔢 数値計算（セル名が複数セルを指している場合）
-```bash
-# 全要素の合計（セル名 json.total が A1:C3 のような複数セルを指している場合）
-python xlsx2json.py samples/sample.xlsx --transform "json.total=function:samples/transform.py:total"
-
-# 数値要素の平均（セル名 json.average が A1:C3 のような複数セルを指している場合）
-python xlsx2json.py samples/sample.xlsx --transform "json.average=function:samples/transform.py:avg"
-
-# 指定列の合計（セル名 json.sum が A1:C10 のような複数セルを指している場合）
-python xlsx2json.py samples/sample.xlsx --transform "json.sum=function:samples/transform.py:sum_col"
-```
-
-##### 💡 サンプル関数の特徴
-- **シンプルな関数名**: `csv()`, `flip()`, `total()`, `normalize()` など覚えやすい名前
-- **後方互換性**: 従来の関数名（`csv_split`, `extract_column`等）も引き続き使用可能
-- **カスタマイズ可能**: `samples/transform.py` を参考に独自の変換関数を作成
-- **詳細情報**: `samples/README.md` に全関数の説明あり
+`samples/transform.py` には変換関数の例を用意しています。
 
 ### 外部コマンドによる変換（command）
 
 外部コマンドを使ってセル値・配列・行列を加工できます。`command:` 変換では、セル名が指す“構造”に応じて標準入力のフォーマットが自動決定され、行指向ユーティリティ（`sort`, `uniq` など）と構造指向ツール（`jq` 等）の両方を自然に活用できます。
 
-#### 入力フォーマット判定
-
-| 元データ | 判定条件 | コマンド入力形式 | 例 | 主用途 |
-|----------|----------|------------------|----|--------|
-| スカラ (str/int/float/bool/None) | 単一値 | `str(value)` | `"ABC"` | 単純置換 / フィルタ |
-| フラットなスカラ配列 | list/tuple かつ全要素がスカラ | 改行結合 | `"A\nB\nC"` | sort / uniq 等 |
-| ネスト配列 | list/tuple 内に list/dict を含む | JSON文字列 | `"[\"A\",[\"B\"]]"` | jq 等構造処理 |
-| dict | dict | JSON文字列 | `"{\"k\":1}"` | jq 等構造処理 |
-| その他 (set 等) | 上記に該当しない | `str(value)` | `"{1,2}"` | 補助 |
-
-#### 出力の復元ロジック
-
-- 出力文字列が JSON として妥当 → `json.loads()` で構造復元
-- 入力が「フラット配列」で、出力が複数行 → 改行ごとに分割し空行除去して配列へ復元
-- それ以外は文字列のまま
-
-#### 基本例
-
 ```bash
-# フラット配列 (1列のセル範囲) をユニーク＆ソート
+# セル内の複数行の文字列をソート・重複除去
 python xlsx2json.py samples/sample.xlsx --transform "json.tags=command:sort -u"
-
-# ネスト配列 (2次元範囲) をそのまま通過（構造維持）
-python xlsx2json.py samples/sample.xlsx --transform "json.table=command:cat"
-
 # dict 構造を jq で加工
 python xlsx2json.py samples/sample.xlsx --transform "json.meta=command:jq '.'"
 ```
 
-#### 応用例
-
-```bash
-# 数値列を昇順ソート
-python xlsx2json.py samples/sample.xlsx --transform "json.values=command:sort -n"
-
-# 重複除去のみ
-python xlsx2json.py samples/sample.xlsx --transform "json.values=command:uniq"
-
-# jq でフィルタリング（配列の2番目要素のみ）
-python xlsx2json.py samples/sample.xlsx --transform "json.list=command:jq '.[1]'"
-
-# jq でキー抽出
-python xlsx2json.py samples/sample.xlsx --transform "json.meta=command:jq 'keys'"
-```
-
-#### ヒント
-
-- 行単位のソート/ユニーク → 1 列（または 1 行）のセル範囲でフラット配列を作る
-- 構造加工（フィルタ / マッピング） → jq 等 JSON 対応コマンドを使用
-- 大きな JSON をパイプで渡すときは `jq -c` でコンパクト化すると高速
-- シェル特殊文字を含む場合はクォートに注意（例: `--transform 'json.tags=command:grep -i "foo"'`）
-
-```bash
-# sort コマンドの典型利用
-python xlsx2json.py samples/sample.xlsx --transform "json.lines=command:sort -u"
-```
+### 下位構造をもつセル名の変換
 
 ### ワイルドカード対応
 
-変換ルールでワイルドカード `*` を使用することで、複数のセル名に対して一括でルールを適用できます。これにより、コンテナ機能で自動生成されるセル名にも効率的にルールを適用可能です。
-
-#### 基本的なワイルドカード使用例
+変換ルールでワイルドカード `*` を使用することで、配列の全要素に対して一括でルールを適用できます。これにより、コンテナ機能で自動生成されるセル名にも効率的にルールを適用可能です。
 
 ```bash
 # 全ての orders インスタンスの amount フィールドに適用
@@ -580,20 +467,6 @@ python xlsx2json.py sample.xlsx --transform "json.orders.*.amount=function:math:
 
 # 全ての items の price フィールドに適用  
 python xlsx2json.py sample.xlsx --transform "json.orders.*.items.*.price=function:math:parse_currency"
-
-# 全ての date フィールドに適用
-python xlsx2json.py sample.xlsx --transform "json.*.date=function:date:parse_japanese_date"
-```
-
-#### 階層ワイルドカード
-
-```bash
-# 複数レベルの階層に適用
-python xlsx2json.py sample.xlsx --transform "json.customers.*.orders.*.date=function:date:parse"
-
-# ツリー構造の seq フィールドに適用
-python xlsx2json.py sample.xlsx --transform "json.tree_data.lv1.*.seq=function:math:parse_number"
-python xlsx2json.py sample.xlsx --transform "json.tree_data.lv1.*.lv2.*.seq=function:math:parse_number"
 ```
 
 #### コンテナ機能との連携例
@@ -774,6 +647,7 @@ containers:
   - 要素数: 既存の命名済みインデックス、実セル値、ラベル、空行・空列などの停止条件に基づいてカウント。`increment=0` は常に 1 件
   - 生成: 第1要素の相対位置から 2 以降を計算し、`json....{index}.{field}` を動的生成します
   - 階層: 子要素は直近の親の要素（行/列）のスキャン単位に従って紐付けられます
+  - 未指定時の自動推論: 命名規則に合致する名前付き範囲から推論し、手動指定があれば後勝ちマージします
 
 ### Excel 側のセル名の作り方（例）
 
@@ -789,6 +663,7 @@ containers:
 - 同一コンテナの配列インデックスはシート横断で「グローバル連番」として付与されます（例: Sheet1 の 1..N の次に Sheet2 の N+1..）
 - `--max-elements` はシート横断の合計件数に対して適用されます
 - 出力は 1 つに集約されます（シート名はメタ情報としては付与しません）
+ - ルートキーの並びは「最初に登場したシート順→行→列」で安定化します（生成名は順序決定に不参加）
 
 ヒント: セル名が複数シートにまたがる場合、各シートで同じ名前（例: `json.orders.1`）のセル名を作成するだけで集約対象になります。特定シートだけに限定したい場合は、Excel のセル名をシートスコープにする（例: `Sheet1!json.orders.1` のようにシート固有のスコープで定義）など、Excel 側の定義の持たせ方で調整してください。
 
@@ -902,6 +777,9 @@ python xlsx2json.py samples/sample.xlsx --schema samples/schema.json --transform
 - JSON Schema Draft-07
 - UTF-8
 
+---
+
+複数シートに同名定義がある場合は各シート destination を順に読み込みフラットに統合（シート順基準）。単一セルのみならスカラ、範囲なら行優先で配列化。
 ---
 
 ## 開発・テスト

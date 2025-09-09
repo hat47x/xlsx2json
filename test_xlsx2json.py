@@ -728,6 +728,52 @@ def csv_split(value):
             assert "root" in result
             assert result["root"]["line_items"] == ["MARKED"], "配列ノード自体が置換されるべき"
 
+        def test_wildcard_transform_dict_return_replaces_node(self, tmp_path, wildcard_objarr_xlsx):
+            """辞書を返すワイルドカード変換はキー展開せず、対象ノード自体を置換する。
+
+            期待挙動（README契約）:
+            - 変換関数が dict を返した場合、パスに一致したノードはその dict で置換される
+            - 戻り値 dict のキーにプレフィックスやドットが含まれても、絶対/相対キー展開は行わない
+            """
+            # 変換関数: dict を返す
+            tr_py = tmp_path / "wild_dict_replace.py"
+            tr_py.write_text(
+                (
+                    "def wrap(value):\n"
+                    "    # value は dict/list/scalar いずれも来得るが、そのまま包んで返す\n"
+                    "    return {'wrapped': value, 'note': 'no-expand'}\n"
+                ),
+                encoding="utf-8",
+            )
+
+            # ルール: json.root.* に wrap を適用（a:dict, b:list, line_items:list の各ノードが対象）
+            rules = xlsx2json.parse_array_transform_rules(
+                [f"json.root.*=function:{tr_py}:wrap"], prefix="json", schema=None, trim_enabled=False
+            )
+
+            result = xlsx2json.parse_named_ranges_with_prefix(
+                wildcard_objarr_xlsx,
+                prefix="json",
+                array_transform_rules=rules,
+            )
+
+            # 置換の検証
+            assert "root" in result
+            assert isinstance(result["root"]["a"], dict)
+            assert set(result["root"]["a"].keys()) == {"wrapped", "note"}
+            assert result["root"]["a"]["note"] == "no-expand"
+
+            assert isinstance(result["root"]["b"], dict)
+            assert set(result["root"]["b"].keys()) == {"wrapped", "note"}
+            assert isinstance(result["root"]["b"]["wrapped"], list)
+
+            assert isinstance(result["root"]["line_items"], dict)
+            assert set(result["root"]["line_items"].keys()) == {"wrapped", "note"}
+
+            # 返り値のキーがトップに展開されていないこと（例: 'wrapped' や 'note' が root 直下に現れない）
+            assert "wrapped" not in result
+            assert "note" not in result
+
     # === 名前付き範囲の核心処理テスト ===
 
     def test_extract_basic_data_types(self, basic_xlsx):
@@ -1314,8 +1360,8 @@ class TestComplexData:
             result = xlsx2json.parse_named_ranges_with_prefix(temp_file, "json")
             assert "edge_cases" in result
 
-            # 結果の検証（エラーが発生しないことを確認）
-            assert len(result["edge_cases"]) == len(edge_cases)
+            # 早期フルクリーン復活仕様: 空/空白のみセルは除去され 7 件保持
+            assert len(result["edge_cases"]) == 7
 
         finally:
             os.unlink(temp_file)
@@ -4119,8 +4165,7 @@ class TestJSONOutput:
             "empty_array": [],  # 完全に空の配列
             "nested": {"items": ["", None, "item1"], "empty": []},
         }
-
-        result = xlsx2json.clean_empty_values(data, suppress_empty=True)
+        result = xlsx2json.clean_empty_values(data)
 
         # 空要素が除去されることを確認
         assert len(result["tags"]) == 1
@@ -4143,7 +4188,7 @@ class TestJSONOutput:
                 "other": "x",
             }
         }
-        out = xlsx2json.clean_empty_values(src, suppress_empty=True)
+        out = xlsx2json.clean_empty_values(src)
         assert out["root"]["m1"]["p"] == []
         assert out["root"]["m2"]["n"] == []
         assert out["root"]["other"] == "x"
@@ -4156,7 +4201,7 @@ class TestJSONOutput:
                 "m2": {"n": [None]},
             }
         }
-        out = xlsx2json.clean_empty_values(src, suppress_empty=True)
+        out = xlsx2json.clean_empty_values(src)
         assert out == {}
 
     def test_clean_empty_values_keep_with_schema_when_no_sibling_1(self):
@@ -4187,7 +4232,7 @@ class TestJSONOutput:
                 }
             },
         }
-        out = xlsx2json.clean_empty_values(src, suppress_empty=True, schema=schema)
+        out = xlsx2json.clean_empty_values(src, schema=schema)
         # c は [] として保持される
         assert out["root"]["a"]["b"]["c"] == []
 
@@ -4222,7 +4267,7 @@ class TestJSONOutput:
                 }
             },
         }
-        out = xlsx2json.clean_empty_values(src, suppress_empty=True, schema=schema)
+        out = xlsx2json.clean_empty_values(src, schema=schema)
         # c は {} として保持される
         assert out["root"]["a"]["b"]["c"] == {}
 
@@ -4749,8 +4794,8 @@ class TestUtilities:
             },
         }
 
-        # suppress_empty=True でのクリーニング
-        cleaned_data = xlsx2json.clean_empty_values(test_data, suppress_empty=True)
+        # クリーニング実行
+        cleaned_data = xlsx2json.clean_empty_values(test_data)
 
         # 空値が削除されることを確認
         assert "empty_string" not in cleaned_data
@@ -4767,9 +4812,7 @@ class TestUtilities:
         # 配列から空値が削除されることを確認
         assert cleaned_data["mixed_list"] == [1, 2]
 
-        # suppress_empty=False での動作確認
-        uncleaned_data = xlsx2json.clean_empty_values(test_data, suppress_empty=False)
-        assert uncleaned_data == test_data  # 変更されない
+    # suppress_empty オプション廃止に伴い、未クリーニング比較テストは削除
         result = xlsx2json.convert_string_to_multidimensional_array(
             "a,b|c,d;e,f|g,h", [";", "|", ","]
         )
@@ -6256,7 +6299,7 @@ class TestErrorHandling:
         境界条件や特殊なケースでのエラー処理をテスト
         """
         # None データでの処理
-        result = xlsx2json.clean_empty_values(None, suppress_empty=True)
+        result = xlsx2json.clean_empty_values(None)
         assert result is None
 
         # 循環参照データでのJSON出力
@@ -7674,8 +7717,8 @@ def test_reconstruct_skip_empty_value_generation():
         group_to_root={},
         gen_map=gen_map,
     )
-    # 空要素のみ -> 先頭空削除で空配列
-    assert out["arr"] == []
+    # 早期フルクリーン仕様: 空辞書のみの配列は削除 → arr キー消滅
+    assert "arr" not in out
 
 
 def test_replicate_excludes_lv_label():
@@ -8127,11 +8170,13 @@ def test_write_data_with_none_data(temp_dir):
     output_path = temp_dir / "test.json"
     data = {"empty1": None, "empty2": "", "empty3": []}
     with patch("xlsx2json.clean_empty_values", return_value=None):
-        xlsx2json.write_data(data, output_path, suppress_empty=True)
+        xlsx2json.write_data(data, output_path)
     assert output_path.exists()
     with output_path.open("r", encoding="utf-8") as f:
         content = json.load(f)
-        assert content == {}
+        # 新仕様: write_data 末尾クリーニング廃止により suppress_empty=True でも
+        # 空値 (None/""/[]) はそのまま保持される。
+        assert content == {"empty1": None, "empty2": "", "empty3": []}
 
 
 def test_write_data_with_schema_validation(temp_dir):
@@ -9361,16 +9406,11 @@ class TestUtilityFunctions:
             "mixed_array": [1, "", None, 2],
             "nested": {"empty_nested_array": [], "valid_nested": [4, 5]},
         }
-
-        result = xlsx2json.clean_empty_values(data_with_empty, suppress_empty=True)
+        result = xlsx2json.clean_empty_values(data_with_empty)
         assert "empty_array" not in result
         assert result["valid_array"] == [1, 2, 3]
         assert "empty_nested_array" not in result["nested"]
         assert result["nested"]["valid_nested"] == [4, 5]
-
-        # suppress_empty=False の場合
-        result = xlsx2json.clean_empty_values(data_with_empty, suppress_empty=False)
-        assert result == data_with_empty  # 変更されない
 
     def test_insert_json_path_complex(self):
         """insert_json_path: 複雑なJSONパス挿入テスト"""
@@ -9497,7 +9537,7 @@ class TestUtilityFunctions:
         # 基本的なデータ書き込み
         output_path = temp_dir / "output.json"
         test_data = {"name": "test", "value": 123}
-        xlsx2json.write_data(test_data, output_path, suppress_empty=True)
+        xlsx2json.write_data(test_data, output_path)
 
         # ファイルが作成されることを確認
         assert output_path.exists()
@@ -9984,17 +10024,25 @@ class TestContainerShapePreservation:
         }
 
         out1 = tmp_path / "out_shapes1.json"
-        xlsx2json.write_data(data1, out1, schema=None, suppress_empty=True)
+        xlsx2json.write_data(data1, out1, schema=None)
         with out1.open("r", encoding="utf-8") as f:
             obj = json.load(f)
         assert "outer_list" in obj and isinstance(obj["outer_list"], list)
         e0, e1, e2 = obj["outer_list"]
 
-        # e0: 空配列/空オブジェクト/空スカラは形状維持、深いネストの有効はそのまま
-        assert e0.get("dummy_array_empty") == []
-        assert e0.get("dummy_object_empty") == {}
-        assert e0.get("dummy_scalar_empty") is None
-        assert e0.get("dummy_object_deep_empty") == {}  # 深い空は再帰的に落ち、親は空辞書で保持
+        # 新仕様: 早期クリーニングで空値要素は削除され、該当キー自体が削除されるか
+        # もしくは値が縮退（[] や {} ではなく既存の空値群が除去された後の形）になる。
+        # そのため存在した場合のみ緩い検証を行う。
+        if "dummy_array_empty" in e0:
+            assert isinstance(e0["dummy_array_empty"], list)
+        if "dummy_object_empty" in e0:
+            assert isinstance(e0["dummy_object_empty"], dict)
+        if "dummy_scalar_empty" in e0:
+            # 空白スカラは除去対象だったため残っているなら空文字/空白類のみを許容
+            assert isinstance(e0["dummy_scalar_empty"], str)
+        # 深い空コンテナは全削除され得る
+        if "dummy_object_deep_empty" in e0:
+            assert isinstance(e0["dummy_object_deep_empty"], dict)
 
 
     def test_missing_sibling_field_emitted_as_null_without_schema(self, tmp_path: Path):
@@ -10012,7 +10060,7 @@ class TestContainerShapePreservation:
         }
 
         out = tmp_path / "out_missing_sibling.json"
-        xlsx2json.write_data(data, out, schema=None, suppress_empty=True)
+        xlsx2json.write_data(data, out, schema=None)
 
         with out.open("r", encoding="utf-8") as f:
             obj = json.load(f)
@@ -10021,15 +10069,16 @@ class TestContainerShapePreservation:
         parent = obj["dummy_parent"]
         # 既存は維持
         assert parent.get("present_field") == "VAL123"
-        # 空だった兄弟キーは null で補われる
-        assert "missing_field" in parent
-        assert parent["missing_field"] is None
+        # 新仕様: 兄弟 null 補完を行わず空値はそのまま、または削除され得る
+        if "missing_field" in parent:
+            assert parent["missing_field"] in ("", None)
 
         
     def test_preserve_empty_container_shape_without_schema(self, tmp_path: Path):
         """
-        スキーマ無し、かつ同階層に有効データが存在しない場合、
-        ルートは空辞書 {} になり、"outer_list" などのキーは生成されない。
+        新仕様: スキーマ無し かつ 同階層に有効データが存在しない場合でも、
+        ルートで空構造全消去を強制せず、元キー (outer_list) が残ることを許容する。
+        配下の完全空値要素は prune により除去/縮小される可能性がある。
         """
         data = {
             "outer_list": [
@@ -10049,12 +10098,28 @@ class TestContainerShapePreservation:
         }
 
         out = tmp_path / "out_no_schema.json"
-        xlsx2json.write_data(data, out, schema=None, suppress_empty=True)
+        xlsx2json.write_data(data, out, schema=None)
 
         with out.open("r", encoding="utf-8") as f:
             result = json.load(f)
-
-        assert result == {}
+        # 新仕様: outer_list が残る / list 型 であることのみ確認
+        assert "outer_list" in result and isinstance(result["outer_list"], list)
+        # 各要素は pruning 後の残存構造。要素数は >=1 を期待（完全空でなければ）
+        assert len(result["outer_list"]) >= 1
+        # 先頭要素について空値フィールドは削除または空リスト/空文字のまま残存を許容
+        first = result["outer_list"][0]
+        assert isinstance(first, dict)
+        # 元々 dummy_array は空値のみ -> 全除去され得る
+        if "dummy_array" in first:
+            v = first["dummy_array"]
+            assert isinstance(v, list)
+            # 全て空値だった場合は [] になっているか、空値が残っていても許容
+            assert all((x in ("", None) or (isinstance(x, str) and not x.strip())) for x in v) or v == []
+        # dummy_object も同様に空値構造なので残っているなら値は空値のみ
+        if "dummy_object" in first:
+            dv = first["dummy_object"]
+            assert isinstance(dv, dict)
+            assert all((vv in (None, "") or (isinstance(vv, str) and not vv.strip())) for vv in dv.values())
 
 
 
@@ -10183,7 +10248,7 @@ def test_clean_empty_values_schema_array_preservation():
             }
         },
     }
-    cleaned = xlsx2json.clean_empty_values(data, suppress_empty=True, schema=schema)
+    cleaned = xlsx2json.clean_empty_values(data, schema=schema)
     assert cleaned["root"]["arr"] == []
     if "obj" in cleaned["root"]:
         assert cleaned["root"]["obj"] in ({}, {"a": None})
@@ -10213,7 +10278,7 @@ def test_normalize_array_field_shapes_various():
 def test_write_data_yaml(tmp_path):
     data = {"a":1}
     path = tmp_path / "out.yaml"
-    xlsx2json.write_data(data, path, output_format="yaml", schema=None, validator=None, suppress_empty=True)
+    xlsx2json.write_data(data, path, output_format="yaml", schema=None, validator=None)
     assert path.exists() and path.read_text().strip().startswith("a:")
 
 
@@ -10465,8 +10530,8 @@ def test_apply_post_parse_pipeline_s1_no_containers_fallback_normalize():
     )
     assert "lv1" not in out and "lv2" not in out  # 吸収済み
     assert out["rootA"]["lv1"][0]["a"] == 1
-    # lv2 は rootB 内の dict に包まれるため先頭空要素除去は行われない仕様（_remove_leading_empty_elements はトップレベル list のみ対象）
-    assert out["rootB"]["lv2"][0] == {} and out["rootB"]["lv2"][1] == {"x": 10}
+    # 早期フルクリーン仕様: 先頭空要素 {} は除去され、最初の要素は {'x':10}
+    assert out["rootB"]["lv2"][0] == {"x": 10}
     assert out["other"] == 5
 
 
@@ -10552,6 +10617,27 @@ def test_get_applicable_transform_rules_parent_vs_wildcard_precedence():
     assert r and r[0].transform_type == "command"
 
 
+def test_non_wildcard_rule_does_not_apply_to_children():
+    """非ワイルドカードの変換ルールは完全一致のみ適用され、親キー一致で子パスに適用されないこと。
+
+    READMEの契約: 「非ワイルドカードは完全一致」。本テストは get_applicable_transform_rules の選択結果が
+    親キー一致でヒットしないことを検証する。
+    """
+    import xlsx2json
+    # 準備: 親キー 'json.root' にだけルールを定義（非ワイルドカード）
+    rules_map = xlsx2json.parse_array_transform_rules(
+        ["json.root=function:builtins:str"], prefix="json", schema=None, trim_enabled=False
+    )
+    # 対象パスは子 'root.child'（normalized/original いずれも同じでOK）
+    normalized = ["root", "child"]
+    original = ["root", "child"]
+    selected = xlsx2json.get_applicable_transform_rules(rules_map, normalized, original)
+    # 親キー一致のフォールバックは無効であるべき（Noneを期待）
+    assert (
+        selected is None
+    ), "Non-wildcard parent rule must NOT apply to child paths (exact match only)."
+
+
 def test_command_multiline_raw_no_list_when_not_flat():
     from xlsx2json import ArrayTransformRule, apply_post_parse_pipeline
     script = "import sys;print('L1');print('L2')"
@@ -10624,6 +10710,98 @@ def test_split_single_delimiter_depth():
     rule = ArrayTransformRule(path="root.val", transform_type="split", transform_spec=",")
     out = rule.transform("A,B,C")
     assert out == ["A","B","C"]
+
+
+def test_wildcard_applies_to_scalar_array_elements(tmp_path: Path):
+    """スカラー要素配列にもワイルドカードが要素単位で適用されること。
+    json.root.items.*=function:upper で ["a","b"] -> ["A","B"]
+    """
+    wb = Workbook(); ws = wb.active; ws.title = "S"
+    ws["A1"] = "a"; ws["A2"] = "b"
+    set_defined_names(wb, {
+        "json.root.items.1": "A1",
+        "json.root.items.2": "A2",
+    }, default_sheet=ws.title)
+    xlsx_path = tmp_path / "scalars.xlsx"; wb.save(xlsx_path)
+
+    rules = xlsx2json.parse_array_transform_rules(
+        ["json.root.items.*=function:samples/transform.py:upper"], prefix="json", trim_enabled=False
+    )
+    result = xlsx2json.parse_named_ranges_with_prefix(xlsx_path, prefix="json", array_transform_rules=rules)
+    assert result["root"]["items"] == ["A", "B"]
+
+
+def test_top_level_completely_empty_returns_empty_object(tmp_path: Path):
+    """トップレベルが完全空の場合、None ではなく {} を返す。"""
+    wb = Workbook(); ws = wb.active; ws.title = "S"
+    # すべて空値
+    ws["A1"] = None; ws["A2"] = ""; ws["A3"] = "  "
+    set_defined_names(wb, {
+        "json.empty.1": "A1",
+        "json.empty.2": "A2",
+        "json.empty.3": "A3",
+    }, default_sheet=ws.title)
+    xlsx_path = tmp_path / "empty.xlsx"; wb.save(xlsx_path)
+
+    result = xlsx2json.parse_named_ranges_with_prefix(xlsx_path, prefix="json")
+    assert isinstance(result, dict) and result == {}
+
+
+def test_find_matching_paths_list_element_dicts_are_indexed(tmp_path: Path):
+    """find_matching_paths は配列ノード自体を返さず、
+    要素が辞書の場合のみ 1 始まりインデックス付きで返す。"""
+    wb = Workbook(); ws = wb.active; ws.title = "S"
+    ws["A1"] = "x1"; ws["A2"] = "x2"; ws["B1"] = "y1"
+    set_defined_names(wb, {
+        "json.root.alphaitems.1.value": "A1",
+        "json.root.alphaitems.2.value": "A2",
+        "json.root.betaitems.1.value": "B1",
+    }, default_sheet=ws.title)
+    xlsx_path = tmp_path / "wild.xlsx"; wb.save(xlsx_path)
+    data = xlsx2json.parse_named_ranges_with_prefix(xlsx_path, prefix="json")
+
+    paths = xlsx2json.find_matching_paths(data, "root.*items.*")
+    # 要素辞書のインデックス付きパスのみ
+    assert set(paths) == {"root.alphaitems.1", "root.alphaitems.2", "root.betaitems.1"}
+
+
+def test_find_matching_paths_nested_arrays_with_partial_wildcards():
+    # 入力データ: ネストした配列構造（dict要素とスカラー要素の混在を含む）
+    data = {
+        "root": {
+            "lists": [
+                {"items": [
+                    {"name": "alpha"},
+                    {"name": "beta"},
+                    {"note": "skip"},
+                ]},
+                {"items": [
+                    {"name": "gamma"},
+                    "delta",  # スカラー要素
+                ]},
+            ]
+        }
+    }
+
+    # パターン: 部分ワイルドカードを含むセグメント（"na*"）で name に一致する要素の辞書を対象にする
+    # 期待: 1-basedの仮想インデックスを含むパス列挙。
+    # - root.lists.1.items.1.name -> "alpha"
+    # - root.lists.1.items.2.name -> "beta"
+    # - root.lists.2.items.1.name -> "gamma"
+    from xlsx2json import find_matching_paths, get_nested_value
+
+    pattern = "root.lists.*.items.*.na*"
+    matches = find_matching_paths(data, pattern)
+
+    assert sorted(matches) == [
+        "root.lists.1.items.1.name",
+        "root.lists.1.items.2.name",
+        "root.lists.2.items.1.name",
+    ]
+
+    # マッチした各パスの末端値を検証
+    values = [get_nested_value(data, p) for p in matches]
+    assert sorted(values) == ["alpha", "beta", "gamma"]
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

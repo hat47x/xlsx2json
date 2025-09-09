@@ -1,10 +1,8 @@
 # ユーザ定義関数のサンプル集
 
-
 # =============================================================================
 # 文字列変換
 # =============================================================================
-
 
 def csv(value):
     """CSV文字列を配列に分割"""
@@ -30,11 +28,9 @@ def words(value):
         return value
     return [w for w in value.split() if w]
 
-
 # =============================================================================
 # 配列・行列操作
 # =============================================================================
-
 
 def column(data, index=0):
     """指定列を抽出"""
@@ -129,7 +125,6 @@ def join_str(data, sep: str = ""):
 # 数値計算
 # =============================================================================
 
-
 def total(data):
     """全要素の合計"""
     if not isinstance(data, list):
@@ -169,7 +164,6 @@ def avg(data):
 # 便利関数
 # =============================================================================
 
-
 def parse_json(value):
     """JSON文字列を解析"""
     import json
@@ -202,35 +196,35 @@ def normalize(value):
 
 def upper(value):
     """大文字に変換"""
+    print(r"upper called with:", value)
     return str(value).upper() if value else value
 
 
 def lower(value):
     """小文字に変換"""
+    print(r"lower called with:", value)
     return str(value).lower() if value else value
 
 
 # =============================================================================
-# 顧客情報用カスタム変換
+# サンプル動作確認用
 # =============================================================================
 
-
 def split_customer_name(node):
-        """nodeのname要素を半角スペースで分割し、last_name, first_name要素を追加し、元のname要素を削除。
-        
-        ・入力例: {"name": "山田 太郎", "address": "..."}
-        ・出力例: {"last_name": "山田", "first_name": "太郎", "address": "..."}
-        """
-        print(r"split_customer_name called with:", node)
-        if not isinstance(node, dict):
-            return node
-        name = node.get("name")
-        if isinstance(name, str) and " " in name:
-            parts = [p for p in name.split(" ") if p]
-            if len(parts) >= 2:
-                new_node = dict(node)
-                new_node["last_name"] = parts[0]
-                new_node["first_name"] = parts[1]
-                new_node.pop("name", None)
-                return new_node
+    """nodeのname要素を半角スペースで分割し、last_name, first_name要素を追加し、元のname要素を削除。    
+    ・入力例: {"name": "山田 太郎", "address": "..."}
+    ・出力例: {"last_name": "山田", "first_name": "太郎", "address": "..."}
+    """
+    print(r"split_customer_name called with:", node)
+    if not isinstance(node, dict):
         return node
+    name = node.get("name")
+    if isinstance(name, str) and " " in name:
+        parts = [p for p in name.split(" ") if p]
+        if len(parts) >= 2:
+            new_node = dict(node)
+            new_node["last_name"] = parts[0]
+            new_node["first_name"] = parts[1]
+            new_node.pop("name", None)
+            return new_node
+    return node

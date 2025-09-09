@@ -928,14 +928,13 @@ class Xlsx2JsonConverter:
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path = output_dir / f"{base_name}{extension}"
 
-        # 空値は常に抑制して出力
+        # 空値抑制オプション廃止: そのまま write
         write_data(
             data,
             output_path,
             self.config.output_format,
             self.config.schema,
             self.validator,
-            True,
         )
 
 
@@ -1357,45 +1356,67 @@ def apply_post_parse_pipeline(
     group_labels: set[str],
     group_to_root: Dict[str, str],
     gen_map: Optional[Dict[str, Any]],
+    schema: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """パース後の出力整形パイプラインを一括適用。
+    """パース後の出力整形パイプラインを一括適用（再構築版）。
 
-    ステップ:
-    1) ルートキー順の安定化（Excel読取順）
-    2) ワイルドカード変換の適用
-    3) コンテナ出力のリシェイプ（dict of lists → list of dicts）
-    4) 明示コンテナ時の prefix 配下の子をトップレベルへ複製（互換）
-    5) コンテナ無し時のグループ吸収のフォールバック正規化
+        新順序 (単一早期クリーン方式):
+            1) ルート順安定化
+            2) （コンテナ有り）配列変換前に一旦 raw -> transform -> reshape -> prefix複製
+                 （コンテナ無し）フォールバック正規化後に transform
+            3) 早期フルクリーニング（空要素 prune + 値クリーン） ← 唯一の自動クリーン地点
+        目的: 変換ルール実行後ただちに空プレースホルダを除去し、後段での再クリーンや出力直前クリーンを不要にする。
     """
     # 1) ルート順安定化
-    result2, root_result = reorder_roots_by_sheet_order(
+    result2, _root_result = reorder_roots_by_sheet_order(
         result, root_first_pos, prefix, user_provided_containers
     )
-    # 2) 変換（ワイルドカード／非ワイルドカード含む）
-    if array_transform_rules:
-        transformed = apply_pattern_transforms(
-            root_result, array_transform_rules, normalized_prefix
-        )
-        if user_provided_containers:
-            result2[prefix] = transformed
-        else:
-            result2 = transformed
-    # 3) コンテナ reshape
-    result2 = reshape_containers_in_result(
-        result2, containers, prefix, user_provided_containers
-    )
-    # 4) prefix の子をトップに複製（互換）
-    if user_provided_containers and is_json_dict(result2) and prefix in result2:
-        result2 = replicate_prefix_children_to_top_level(
-            result2, prefix, group_labels, root_first_pos
-        )
-    # 5) コンテナ無しフォールバック
-    if not user_provided_containers and is_json_dict(result2):
-        result2 = fallback_normalize_root_groups_without_containers(
-            result2, group_to_root, gen_map, normalized_prefix
-        )
-    return result2
 
+    # container 有無で前段構造確定と transform を行う
+    if user_provided_containers:
+        if array_transform_rules:
+            transformed = apply_pattern_transforms(
+                result2[prefix] if (prefix in result2) else result2,
+                array_transform_rules,
+                normalized_prefix,
+            )
+            if prefix in result2:
+                result2[prefix] = transformed
+            else:
+                result2 = transformed
+        result2 = reshape_containers_in_result(result2, containers, prefix, user_provided_containers)
+        if is_json_dict(result2) and prefix in result2:
+            result2 = replicate_prefix_children_to_top_level(
+                result2, prefix, group_labels, root_first_pos
+            )
+    else:
+        if is_json_dict(result2):
+            result2 = fallback_normalize_root_groups_without_containers(
+                result2, group_to_root, gen_map, normalized_prefix
+            )
+        if array_transform_rules:
+            transformed = apply_pattern_transforms(
+                result2[prefix] if (prefix in result2) else result2,
+                array_transform_rules,
+                normalized_prefix,
+            )
+            if prefix in result2:
+                result2[prefix] = transformed
+            else:
+                result2 = transformed
+
+    # ---- 早期唯一のフルクリーン段階 ----
+    # ここで空要素を削除し値レベルもクリーン。後続での追加クリーンは行わない方針。
+    try:
+        result2 = prune_empty_elements(result2, schema=schema)
+        result2 = clean_empty_values(result2, schema=schema)
+    except Exception as e:  # 失敗しても致命的にしない（ロバスト性優先）
+        logger.debug("early full clean skipped due to error: %s", e)
+    # トップレベルが None (全要素空で削除) の場合は空dictへフォールバック
+    if result2 is None:
+        result2 = {}
+
+    return result2
 
 def get_named_range_values(wb, defined_name) -> Any:
     """
@@ -2900,7 +2921,8 @@ def replicate_prefix_children_to_top_level(
     pref_val2 = result[prefix]
     if not is_json_dict(pref_val2):
         return result
-    for k, v in cast(Dict[str, JSONValue], pref_val2).items():
+    # pref_val2 は直前で is_json_dict 判定済みなので cast 不要
+    for k, v in pref_val2.items():
         if k in rep_group_labels:
             continue
         if k not in result:
@@ -4559,12 +4581,19 @@ def get_applicable_transform_rules(
     normalized_path_keys: List[str],
     original_path_keys: List[str],
 ) -> Optional[List[ArrayTransformRule]]:
-    """normalized/original の両方で、完全一致→親キー→ワイルドカードの順に適用可能な変換ルールを返す。
+    """適用可能な変換ルールを優先順位で検索して返す。
 
-    優先順位:
+     契約/優先順位（README準拠）:
     1) 完全一致（normalized → original）
-    2) 親キー一致（normalized → original）
-    3) ワイルドカード（*）パターンマッチ（normalized → original）
+    2) 配列要素親への非ワイルドカード適用（normalized → original）
+       - 親キー一致のうち、親パスの末尾が数値（配列の 1 始まりインデックス）の場合のみ許可する
+       - 例: 対象パスが "arr.1.name" のとき、"arr.1" に定義された非ワイルドカードルールを適用
+       - 通常の辞書親（例: "root" → "root.child"）へのフォールバックは行わない
+     3) split 変換に限る辞書親へのフォールバック（normalized → original）
+         - 祖先キーに定義された split ルールは、その配下の要素文字列に対する分割として適用される
+         - 例: "parent=split:\n|," は "parent.*.*" 等のセル文字列を分割し、次元を追加する
+         - function/command 等は辞書親フォールバックの対象外（完全一致/数値親/ワイルドカードのみ）
+     4) ワイルドカード（*）パターンマッチ（normalized → original）
     """
     if not transform_rules:
         return None
@@ -4579,17 +4608,23 @@ def get_applicable_transform_rules(
             return transform_rules[orig_key_path]
         return None
 
-    def _find_parent_match() -> Optional[List[ArrayTransformRule]]:
-        if len(normalized_path_keys) > 1:
-            for i in range(len(normalized_path_keys) - 1, 0, -1):
-                parent_norm = ".".join(normalized_path_keys[:i])
-                if parent_norm in transform_rules:
-                    return transform_rules[parent_norm]
-        if len(original_path_keys) > 1:
-            for i in range(len(original_path_keys) - 1, 0, -1):
-                parent_orig = ".".join(original_path_keys[:i])
-                if parent_orig in transform_rules:
-                    return transform_rules[parent_orig]
+    def _find_array_element_parent_match() -> Optional[List[ArrayTransformRule]]:
+        """配列要素（数値インデックス）直下の親パスに定義された非ワイルドカードを探索。
+
+        - 対象パスが少なくとも 2 セグメント以上で、直前の親が数値セグメントのときのみ候補にする
+        - normalized/original の両方で確認する
+        - 深い階層で連続する数値があるケースは、最も末端の直近親のみ対象（即時の親）
+        """
+        # normalized 側で探索
+        if len(normalized_path_keys) >= 2 and normalized_path_keys[-2].isdigit():
+            parent_norm = ".".join(normalized_path_keys[:-1])
+            if parent_norm in transform_rules:
+                return transform_rules[parent_norm]
+        # original 側で探索
+        if len(original_path_keys) >= 2 and original_path_keys[-2].isdigit():
+            parent_orig = ".".join(original_path_keys[:-1])
+            if parent_orig in transform_rules:
+                return transform_rules[parent_orig]
         return None
 
     def _find_wildcard_match() -> Optional[List[ArrayTransformRule]]:
@@ -4601,7 +4636,40 @@ def get_applicable_transform_rules(
                 return rule_list
         return None
 
-    return _find_exact_match() or _find_parent_match() or _find_wildcard_match()
+    def _all_split_rules(rule_list: List[ArrayTransformRule]) -> bool:
+        return all(getattr(r, "transform_type", None) == "split" for r in rule_list)
+
+    def _find_split_parent_match() -> Optional[List[ArrayTransformRule]]:
+        """辞書親（数値でない）に定義された split ルールを最近傍の祖先から検索して返す。"""
+        # normalized 側: 末尾を削りながら探索
+        for i in range(len(normalized_path_keys) - 1, 0, -1):
+            parent_parts = normalized_path_keys[:i]
+            # 直近親が数値のケースは配列要素親に任せるためスキップ
+            if parent_parts and parent_parts[-1].isdigit():
+                continue
+            parent_path = ".".join(parent_parts)
+            if parent_path in transform_rules:
+                cand = transform_rules[parent_path]
+                if _all_split_rules(cand):
+                    return cand
+        # original 側
+        for i in range(len(original_path_keys) - 1, 0, -1):
+            parent_parts = original_path_keys[:i]
+            if parent_parts and parent_parts[-1].isdigit():
+                continue
+            parent_path = ".".join(parent_parts)
+            if parent_path in transform_rules:
+                cand = transform_rules[parent_path]
+                if _all_split_rules(cand):
+                    return cand
+        return None
+
+    return (
+        _find_exact_match()
+        or _find_array_element_parent_match()
+        or _find_split_parent_match()
+        or _find_wildcard_match()
+    )
 
 
 def apply_transform_rules_for_path(
@@ -4657,12 +4725,17 @@ def apply_transform_rules_for_path(
 def wildcard_match_path(pattern: str, actual_path: str) -> bool:
     """拡張ワイルドカードマッチ。
 
-    仕様:
-    - セグメント数は一致すること
-    - セグメント全体が '*' の場合: 任意1セグメント
-    - セグメントに部分ワイルドカード（例: '*items', 'pre*', 'mid*post'）を含められる
-      → '*' は同一セグメント内で 0 文字以上にマッチ
-    - 正規表現は使用せずキャッシュ不要な軽量実装
+    契約/仕様:
+    - セグメント区切りは '.'
+    - セグメント数は一致している必要がある（配列要素は 1 始まりの数値セグメントとして現れる）
+    - セグメント全体が '*' の場合: 任意1セグメントに一致
+    - セグメント内の部分ワイルドカードをサポート（例: '*items', 'pre*', 'mid*post'）
+      → '*' は同一セグメント内で 0 文字以上にマッチ（正規表現は不使用）
+    - リストそのもののノードには一致させない方針（要素レベルでの一致のみを想定）。
+
+    例:
+    - pattern='json.a.*.b' は 'json.a.1.b' / 'json.a.2.b' に一致
+    - pattern='json.ro*.*.na*' は 'json.root.1.name' / 'json.root.2.natural' に一致
     """
     pattern_parts = [p for p in pattern.split('.') if p]
     actual_parts = [p for p in actual_path.split('.') if p]
@@ -4826,60 +4899,103 @@ def handle_parent_level_for_double_index_array(
 
 
 def get_nested_value(obj: JSONDict, path: str) -> Any:
-    """dict のドット区切りパスから値を取得（存在しなければ None）。"""
+    """dict のドット区切りパスから値を取得（存在しなければ None）。
+
+    契約:
+    - 数値セグメントは配列インデックスとして解釈（1 始まり）
+    - 非数値セグメントは dict キーとして扱う
+    - 範囲外インデックスやキー未存在は None を返す
+    """
     parts = [p for p in path.split(".") if p]
     cur: JSONValue = obj
     for part in parts:
         if is_json_dict(cur) and part in cur:
-            cur = cast(JSONDict, cur)[part]
-        else:
+            cur = cur[part]  # type: ignore[index]
+            continue
+        if is_json_list(cur) and part.isdigit():
+            idx = int(part) - 1  # 1始まり
+            if 0 <= idx < len(cur):
+                cur = cur[idx]
+                continue
             return None
+        return None
     return cur
 
 
 def set_nested_value(obj: JSONDict, path: str, value: JSONValue) -> None:
-    """dict のドット区切りパスに値を設定（中間 dict は自動生成）。"""
+    """dict のドット区切りパスに値を設定（中間 dict は自動生成）。
+
+    契約:
+    - 数値セグメントは配列インデックスとして解釈（1 始まり）
+    - 中間が配列の場合は既存要素範囲内のみ設定（範囲外は無操作で安全側）
+    - 中間が dict の場合は不足キーを {} で補完
+    - 最終セグメントが配列インデックスの場合も同様に 1 始まりで設定
+    """
     parts = [p for p in path.split(".") if p]
-    cur: JSONDict = obj
+    cur: JSONValue = obj
     for part in parts[:-1]:
-        if part not in cur or not is_json_dict(cur.get(part)):
-            cur[part] = {}
-        cur = cast(JSONDict, cur[part])
-    cur[parts[-1]] = value
+        if is_json_dict(cur):
+            if part not in cur or not is_json_dict(cur.get(part)):
+                # 既存が list などの場合は上書きせず失敗扱い
+                if part not in cur:
+                    cur[part] = {}
+            cur = cast(JSONDict, cur)[part]  # type: ignore[index]
+            continue
+        if is_json_list(cur) and part.isdigit():
+            idx = int(part) - 1
+            if 0 <= idx < len(cur):
+                cur = cur[idx]
+                continue
+            else:
+                return
+        else:
+            return
+    last = parts[-1]
+    if is_json_dict(cur):
+        cur[last] = value  # type: ignore[index]
+    elif is_json_list(cur) and last.isdigit():
+        idx = int(last) - 1
+        if 0 <= idx < len(cur):
+            cur[idx] = value
 
 
 def find_matching_paths(
     obj: JSONValue, pattern: str, current_path: str = ""
 ) -> List[str]:
     """
-    dict 構造から、パターンにマッチするドット区切りパスを列挙する。
-    リストは配列インデックスをキーとみなさず、子要素を同じ current_path 配下として再帰探索する。
+    dict/list 構造から、パターンにマッチするドット区切りパスを列挙する。
+
+    振る舞い（READMEの契約と一致）:
+    - リスト自体は候補に含めない（コンテナ丸ごとの誤適用防止）
+    - リスト要素は 1 始まりの仮想数値インデックスとしてパスに現れる
+      例: root.items = ['a','b'] → 'root.items.1', 'root.items.2'
+          root.arr = [{'x':1},{'x':2}] → 'root.arr.1.x', 'root.arr.2.x'
+    - dict ノード（中間/leaf）は、パターン長が一致し `wildcard_match_path` が真であれば候補
+    - 同一路径の重複は除外
     """
     matches: List[str] = []
-    if is_json_dict(obj):
-        for key, value in obj.items():
-            new_path = f"{current_path}.{key}" if current_path else key
-            if wildcard_match_path(pattern, new_path):
-                matches.append(new_path)
-            if is_json_dict(value) or is_json_list(value):
-                matches.extend(find_matching_paths(value, pattern, new_path))
-    elif is_json_list(obj):
-        # リスト: 各要素に対し同じ current_path を継続しつつ要素(dict) 自体がパターンに合致するケースを許容
-        for item in obj:
-            # 要素が dict の場合 current_path 自体を対象として再評価する（例えば *.items.* で items 配下の要素をマッチさせる）
-            if is_json_dict(item) and current_path and wildcard_match_path(pattern, current_path):
-                matches.append(current_path)
-            matches.extend(find_matching_paths(item, pattern, current_path))
-        # 特別処理: pattern が current_path + '.*' に近く、要素が dict の場合は current_path を候補に含める
-        if current_path and any(is_json_dict(it) for it in obj):
-            # pattern セグメント数と current_path セグメント数の差が1 以上で最後のパターンセグメントが '*' 含む場合
-            p_parts = [p for p in pattern.split('.') if p]
-            c_parts = [p for p in current_path.split('.') if p]
-            if len(p_parts) >= len(c_parts) and wildcard_match_path(".".join(p_parts[:len(c_parts)]), current_path):
-                # 直後のパターンセグメントに '*' を含むならノード自体を追加
-                if len(p_parts) > len(c_parts) and '*' in p_parts[len(c_parts)]:
-                    if current_path not in matches:
-                        matches.append(current_path)
+    # 改訂仕様:
+    #  - dict ノード (中間/leaf) 自体がパターン長と一致し wildcard_match_path で真なら候補に含める
+    #  - list ノードは current_path を候補に含めない（配列全体変換の誤適用防止）
+    #  - list 要素の再帰で同一パスが重複し得るため去重
+    seen: set[str] = set()
+
+    def _recurse(node: JSONValue, path: str):
+        if path and wildcard_match_path(pattern, path):
+            if path not in seen:
+                matches.append(path)
+                seen.add(path)
+        if is_json_dict(node):
+            for k, v in node.items():
+                new_path = f"{path}.{k}" if path else k
+                _recurse(v, new_path)
+        elif is_json_list(node):
+            # list 要素は常に 1 始まりの仮想インデックスを付与して探索（スカラー要素も対象）
+            for idx, item in enumerate(node, start=1):
+                idx_path = f"{path}.{idx}" if path else str(idx)
+                _recurse(item, idx_path)
+
+    _recurse(obj, current_path if current_path else "")
     return matches
 
 
@@ -5440,6 +5556,7 @@ def _finalize_result(
     array_transform_rules: Optional[Dict[str, List[ArrayTransformRule]]],
     user_provided_containers: bool,
     containers: Optional[Dict[str, Dict]],
+    schema: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """ポストパース整形パイプラインを適用し、最終出力を返す。"""
     return apply_post_parse_pipeline(
@@ -5453,6 +5570,7 @@ def _finalize_result(
         group_labels=state["group_labels"],
         group_to_root=state["group_to_root"],
         gen_map=state["gen_map"],
+        schema=schema,
     )
 
 
@@ -5558,6 +5676,7 @@ def parse_named_ranges_with_prefix(
         array_transform_rules=array_transform_rules,
         user_provided_containers=user_provided_containers,
         containers=containers,
+        schema=schema,
     )
 
     return result
@@ -5792,7 +5911,6 @@ def write_data(
     output_format: str = "json",
     schema: Optional[Dict[str, Any]] = None,
     validator: Optional[Draft7Validator] = None,
-    suppress_empty: bool = True,
     *,
     cleaning_policy: DataCleaningPolicy | None = None,
     ordering_policy: OutputOrderingPolicy | None = None,
@@ -5807,9 +5925,9 @@ def write_data(
     base_name = output_path.stem
     output_dir = output_path.parent
 
-    # デバッグ: 出力前の一部構造確認（特定キー名に依存しない汎用ログ）
+    # デバッグ: 出力前の一部構造確認
     sample_keys = list(data.keys())[:5] if is_json_dict(data) else []
-    logger.debug("BEFORE-PRUNE keys(sample)=%r", sample_keys)
+    logger.debug("WRITE-DATA initial keys(sample)=%r", sample_keys)
 
     # ポリシー（デフォルト併用）
     _cp = cleaning_policy or DEFAULT_DATA_CLEANING_POLICY
@@ -5817,29 +5935,9 @@ def write_data(
     _vp = validation_policy or DEFAULT_VALIDATION_POLICY
     _lp = logging_policy or DEFAULT_LOGGING_POLICY
 
-    # 形状正規化
+    # クリーニングは early_clean に移行済み。ここでは順序整形のみ。
     if _cp.normalize_array_field_shapes:
         data = cast(Dict[str, Any], normalize_array_field_shapes(data))
-
-    # 全フィールドが未設定の要素を除去
-    if _cp.prune_empty_elements:
-        data = prune_empty_elements(data, schema=schema)
-
-    # 空値の除去（この時点では空キーは落ちる）
-    original_after_prune = data  # 形状復元のため保持
-    if _cp.clean_empty_values and suppress_empty:
-        cleaned_data = clean_empty_values(original_after_prune, suppress_empty, schema=schema)
-        if cleaned_data is None:
-            data = {}
-        else:
-            data = cast(Dict[str, Any], cleaned_data)
-
-    if suppress_empty:
-        data = cast(Dict[str, Any], _restore_shapes_tree(original_after_prune, data, schema))
-
-    # デバッグ: プルーニング後の構造確認（特定キー名に依存しない汎用ログ）
-    sample_keys_after = list(data.keys())[:5] if is_json_dict(data) else []
-    logger.debug("AFTER-PRUNE keys(sample)=%r", sample_keys_after)
 
     # 出力順ポリシーの適用
     if ordering_policy is None:
@@ -9784,19 +9882,8 @@ def apply_wildcard_transforms(
                     else:
                         new_value = rule.transform(new_value)
                 if isinstance(new_value, dict):
-                    dynamic_keys = [k for k in new_value.keys() if k.startswith(prefix) or '.' in k]
-                    if dynamic_keys:
-                        expand_and_insert_dict(
-                            result_dict=new_value,
-                            base_path=path,
-                            prefix=prefix,
-                            root_result=data,
-                            transform_rules_map=None,
-                            workbook=None,
-                            apply_dynamic_rules=False,
-                        )
-                    else:
-                        set_nested_value(data, path, new_value)
+                    # 契約: 辞書戻り値はキー展開せず、そのまま対象ノードを置換する
+                    set_nested_value(data, path, new_value)
                 elif is_json_list(new_value):
                     set_nested_value(data, path, new_value)
                 else:
@@ -9840,7 +9927,7 @@ def is_completely_empty(data: Any) -> bool:
     return False
 
 
-def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Optional[Dict[str, Any]] = None, _path: tuple[str, ...] = ()):  # noqa: E501, PLR0915
+def clean_empty_values(data: Any, *, schema: Optional[Dict[str, Any]] = None, _path: tuple[str, ...] = ()):  # noqa: E501, PLR0915
     """空の値をクリーニング。
 
     ポリシー:
@@ -9911,8 +9998,8 @@ def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Option
             for kk, vv in orig.items():
                 ss = props2.get(kk) if isinstance(props2, dict) else None
                 # 通常クリーン
-                cleaned_sub = clean_empty_values(vv, suppress_empty, schema=ss, _path=(*_path, kk))
-                if not (suppress_empty and is_completely_empty(cleaned_sub)):
+                cleaned_sub = clean_empty_values(vv, schema=ss, _path=(*_path, kk))
+                if not is_completely_empty(cleaned_sub):
                     out_d[kk] = cleaned_sub
                     continue
                 # 空になったが、元が配列で全てスカラー空のみの場合は [] を保持
@@ -9963,14 +10050,13 @@ def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Option
                     out[k] = []
         return out if out else None
 
-    if suppress_empty and is_completely_empty(data):
-        # スキーマが無い場合だけ従来通りの早期リターン
-        if not isinstance(schema, dict):
-            if isinstance(data, list):
-                return []
-            if isinstance(data, dict):
-                return {}
-            return None
+    # 完全空入力の特別扱い: スキーマ未指定時は元の形状を簡略化して即時返却
+    if is_completely_empty(data) and not isinstance(schema, dict):
+        if isinstance(data, list):
+            return []
+        if isinstance(data, dict):
+            return {}
+        return None
 
     if isinstance(data, dict):
         # まず子をクリーン
@@ -9980,7 +10066,7 @@ def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Option
         for k, v in data.items():
             sub_schema = props.get(k) if isinstance(props, dict) else None
             orig_children[k] = v
-            cleaned_children[k] = clean_empty_values(v, suppress_empty, schema=sub_schema, _path=(*_path, k))
+            cleaned_children[k] = clean_empty_values(v, schema=sub_schema, _path=(*_path, k))
 
         # 同階層に非空の兄弟が存在するか
         has_non_empty_sibling = any(
@@ -9991,7 +10077,7 @@ def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Option
         for k, cleaned in cleaned_children.items():
             v = orig_children[k]
             sub_schema = props.get(k) if isinstance(props, dict) else None
-            if not (suppress_empty and is_completely_empty(cleaned)):
+            if not is_completely_empty(cleaned):
                 result[k] = cleaned
                 continue
 
@@ -10035,11 +10121,11 @@ def clean_empty_values(data: Any, suppress_empty: bool = True, *, schema: Option
         if isinstance(schema, dict):
             item_schema = schema.get("items") if isinstance(schema.get("items"), dict) else None
         for item in data:
-            cleaned = clean_empty_values(item, suppress_empty, schema=item_schema, _path=_path)
-            if not (suppress_empty and is_completely_empty(cleaned)):
+            cleaned = clean_empty_values(item, schema=item_schema, _path=_path)
+            if not is_completely_empty(cleaned):
                 cleaned_list.append(cleaned)
-        # スキーマ参照なしでも、完全空リストは [] を返す（呼び出し側で扱う）
-        if suppress_empty and not cleaned_list:
+        # 完全空リストは落とす（空構造保持方針は廃止）
+        if not cleaned_list:
             return []
         return cleaned_list
 
